@@ -16,7 +16,7 @@ use crate::clipboard::{self, Clip};
 use crate::emoji::{self, Picker};
 use crate::{autostart, export, icon, notify, tray};
 use crate::media::{self, Kind, Loaded, Shared, Store};
-use crate::player::{self, Audio, Movie};
+use crate::player::{self, Audio, Movie, SpeedKind, Speeds};
 use crate::tg::{self, ChatKind, Folder, ListKey, Media, Msg, Presence, Scope, SendOptions, Sender, User};
 use crate::view;
 use crate::vim::{Action, History, Input, Mode, NKey, Pending, normalize};
@@ -40,6 +40,9 @@ const SCROLLOFF: usize = 2;
 const TALL_STEP: f32 = 90.0;
 /// Older messages arriving (e.g. after being offline) don't notify.
 const NOTIFY_MAX_AGE: i64 = 120;
+/// Cached media unused this long is deleted, checked once this often.
+const CACHE_DAYS: i32 = 7;
+
 /// Scrollable showing a message taller than the screen.
 pub const TALL_ID: &str = "tall-message";
 
@@ -48,7 +51,7 @@ const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l panes  J/K g
                     yy/Y copy  p/P paste  ge emoji  Space play/pause  [ ] speed  = 1x  H/L seek  \
                     / filter chats or search messages  n/N next/prev match  ga attach  gp pinned  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
-                    :folder  :theme  :autostart  :q";
+                    :folder  :theme  :autostart  :cleancache  :q";
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -118,6 +121,7 @@ pub enum Message {
     /// A notification of this chat was clicked.
     NotificationClicked(i64),
     Autostart(Result<String, String>),
+    CacheCleaned(Result<i64, String>),
     TallScroll(Viewport),
     Paste(Option<String>),
     Clip(Result<Clip, String>),
@@ -185,6 +189,8 @@ pub struct VoicePlayback {
 
 pub struct VideoPlayback {
     file_id: i32,
+    /// Video or round video message: each keeps its own speed.
+    kind: SpeedKind,
     /// `None` until the stream has started.
     pub movie: Option<Movie>,
     /// A speed change failed (e.g. mid-seek) and is retried on the next tick.
@@ -434,8 +440,8 @@ pub struct App {
     pub viewer: Option<Viewer>,
     pub video: Option<VideoPlayback>,
     pub voice: Option<VoicePlayback>,
-    /// Playback speed shared by voice messages and videos.
-    pub speed: f64,
+    /// Playback speed per kind of media, remembered across restarts.
+    speeds: Speeds,
     pub media: Store,
     /// Time base for animations: frame = (now - clock) / frame time.
     pub clock: Instant,
@@ -535,7 +541,7 @@ impl App {
             viewer: None,
             video: None,
             voice: None,
-            speed: 1.0,
+            speeds: Speeds::load(),
             media: Store::default(),
             clock: Instant::now(),
             now: Instant::now(),
@@ -693,7 +699,7 @@ impl App {
             _ => chat.title.clone(),
         };
         let body = notify::preview(&msg.summary());
-        let (chat_id, avatar) = (chat.id, chat.avatar);
+        let (chat_id, avatar, msg_id) = (chat.id, chat.avatar, msg.id);
         Task::perform(
             async move {
                 // The chat photo with the app icon in its corner.
@@ -711,7 +717,7 @@ impl App {
                 };
                 let app_icon = icon::png_path();
                 let image = image.or_else(|| app_icon.clone());
-                notify::show(title, body, image, app_icon).await
+                notify::show(title, body, image, app_icon, chat_id, msg_id).await
             },
             move |clicked| {
                 if clicked {
@@ -1030,6 +1036,14 @@ impl App {
                 self.select_chat(chat_id);
                 Task::batch([window, self.open_chat(chat_id)])
             }
+            Message::CacheCleaned(result) => {
+                match result {
+                    Ok(freed) if freed > 0 => self.info(format!("Cache: freed {:.1} MB", freed as f64 / 1e6)),
+                    Ok(_) => {}
+                    Err(e) => self.error(format!("Cache cleanup: {e}")),
+                }
+                Task::none()
+            }
             Message::Autostart(result) => {
                 match result {
                     Ok(text) => self.info(text),
@@ -1211,6 +1225,9 @@ impl App {
                     chat.unread = u.unread_count;
                     self.list_dirty = true;
                 }
+                // Read here or on another device: its notifications go away.
+                let up_to = if u.unread_count == 0 { i64::MAX } else { u.last_read_inbox_message_id };
+                return Task::perform(notify::withdraw(u.chat_id, up_to), |()| Message::Done(Ok(())));
             }
             Update::ChatFolders(u) => {
                 let current = self.current_list();
@@ -1336,7 +1353,7 @@ impl App {
                 self.mode = Mode::Normal;
                 self.input.clear();
                 self.status = None;
-                return self.load_more_chats();
+                return Task::batch([self.load_more_chats(), weekly_cache_clean()]);
             }
             S::LoggingOut | S::Closing => self.auth = Auth::Info("Closing…".into()),
             S::Closed => self.auth = Auth::Info("Session closed".into()),
@@ -1916,7 +1933,7 @@ impl App {
             }
         };
         if let Some(voice) = self.voice.as_mut().filter(|v| v.file_id == file_id) {
-            match Audio::open(&path, self.speed) {
+            match Audio::open(&path, self.speeds.get(SpeedKind::Voice)) {
                 Ok(audio) => voice.audio = Some(audio),
                 Err(e) => {
                     self.voice = None;
@@ -1960,7 +1977,9 @@ impl App {
     fn open_viewer(&mut self, viewer: Viewer) -> Task<Message> {
         self.viewer = Some(viewer);
         let video_file = match self.viewer_media() {
-            Some(Media::Video { video, .. }) => Some(video.id),
+            Some(Media::Video { video, round, .. }) => {
+                Some((video.id, if *round { SpeedKind::Round } else { SpeedKind::Video }))
+            }
             _ => None,
         };
         if let Some(open) = self.open.as_mut()
@@ -1970,16 +1989,17 @@ impl App {
         }
         self.scroll_messages();
         match video_file {
-            Some(file_id) if self.video.as_ref().is_some_and(|v| v.file_id == file_id) => Task::none(),
-            Some(file_id) => {
+            Some((file_id, _)) if self.video.as_ref().is_some_and(|v| v.file_id == file_id) => Task::none(),
+            Some((file_id, kind)) => {
                 // A video brings its own sound; don't talk over it.
                 self.voice = None;
                 self.video = Some(VideoPlayback {
                     file_id,
+                    kind,
                     movie: None,
                     speed_pending: false,
                 });
-                let speed = self.speed;
+                let speed = self.speeds.get(kind);
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || player::open_video(file_id, speed).map(Shared::new))
@@ -2002,11 +2022,11 @@ impl App {
     }
 
     fn poll_players(&mut self) {
-        let speed = self.speed;
-        if let Some(playback) = self.video.as_mut().filter(|p| p.speed_pending)
-            && let Some(video) = playback.video_mut()
-        {
-            playback.speed_pending = video.set_speed(speed).is_err();
+        if let Some(playback) = self.video.as_mut().filter(|p| p.speed_pending) {
+            let speed = self.speeds.get(playback.kind);
+            if let Some(video) = playback.video_mut() {
+                playback.speed_pending = video.set_speed(speed).is_err();
+            }
         }
         if let Some(recorder) = self.recorder.as_mut()
             && let Err(e) = recorder.poll()
@@ -2049,8 +2069,20 @@ impl App {
         }
     }
 
+    /// The kind of media whose speed `[`/`]` change: what plays now, else
+    /// voice messages.
+    fn speed_kind(&self) -> SpeedKind {
+        self.video.as_ref().map_or(SpeedKind::Voice, |v| v.kind)
+    }
+
+    /// Speed of what plays now (or of voice messages).
+    pub fn speed(&self) -> f64 {
+        self.speeds.get(self.speed_kind())
+    }
+
     fn set_speed(&mut self, speed: f64) {
-        self.speed = speed;
+        self.speeds.set(self.speed_kind(), speed);
+        self.speeds.save();
         if let Some(playback) = self.video.as_mut()
             && let Some(video) = playback.video_mut()
         {
@@ -2240,11 +2272,11 @@ impl App {
             }
             NKey::Space => return self.toggle_pause(),
             NKey::Char(']' | '+') => {
-                self.set_speed(player::faster(self.speed));
+                self.set_speed(player::faster(self.speed()));
                 None
             }
             NKey::Char('[' | '-') => {
-                self.set_speed(player::slower(self.speed));
+                self.set_speed(player::slower(self.speed()));
                 None
             }
             NKey::Char('=') => {
@@ -2494,6 +2526,18 @@ impl App {
                 return Task::none();
             }
             ("autostart", arg) => return self.autostart(arg),
+            ("cleancache", days) => {
+                let days = match days.map(str::parse::<i32>) {
+                    None => CACHE_DAYS,
+                    Some(Ok(days)) if days >= 0 => days,
+                    Some(_) => {
+                        self.error("Usage: :cleancache [days unused, default 7]");
+                        return Task::none();
+                    }
+                };
+                self.info("Cleaning the cache…");
+                return clean_cache(days);
+            }
             ("emoji", None) => {
                 self.open_emoji();
                 return Task::none();
@@ -2642,11 +2686,11 @@ impl App {
             }
             Action::PlayPause => self.toggle_pause(),
             Action::Faster => {
-                self.set_speed(player::faster(self.speed));
+                self.set_speed(player::faster(self.speed()));
                 Task::none()
             }
             Action::Slower => {
-                self.set_speed(player::slower(self.speed));
+                self.set_speed(player::slower(self.speed()));
                 Task::none()
             }
             Action::NormalSpeed => {
@@ -3081,6 +3125,26 @@ fn parse_date(arg: &str) -> Option<chrono::NaiveDate> {
     NaiveDate::from_ymd_opt(today.year(), month.parse().ok()?, day.parse().ok()?)
 }
 
+
+fn clean_cache(days: i32) -> Task<Message> {
+    icon::clean_cache(days.max(0) as u64);
+    Task::perform(tg::clean_cache(days), Message::CacheCleaned)
+}
+
+/// Clean the media cache when the last cleanup is a week old.
+fn weekly_cache_clean() -> Task<Message> {
+    let stamp = config::dirs().data_dir().join("last_cache_clean");
+    let now = chrono::Utc::now().timestamp();
+    let last = std::fs::read_to_string(&stamp)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    if now - last < i64::from(CACHE_DAYS) * 86_400 {
+        return Task::none();
+    }
+    let _ = std::fs::write(&stamp, now.to_string());
+    clean_cache(CACHE_DAYS)
+}
 
 fn history_path() -> PathBuf {
     config::dirs().data_dir().join("cmdline_history")

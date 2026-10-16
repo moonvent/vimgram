@@ -165,6 +165,23 @@ pub fn png_path() -> Option<PathBuf> {
     Some(path)
 }
 
+/// Drop cached notification images older than `days`.
+pub fn clean_cache(days: u64) {
+    let Ok(entries) = std::fs::read_dir(cache_dir()) else { return };
+    let max_age = std::time::Duration::from_secs(days * 86_400);
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+        if old && entry.file_name().to_string_lossy().starts_with("avatar-") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// A round avatar with the app icon in its corner, so notification daemons
 /// that show a single image (mako) still show both. Cached per avatar file.
 pub fn notification_image(avatar: &Path, key: i32) -> Option<PathBuf> {

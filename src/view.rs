@@ -948,7 +948,7 @@ fn voice_view<'a>(app: &'a App, msg_id: i64, duration: i32, waveform: &'a [u8]) 
     .spacing(10)
     .align_y(Alignment::Center);
     if playback.is_some() {
-        line = line.push(text(player::fmt_speed(app.speed)).size(12).style(primary_text));
+        line = line.push(text(player::fmt_speed(app.speed())).size(12).style(primary_text));
     }
     container(line).height(VOICE.height).align_y(Alignment::Center).into()
 }
@@ -1324,7 +1324,7 @@ fn recording_status(app: &App) -> Element<'_, Message> {
 
 /// What is playing, for the right side of the status line.
 fn playback_status(app: &App) -> Option<String> {
-    let speed = player::fmt_speed(app.speed);
+    let speed = player::fmt_speed(app.speed());
     if let Some(video) = app.video.as_ref().and_then(VideoPlayback::video) {
         let icon = if video.paused() { "⏸" } else { "▶" };
         return Some(format!(

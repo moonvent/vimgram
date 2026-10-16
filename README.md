@@ -55,7 +55,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `p` / `P` | paste the clipboard at the end / start of the message; a copied image or file becomes an attachment |
 | `q` | record a voice message; `q`/`Enter` sends, `Esc` discards |
 | `Space` | play / pause voice message or video |
-| `]` `+` / `[` `-` / `=` | speed up / down (0.25x–5x) / reset to 1x |
+| `]` `+` / `[` `-` / `=` | speed up / down (0.25x–5x) / reset to 1x; voice messages, videos and round videos each remember their own speed |
 | `H` / `L` | seek voice message −5s / +5s |
 | `Esc`, `Ctrl-[` | normal mode; cancel reply, edit, forward, filter, attachment |
 | `/` | chat list: filter chats; message pane: search messages |
@@ -68,6 +68,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `:export [path]` | export the chat to PDF (default `~/Documents/vimgram/`) |
 | `:search word`, `:folder name`, `:theme name`, `:speed 1.5`, `:42` | commands |
 | `:autostart [on\|off]` | start with the session, in the tray (off by default) |
+| `:cleancache [days]` | delete cached media unused for that many days (default 7; also done weekly) |
 | `:help` | key summary |
 
 Command line: `↑`/`↓` (or `Ctrl-p`/`Ctrl-n`) recall earlier `/` searches and `:` commands
@@ -93,7 +94,8 @@ downloaded right away (up to `prefetch_mb`). Links of messages still alive after
 are dropped.
 
 New messages raise desktop notifications with the chat photo (and the app icon in its
-corner) unless the chat is muted or open and focused; clicking one opens the chat.
+corner) unless the chat is muted or open and focused; clicking one opens the chat. Once
+the chat is read (here or on another device) its notifications are withdrawn.
 
 Tray: left click shows / hides the window, the menu has Quit. Wayland can't hide a
 window, so "hide" closes it and vimgram keeps running; `:q` quits. `:autostart on`
@@ -101,4 +103,17 @@ enables a systemd user service bound to `graphical-session.target` when the sess
 one (uwsm, or a Hyprland config starting such a target), otherwise an XDG autostart
 entry; both start vimgram with `--hidden`, in the tray.
 
-Session data lives in `~/.local/share/vimgram`.
+Where things are:
+
+| Path | What |
+|---|---|
+| `~/.local/share/vimgram/db` | TDLib database (session, chats, sticker files) |
+| `~/.local/share/vimgram/files` | media cache: photos, videos, voice messages, documents. Files unused for a week are deleted weekly (`:cleancache`) |
+| `~/.local/share/vimgram/archive.sqlite`, `media/` | archive of messages and their media (kept) |
+| `~/.cache/vimgram` | pasted images, notification images |
+
+Nothing is saved to `~/Downloads`.
+
+`[profile.release]` builds incrementally: after a change `cargo run --release` rebuilds in
+seconds; without changes it starts right away. `./target/release/vimgram` runs the last
+build without checking for changes.

@@ -26,6 +26,83 @@ pub fn fmt_speed(speed: f64) -> String {
     format!("{}x", (speed * 100.0).round() / 100.0)
 }
 
+/// Media kinds that remember their own playback speed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeedKind {
+    Voice,
+    Video,
+    /// Round video messages.
+    Round,
+}
+
+impl SpeedKind {
+    const ALL: [SpeedKind; 3] = [SpeedKind::Voice, SpeedKind::Video, SpeedKind::Round];
+
+    fn name(self) -> &'static str {
+        match self {
+            SpeedKind::Voice => "voice",
+            SpeedKind::Video => "video",
+            SpeedKind::Round => "round",
+        }
+    }
+}
+
+/// Last speed per kind, kept across restarts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Speeds([f64; 3]);
+
+impl Default for Speeds {
+    fn default() -> Self {
+        Speeds([1.0; 3])
+    }
+}
+
+impl Speeds {
+    pub fn get(&self, kind: SpeedKind) -> f64 {
+        self.0[kind as usize]
+    }
+
+    pub fn set(&mut self, kind: SpeedKind, speed: f64) {
+        self.0[kind as usize] = speed;
+    }
+
+    /// "voice 1.5" per line.
+    pub fn parse(text: &str) -> Self {
+        let mut speeds = Speeds::default();
+        for line in text.lines() {
+            let mut parts = line.split_whitespace();
+            let (Some(name), Some(value)) = (parts.next(), parts.next()) else { continue };
+            if let (Some(kind), Ok(speed)) =
+                (SpeedKind::ALL.into_iter().find(|k| k.name() == name), value.parse::<f64>())
+                && (SPEEDS[0]..=SPEEDS[SPEEDS.len() - 1]).contains(&speed)
+            {
+                speeds.set(kind, speed);
+            }
+        }
+        speeds
+    }
+
+    pub fn to_text(&self) -> String {
+        SpeedKind::ALL.iter().map(|k| format!("{} {}\n", k.name(), self.get(*k))).collect()
+    }
+
+    fn path() -> std::path::PathBuf {
+        crate::config::dirs().data_dir().join("speeds")
+    }
+
+    pub fn load() -> Self {
+        std::fs::read_to_string(Self::path()).map(|t| Self::parse(&t)).unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        let path = Self::path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, self.to_text());
+    }
+}
+
 fn scaletempo() -> Result<gst::Element, String> {
     gst::ElementFactory::make("scaletempo")
         .build()
@@ -203,6 +280,18 @@ impl Drop for Audio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speeds_round_trip() {
+        let mut speeds = Speeds::default();
+        speeds.set(SpeedKind::Voice, 1.75);
+        speeds.set(SpeedKind::Round, 2.0);
+        let back = Speeds::parse(&speeds.to_text());
+        assert_eq!(back, speeds);
+        assert_eq!(back.get(SpeedKind::Video), 1.0);
+        // Garbage and out-of-range values fall back to 1x.
+        assert_eq!(Speeds::parse("voice 99\nvideo x\nnope 2"), Speeds::default());
+    }
 
     #[test]
     fn speed_steps() {

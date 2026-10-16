@@ -29,3 +29,8 @@ tiny-skia = "0.11.4"
 tokio = { version = "1", features = ["rt", "time"] }
 toml = "1.1.8"
 url = "2.5.8"
+zbus = { version = "5.19", default-features = false }
+
+[profile.release]
+incremental = true
+codegen-units = 256

@@ -182,6 +182,26 @@ pub async fn start_download(file_id: i32, offset: i64) -> Res<()> {
         .map_err(err)
 }
 
+/// Delete cached files (photos, videos, voice, …) not opened for `days`
+/// days; profile photos stay. Returns the bytes freed.
+pub async fn clean_cache(days: i32) -> Res<i64> {
+    let enums::StorageStatistics::StorageStatistics(deleted) = functions::optimize_storage(
+        1 << 50, // no size limit, only age
+        days.max(0) * 86_400,
+        i32::MAX,
+        if days == 0 { 0 } else { -1 },
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        true,
+        0,
+        client(),
+    )
+    .await
+    .map_err(err)?;
+    Ok(deleted.size)
+}
+
 /// Download in the background at low priority, so the message's media
 /// survives if it gets deleted.
 pub async fn prefetch(file_id: i32) -> Res<()> {

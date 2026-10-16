@@ -5657,6 +5657,7 @@ dependencies = [
  "tokio",
  "toml",
  "url",
+ "zbus",
 ]
 
 [[package]]
