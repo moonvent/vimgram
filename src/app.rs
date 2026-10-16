@@ -12,7 +12,8 @@ use tdlib_rs::types::{ChatNotificationSettings, ChatPhotoInfo, ChatPosition};
 
 use crate::archive::{Archive, Record};
 use crate::config::{self, Config};
-use crate::{export, notify};
+use crate::clipboard::{self, Clip};
+use crate::{autostart, export, icon, notify, tray};
 use crate::media::{self, Kind, Loaded, Shared, Store};
 use crate::player::{self, Audio, Movie};
 use crate::tg::{self, ChatKind, Folder, ListKey, Media, Msg, Presence, Scope, SendOptions, Sender, User};
@@ -46,7 +47,7 @@ const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l panes  J/K g
                     yy/Y copy  p/P paste  Space play/pause  [ ] speed  = 1x  H/L seek  \
                     / filter chats or search messages  n/N next/prev match  ga attach  gp pinned  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
-                    :folder  :theme  :q";
+                    :folder  :theme  :autostart  :q";
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -109,8 +110,16 @@ pub enum Message {
     Picked(Vec<PathBuf>),
     Exported(Result<(PathBuf, usize), String>),
     WindowEvent(window::Event),
+    WindowOpened,
+    WindowClosed(window::Id),
+    CloseRequested(window::Id),
+    Tray(tray::Output),
+    /// A notification of this chat was clicked.
+    NotificationClicked(i64),
+    Autostart(Result<String, String>),
     TallScroll(Viewport),
     Paste(Option<String>),
+    Clip(Result<Clip, String>),
     ClickFolder(usize),
     ClickChat(i64),
     SelectMsg(i64),
@@ -347,6 +356,15 @@ impl OpenChat {
     }
 }
 
+/// Add archived deleted messages. Live messages win, except ones already
+/// known to be deleted: their archived copy has the media files.
+fn restore_archived(msgs: &mut Vec<Msg>, records: Vec<Record>) {
+    let archived: Vec<Msg> = records.into_iter().map(Msg::from).collect();
+    // A deleted album goes as a whole; `merge_albums` rebuilds it from parts.
+    msgs.retain(|m| !m.deleted || !archived.iter().any(|a| m.contains(a.id)));
+    msgs.extend(archived);
+}
+
 /// Telegram sends each album item as its own message; show them as one.
 fn merge_albums(msgs: &mut Vec<Msg>) {
     let mut merged: Vec<Msg> = Vec::with_capacity(msgs.len());
@@ -436,6 +454,29 @@ pub struct App {
     pub status: Option<Status>,
     pub theme: Theme,
     pub size: Size,
+    /// The window, while it is open (closed to the tray otherwise).
+    window: Option<window::Id>,
+    /// The tray icon, once waybar (or another tray) shows it.
+    tray: Option<tray::Handle>,
+    /// Unread count last shown by the tray icon.
+    tray_unread: i32,
+    /// Media file id → (chat, message), to archive files once downloaded.
+    file_owner: HashMap<i32, (i64, i64)>,
+    /// Files to send with the next message (pasted or picked).
+    pub attachments: Vec<PathBuf>,
+}
+
+fn window_settings(size: Size) -> window::Settings {
+    window::Settings {
+        size,
+        icon: icon::window_icon(),
+        exit_on_close_request: false,
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: "vimgram".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 pub fn find_theme(name: &str) -> Option<Theme> {
@@ -454,9 +495,11 @@ fn normalize_name(s: &str) -> String {
 }
 
 impl App {
-    pub fn new(cfg: Config) -> (Self, Task<Message>) {
+    /// `hidden`: start in the tray (autostart) instead of opening the window.
+    pub fn new(cfg: Config, hidden: bool) -> (Self, Task<Message>) {
         let theme = find_theme(&cfg.theme).unwrap_or(Theme::TokyoNight);
-        let app = App {
+        clipboard::clean_old_pastes();
+        let mut app = App {
             cfg,
             auth: Auth::Starting,
             mode: Mode::Normal,
@@ -503,18 +546,50 @@ impl App {
             status: None,
             theme,
             size: Size::new(1200.0, 800.0),
+            window: None,
+            tray: None,
+            tray_unread: 0,
+            file_owner: HashMap::new(),
+            attachments: Vec::new(),
         };
-        (app, Task::perform(tg::start(), Message::Done))
+        let window = if hidden && app.cfg.tray { Task::none() } else { app.open_window() };
+        (app, Task::batch([Task::perform(tg::start(), Message::Done), window]))
     }
 
-    pub fn title(&self) -> String {
+    fn open_window(&mut self) -> Task<Message> {
+        if let Some(id) = self.window {
+            return window::gain_focus(id);
+        }
+        let (id, opened) = window::open(window_settings(self.size));
+        self.window = Some(id);
+        self.focused = true;
+        opened.map(|_| Message::WindowOpened)
+    }
+
+    /// Close the window but keep running in the tray.
+    fn hide_window(&mut self) -> Task<Message> {
+        match self.window.take() {
+            Some(id) => {
+                self.focused = false;
+                // Nothing plays to a closed window.
+                self.stop_recording(false);
+                self.voice = None;
+                self.video = None;
+                self.viewer = None;
+                window::close(id)
+            }
+            None => Task::none(),
+        }
+    }
+
+    pub fn title(&self, _window: window::Id) -> String {
         match self.open.as_ref().and_then(|o| self.chats.get(&o.id)) {
             Some(chat) => format!("{} — vimgram", chat.title),
             None => "vimgram".into(),
         }
     }
 
-    pub fn theme(&self) -> Theme {
+    pub fn theme(&self, _window: window::Id) -> Theme {
         self.theme.clone()
     }
 
@@ -532,8 +607,14 @@ impl App {
             Subscription::run(tg::updates).map(Message::Tg),
             keyboard::listen().map(Message::Key),
             window::resize_events().map(|(_, size)| Message::Resized(size)),
-            window::close_requests().map(|_| Message::Quit),
+            window::close_requests().map(Message::CloseRequested),
+            window::close_events().map(Message::WindowClosed),
             window::events().map(|(_, event)| Message::WindowEvent(event)),
+            if self.cfg.tray {
+                Subscription::run(tray::run).map(Message::Tray)
+            } else {
+                Subscription::none()
+            },
             tick,
         ])
     }
@@ -600,15 +681,68 @@ impl App {
             ChatKind::Group => format!("{} · {}", self.sender_name(msg.sender), chat.title),
             _ => chat.title.clone(),
         };
-        Task::perform(notify::show(title, notify::preview(&msg.summary())), |()| {
-            Message::Done(Ok(()))
-        })
+        let body = notify::preview(&msg.summary());
+        let (chat_id, avatar) = (chat.id, chat.avatar);
+        Task::perform(
+            async move {
+                // The chat photo with the app icon in its corner.
+                let image = match avatar {
+                    Some(file) => match tg::download(file, 16).await {
+                        Ok(path) => tokio::task::spawn_blocking(move || {
+                            icon::notification_image(std::path::Path::new(&path), file)
+                        })
+                        .await
+                        .ok()
+                        .flatten(),
+                        Err(_) => None,
+                    },
+                    None => None,
+                };
+                let app_icon = icon::png_path();
+                let image = image.or_else(|| app_icon.clone());
+                notify::show(title, body, image, app_icon).await
+            },
+            move |clicked| {
+                if clicked {
+                    Message::NotificationClicked(chat_id)
+                } else {
+                    Message::Done(Ok(()))
+                }
+            },
+        )
     }
 
-    fn archive_save(&self, msgs: &[Msg]) {
-        if let Some(archive) = &self.archive {
-            archive.save(msgs);
+    /// Archive messages, and their media files as they get downloaded.
+    fn archive_save(&mut self, msgs: &[Msg]) {
+        let Some(archive) = &self.archive else { return };
+        archive.save(msgs);
+        for msg in msgs.iter().filter(|m| !m.deleted && !m.scheduled) {
+            for (file_id, path) in &msg.local_files {
+                archive.link(msg.chat_id, msg.id, *file_id, path.clone());
+            }
+            for media in &msg.media {
+                for (file_id, _) in media.files() {
+                    self.file_owner.insert(file_id, (msg.chat_id, msg.id));
+                }
+            }
         }
+    }
+
+    /// Download the media of an incoming message right away (in private
+    /// chats and groups), so it is archived even if deleted unseen.
+    fn prefetch(&self, msg: &Msg) -> Task<Message> {
+        let channel = self.chats.get(&msg.chat_id).is_none_or(|c| c.kind == ChatKind::Channel);
+        if msg.outgoing || channel || self.archive.is_none() {
+            return Task::none();
+        }
+        let limit = i64::from(self.cfg.prefetch_mb) * 1024 * 1024;
+        Task::batch(
+            msg.media
+                .iter()
+                .flat_map(Media::files)
+                .filter(|&(_, size)| size <= limit)
+                .map(|(file, _)| Task::perform(tg::prefetch(file), |_| Message::Done(Ok(())))),
+        )
     }
 
     /// Bring back messages deleted in `lo..=hi` that the archive remembers.
@@ -638,7 +772,7 @@ impl App {
     /// Size of the message list, which shrinks with the compose box.
     pub fn viewport(&self) -> (f32, f32) {
         let pinned = self.open.as_ref().is_some_and(|o| o.pinned.is_some());
-        view::messages_viewport(self.size, &self.input, self.compose != Compose::New, pinned)
+        view::messages_viewport(self.size, &self.input, view::has_banner(self), pinned)
     }
 
     pub fn viewer_media(&self) -> Option<&Media> {
@@ -656,7 +790,37 @@ impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.handle(message);
         // Whatever changed, make sure what is on screen gets downloaded.
-        Task::batch([task, self.fetch_visible()])
+        Task::batch([task, self.fetch_visible(), self.sync_tray()])
+    }
+
+    /// Unread chats (not muted, not archived) for the tray icon.
+    fn sync_tray(&mut self) -> Task<Message> {
+        let Some(tray) = &self.tray else {
+            return Task::none();
+        };
+        let unread = self
+            .chats
+            .values()
+            .filter(|c| c.unread > 0 && c.order(ListKey::Main).is_some() && !self.muted(c))
+            .count() as i32;
+        if unread == self.tray_unread {
+            return Task::none();
+        }
+        self.tray_unread = unread;
+        Task::perform(tray.clone().set_unread(unread), |()| Message::Done(Ok(())))
+    }
+
+    /// Select a chat in the sidebar, switching to the main list if the
+    /// current folder doesn't have it.
+    fn select_chat(&mut self, chat_id: i64) {
+        if !self.list.contains(&chat_id) {
+            self.folder = 0;
+            self.filter.clear();
+            self.list_dirty = true;
+            self.refresh_list();
+        }
+        self.selected = Some(chat_id);
+        self.scroll_chats();
     }
 
     fn handle(&mut self, message: Message) -> Task<Message> {
@@ -762,7 +926,7 @@ impl App {
                 match result {
                     Ok(records) if !records.is_empty() => {
                         if let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id) {
-                            open.edit(|msgs| msgs.extend(records.into_iter().map(Msg::from)));
+                            open.edit(|msgs| restore_archived(msgs, records));
                             self.scroll_messages();
                         }
                     }
@@ -788,7 +952,10 @@ impl App {
                     Task::none()
                 }
             },
-            Message::Picked(paths) => self.send_files(paths),
+            Message::Picked(paths) => {
+                self.attach(paths);
+                Task::none()
+            }
             Message::Exported(result) => {
                 match result {
                     Ok((path, count)) => self.info(format!("Exported {count} messages to {}", path.display())),
@@ -804,6 +971,81 @@ impl App {
                 }
                 Task::none()
             }
+            Message::WindowOpened => {
+                self.scroll_messages();
+                Task::none()
+            }
+            Message::WindowClosed(id) => {
+                if self.window == Some(id) {
+                    self.window = None;
+                    self.focused = false;
+                }
+                // Without a tray there is no way back: quit.
+                if self.window.is_none() && self.tray.is_none() {
+                    return self.handle(Message::Quit);
+                }
+                Task::none()
+            }
+            Message::CloseRequested(id) if self.window != Some(id) => window::close(id),
+            Message::CloseRequested(_) => {
+                if self.tray.is_some() && self.cfg.close_to_tray {
+                    self.hide_window()
+                } else {
+                    self.handle(Message::Quit)
+                }
+            }
+            Message::Tray(tray::Output::Ready(handle)) => {
+                self.tray = Some(handle.clone());
+                self.tray_unread = 0;
+                self.list_dirty = true;
+                self.refresh_list();
+                Task::none()
+            }
+            Message::Tray(tray::Output::Failed(e)) => {
+                eprintln!("vimgram: no tray icon: {e}");
+                // Started hidden but nothing can show us: open the window.
+                if self.window.is_none() { self.open_window() } else { Task::none() }
+            }
+            Message::Tray(tray::Output::Event(event)) => match event {
+                tray::Event::Toggle if self.window.is_some() && self.focused => self.hide_window(),
+                tray::Event::Toggle | tray::Event::Show => self.open_window(),
+                tray::Event::Quit => self.handle(Message::Quit),
+            },
+            Message::NotificationClicked(chat_id) => {
+                let window = self.open_window();
+                if self.auth != Auth::Ready {
+                    return window;
+                }
+                self.select_chat(chat_id);
+                Task::batch([window, self.open_chat(chat_id)])
+            }
+            Message::Autostart(result) => {
+                match result {
+                    Ok(text) => self.info(text),
+                    Err(e) => self.error(format!("Autostart: {e}")),
+                }
+                Task::none()
+            }
+            Message::Clip(Ok(Clip::Text(text))) => {
+                self.on_paste(Some(text));
+                Task::none()
+            }
+            Message::Clip(Ok(Clip::Files(paths))) => {
+                match self.paste {
+                    PasteTarget::Cmdline => {
+                        let text: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+                        self.on_paste(Some(text.join(" ")));
+                    }
+                    PasteTarget::Input(_) => self.attach(paths),
+                }
+                Task::none()
+            }
+            Message::Clip(Ok(Clip::Empty)) => {
+                self.error("Clipboard is empty");
+                Task::none()
+            }
+            // No wl-paste (or not Wayland): plain text through iced.
+            Message::Clip(Err(_)) => iced::clipboard::read().map(Message::Paste),
             Message::TallScroll(viewport) => {
                 self.tall_offset = viewport.absolute_offset().y;
                 self.tall_max = Some((viewport.content_bounds().height - viewport.bounds().height).max(0.0));
@@ -847,7 +1089,8 @@ impl App {
                 self.voice = None;
                 self.video = None;
                 self.info("Closing…");
-                Task::perform(tg::close(), |()| Message::Exit)
+                let window = self.window.take().map_or_else(Task::none, window::close);
+                Task::batch([window, Task::perform(tg::close(), |()| Message::Exit)])
             }
             Message::Exit => iced::exit(),
         }
@@ -957,7 +1200,8 @@ impl App {
                 let msg = Msg::from(u.message);
                 self.archive_save(std::slice::from_ref(&msg));
                 let notify = self.notification(&msg);
-                return Task::batch([notify, self.on_new_message(msg)]);
+                let prefetch = self.prefetch(&msg);
+                return Task::batch([notify, prefetch, self.on_new_message(msg)]);
             }
             Update::MessageSendSucceeded(u) => {
                 let msg = Msg::from(u.message);
@@ -982,7 +1226,7 @@ impl App {
                     let msg = &mut open.msgs[i];
                     msg.media = tg::media(&u.new_content).into_iter().collect();
                     if msg.media.is_empty() {
-                        msg.text = tg::content_text(&u.new_content);
+                        msg.text = tg::content_text(&u.new_content, msg.outgoing);
                     }
                     let msg = msg.clone();
                     self.archive_save(&[msg]);
@@ -1000,11 +1244,40 @@ impl App {
                 if let Some(archive) = &self.archive {
                     archive.mark_deleted(u.chat_id, u.message_ids.clone());
                 }
-                // Keep showing deleted messages, marked as such.
+                // Keep showing deleted messages, marked as such…
                 if let Some(open) = self.open.as_mut().filter(|o| o.id == u.chat_id) {
-                    for msg in open.msgs.iter_mut().filter(|m| u.message_ids.contains(&m.id)) {
+                    let mut shown = false;
+                    // Albums count as deleted once all their parts are.
+                    for msg in open.msgs.iter_mut().filter(|m| m.members.iter().all(|id| u.message_ids.contains(id))) {
                         msg.deleted = true;
+                        shown = true;
                     }
+                    // …with their media from the archive: TDLib deletes the files.
+                    if shown && let Some(archive) = self.archive.clone() {
+                        let lo = u.message_ids.iter().copied().min().unwrap_or(0);
+                        let hi = u.message_ids.iter().copied().max().unwrap_or(0);
+                        let chat_id = u.chat_id;
+                        return Task::perform(
+                            async move {
+                                tokio::task::spawn_blocking(move || {
+                                    archive.flush();
+                                    archive.deleted_between(chat_id, lo, hi)
+                                })
+                                .await
+                                .map_err(|e| e.to_string())?
+                            },
+                            move |result| Message::Archived { chat_id, result },
+                        );
+                    }
+                }
+            }
+            Update::File(u) => {
+                let file = u.file;
+                if file.local.is_downloading_completed
+                    && let Some((chat_id, msg_id)) = self.file_owner.get(&file.id).copied()
+                    && let Some(archive) = &self.archive
+                {
+                    archive.link(chat_id, msg_id, file.id, file.local.path);
                 }
             }
             _ => {}
@@ -1087,9 +1360,10 @@ impl App {
                 return Task::none();
             }
         };
-        if let Some(archive) = &self.archive {
-            archive.save(&batch);
-        }
+        self.archive_save(&batch);
+        let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id) else {
+            return Task::none();
+        };
         if newer {
             // The page includes the message it starts from.
             if batch.len() <= 1 {
@@ -1276,9 +1550,10 @@ impl App {
                 return Task::none();
             }
         };
-        if let Some(archive) = &self.archive {
-            archive.save(&batch);
-        }
+        self.archive_save(&batch);
+        let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id) else {
+            return Task::none();
+        };
         let ids: Vec<i64> = batch.iter().map(|m| m.id).collect();
         let lo = ids.iter().copied().min().unwrap_or(0);
         let hi = ids.iter().copied().max().unwrap_or(0);
@@ -1419,6 +1694,10 @@ impl App {
         let Some(open) = &self.open else {
             return Task::none();
         };
+        if !self.attachments.is_empty() && !matches!(self.compose, Compose::Edit(_)) {
+            let paths = std::mem::take(&mut self.attachments);
+            return self.send_files(paths, options);
+        }
         let text = self.input.as_str().trim();
         if text.is_empty() {
             self.error("Nothing to send: write a message first (i)");
@@ -1461,8 +1740,33 @@ impl App {
         )
     }
 
+    /// Stage files for the next message; Enter sends them, the composed
+    /// text becomes their caption.
+    fn attach(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        if self.open.is_none() {
+            self.error("Open a chat first (Enter)");
+            return;
+        }
+        if let Some(missing) = paths.iter().find(|p| !p.is_file()) {
+            self.error(format!("No such file: {}", missing.display()));
+            return;
+        }
+        if matches!(self.compose, Compose::Edit(_)) {
+            self.compose = Compose::New;
+            self.input.clear();
+        }
+        self.attachments.extend(paths);
+        self.focus = Focus::Messages;
+        self.mode = Mode::Insert;
+        self.info("Enter sends the attachment (the text is its caption), Esc then Esc drops it");
+        self.scroll_messages();
+    }
+
     /// Send files; the composed text becomes the caption of the first one.
-    fn send_files(&mut self, paths: Vec<PathBuf>) -> Task<Message> {
+    fn send_files(&mut self, paths: Vec<PathBuf>, mut options: SendOptions) -> Task<Message> {
         let Some(chat_id) = self.open.as_ref().map(|o| o.id) else {
             return Task::none();
         };
@@ -1473,20 +1777,57 @@ impl App {
             self.error(format!("No such file: {}", missing.display()));
             return Task::none();
         }
-        let mut options = SendOptions::default();
         if let Compose::Reply(id) = self.compose {
             options.reply_to = Some(id);
         }
-        let mut caption = match self.compose {
+        let caption = match self.compose {
             Compose::Edit(_) => String::new(),
             _ => self.input.take().trim().to_owned(),
         };
         self.compose = Compose::New;
-        self.info(format!("Sending {} file(s)…", paths.len()));
-        Task::batch(paths.into_iter().map(|path| {
-            let caption = std::mem::take(&mut caption);
-            Task::perform(tg::send_file(chat_id, path, caption, options), Message::Done)
-        }))
+        self.mode = Mode::Normal;
+        self.info(match paths.len() {
+            1 => "Sending the file…".to_owned(),
+            n => format!("Sending {n} files…"),
+        });
+        Task::perform(tg::send_files(chat_id, paths, caption, options), Message::Done)
+    }
+
+    /// `:autostart` shows the state, `:autostart on|off` changes it.
+    fn autostart(&mut self, arg: Option<&str>) -> Task<Message> {
+        let on = match arg.map(str::trim) {
+            None | Some("") => None,
+            Some("on" | "1" | "true" | "yes") => Some(true),
+            Some("off" | "0" | "false" | "no") => Some(false),
+            Some(other) => {
+                self.error(format!("Usage: :autostart [on|off], not {other}"));
+                return Task::none();
+            }
+        };
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || match on {
+                    None => Ok(match autostart::current() {
+                        Some(autostart::Method::Systemd) => "Autostart is on (systemd user service vimgram.service)",
+                        Some(autostart::Method::Xdg) => "Autostart is on (~/.config/autostart/vimgram.desktop)",
+                        None => "Autostart is off — :autostart on",
+                    }
+                    .to_owned()),
+                    Some(true) => autostart::enable().map(|method| match method {
+                        autostart::Method::Systemd => {
+                            "Autostart on: vimgram.service starts with the graphical session, in the tray".to_owned()
+                        }
+                        autostart::Method::Xdg => {
+                            "Autostart on: ~/.config/autostart/vimgram.desktop (starts in the tray)".to_owned()
+                        }
+                    }),
+                    Some(false) => autostart::disable().map(|()| "Autostart off".to_owned()),
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            },
+            Message::Autostart,
+        )
     }
 
     fn export(&mut self, arg: Option<&str>) -> Task<Message> {
@@ -1939,7 +2280,11 @@ impl App {
 
     fn read_clipboard(&mut self, target: PasteTarget) -> Task<Message> {
         self.paste = target;
-        iced::clipboard::read().map(Message::Paste)
+        // The login form only takes text.
+        if self.auth != Auth::Ready {
+            return iced::clipboard::read().map(Message::Paste);
+        }
+        Task::perform(clipboard::read(), Message::Clip)
     }
 
     fn on_paste(&mut self, text: Option<String>) {
@@ -2007,7 +2352,11 @@ impl App {
             }
             ("d" | "date", Some(value)) => return self.jump_to_date(value),
             ("a" | "attach", None) => return self.pick_files(),
-            ("a" | "attach", Some(path)) => return self.send_files(vec![expand_home(path)]),
+            ("a" | "attach", Some(path)) => {
+                self.attach(vec![expand_home(path)]);
+                return Task::none();
+            }
+            ("autostart", arg) => return self.autostart(arg),
             ("silent", _) => {
                 return self.send_with(SendOptions {
                     silent: true,
@@ -2210,6 +2559,10 @@ impl App {
             }
             Action::Cancel => {
                 self.pending.clear();
+                if !self.attachments.is_empty() {
+                    self.attachments.clear();
+                    self.info("Attachment dropped");
+                }
                 if self.forward.take().is_some() {
                     self.info("Forward cancelled");
                 }
@@ -2569,124 +2922,6 @@ fn parse_date(arg: &str) -> Option<chrono::NaiveDate> {
     NaiveDate::from_ymd_opt(today.year(), month.parse().ok()?, day.parse().ok()?)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::NaiveDate;
-
-    #[test]
-    fn schedule_times() {
-        use chrono::TimeZone;
-        let now = chrono::Local.with_ymd_and_hms(2026, 10, 16, 20, 0, 0).unwrap();
-        let at = |s: &str| parse_when(s, now).map(|t| chrono::Local.timestamp_opt(i64::from(t), 0).unwrap());
-        assert_eq!(at("21:30"), chrono::Local.with_ymd_and_hms(2026, 10, 16, 21, 30, 0).single());
-        // Already past today: tomorrow.
-        assert_eq!(at("09:00"), chrono::Local.with_ymd_and_hms(2026, 10, 17, 9, 0, 0).single());
-        assert_eq!(at("+30m"), Some(now + chrono::Duration::minutes(30)));
-        assert_eq!(at("+2h"), Some(now + chrono::Duration::hours(2)));
-        assert_eq!(at("01.11 09:15"), chrono::Local.with_ymd_and_hms(2026, 11, 1, 9, 15, 0).single());
-        assert_eq!(at("01.01.2020 10:00"), None);
-        assert_eq!(at("soon"), None);
-    }
-
-    fn msg(id: i64, album: i64) -> Msg {
-        Msg {
-            id,
-            chat_id: 1,
-            sender: Sender::User(1),
-            outgoing: false,
-            date: 0,
-            edited: false,
-            text: format!("m{id}"),
-            media: Vec::new(),
-            album,
-            members: vec![id],
-            reply_to: None,
-            sending: false,
-            scheduled: false,
-            deleted: false,
-        }
-    }
-
-    #[test]
-    fn albums_merge_in_any_order() {
-        let mut chat = OpenChat::new(1);
-        chat.edit(|m| m.extend([msg(1, 0), msg(3, 7), msg(4, 7)]));
-        assert_eq!(chat.msgs.len(), 2);
-        // An older part of the album arrives later (previous history page).
-        chat.edit(|m| m.push(msg(2, 7)));
-        assert_eq!(chat.msgs.len(), 2);
-        assert_eq!(chat.msgs[1].members, vec![2, 3, 4]);
-        assert_eq!(chat.position(4), Some(1));
-        // Seeing a part again does not duplicate it.
-        chat.edit(|m| m.push(msg(3, 7)));
-        assert_eq!(chat.msgs[1].members, vec![2, 3, 4]);
-    }
-
-    #[test]
-    fn edits_keep_the_cursor_on_its_message() {
-        let mut chat = OpenChat::new(1);
-        chat.edit(|m| m.extend((10..20).map(|id| msg(id, 0))));
-        chat.cursor = chat.position(15).unwrap();
-        chat.edit(|m| m.extend((0..10).map(|id| msg(id, 0))));
-        assert_eq!(chat.msgs[chat.cursor].id, 15);
-        // Deleting the cursor's message moves it to the next one.
-        chat.edit(|m| m.retain(|x| x.id != 15));
-        assert_eq!(chat.msgs[chat.cursor].id, 16);
-    }
-
-    #[test]
-    fn deleted_messages_from_the_archive_never_replace_live_ones() {
-        let mut chat = OpenChat::new(1);
-        chat.edit(|m| m.extend([msg(1, 0), msg(2, 0)]));
-        let mut ghost = msg(2, 0);
-        ghost.deleted = true;
-        ghost.text = "old".into();
-        let mut gone = msg(3, 0);
-        gone.deleted = true;
-        chat.edit(|m| m.extend([ghost, gone]));
-        assert_eq!(chat.msgs.len(), 3);
-        assert!(!chat.msgs[1].deleted);
-        assert!(chat.msgs[2].deleted);
-    }
-
-    #[test]
-    fn viewer_walks_photos_across_albums() {
-        use crate::tg::FileRef;
-        let photo = || Media::Photo {
-            preview: FileRef { id: 1, width: 10, height: 10 },
-            full: FileRef { id: 2, width: 10, height: 10 },
-        };
-        let mut chat = OpenChat::new(1);
-        let mut a = msg(1, 0);
-        a.media = vec![photo(), photo()];
-        let b = msg(2, 0);
-        let mut c = msg(3, 0);
-        c.media = vec![photo()];
-        chat.edit(|m| m.extend([a, b, c]));
-        let start = Viewer { msg_id: 1, item: 1 };
-        assert_eq!(chat.viewable_near(start, 1), Some(Viewer { msg_id: 3, item: 0 }));
-        assert_eq!(chat.viewable_near(start, -1), Some(Viewer { msg_id: 1, item: 0 }));
-        assert_eq!(chat.viewable_near(Viewer { msg_id: 3, item: 0 }, 1), None);
-    }
-
-    #[test]
-    fn themes_by_loose_name() {
-        assert_eq!(find_theme("tokyo night"), Some(Theme::TokyoNight));
-        assert_eq!(find_theme("Catppuccin-Mocha"), Some(Theme::CatppuccinMocha));
-        assert_eq!(find_theme("nope"), None);
-    }
-
-    #[test]
-    fn dates() {
-        assert_eq!(parse_date("01.05.2024"), NaiveDate::from_ymd_opt(2024, 5, 1));
-        assert_eq!(parse_date("2024-05-01"), NaiveDate::from_ymd_opt(2024, 5, 1));
-        assert_eq!(parse_date("01.05.24"), NaiveDate::from_ymd_opt(2024, 5, 1));
-        assert!(parse_date("01.05").is_some());
-        assert!(parse_date("yesterday").is_some());
-        assert_eq!(parse_date("nonsense"), None);
-    }
-}
 
 fn history_path() -> PathBuf {
     config::dirs().data_dir().join("cmdline_history")
@@ -2745,4 +2980,124 @@ fn parse_when(arg: &str, now: chrono::DateTime<chrono::Local>) -> Option<i32> {
         at += Span::days(1);
     }
     (at > now).then(|| i32::try_from(at.timestamp()).ok()).flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    #[test]
+    fn schedule_times() {
+        use chrono::TimeZone;
+        let now = chrono::Local.with_ymd_and_hms(2026, 10, 16, 20, 0, 0).unwrap();
+        let at = |s: &str| parse_when(s, now).map(|t| chrono::Local.timestamp_opt(i64::from(t), 0).unwrap());
+        assert_eq!(at("21:30"), chrono::Local.with_ymd_and_hms(2026, 10, 16, 21, 30, 0).single());
+        // Already past today: tomorrow.
+        assert_eq!(at("09:00"), chrono::Local.with_ymd_and_hms(2026, 10, 17, 9, 0, 0).single());
+        assert_eq!(at("+30m"), Some(now + chrono::Duration::minutes(30)));
+        assert_eq!(at("+2h"), Some(now + chrono::Duration::hours(2)));
+        assert_eq!(at("01.11 09:15"), chrono::Local.with_ymd_and_hms(2026, 11, 1, 9, 15, 0).single());
+        assert_eq!(at("01.01.2020 10:00"), None);
+        assert_eq!(at("soon"), None);
+    }
+
+    fn msg(id: i64, album: i64) -> Msg {
+        Msg {
+            id,
+            chat_id: 1,
+            sender: Sender::User(1),
+            outgoing: false,
+            date: 0,
+            edited: false,
+            text: format!("m{id}"),
+            media: Vec::new(),
+            album,
+            members: vec![id],
+            reply_to: None,
+            sending: false,
+            scheduled: false,
+            deleted: false,
+            local_files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn albums_merge_in_any_order() {
+        let mut chat = OpenChat::new(1);
+        chat.edit(|m| m.extend([msg(1, 0), msg(3, 7), msg(4, 7)]));
+        assert_eq!(chat.msgs.len(), 2);
+        // An older part of the album arrives later (previous history page).
+        chat.edit(|m| m.push(msg(2, 7)));
+        assert_eq!(chat.msgs.len(), 2);
+        assert_eq!(chat.msgs[1].members, vec![2, 3, 4]);
+        assert_eq!(chat.position(4), Some(1));
+        // Seeing a part again does not duplicate it.
+        chat.edit(|m| m.push(msg(3, 7)));
+        assert_eq!(chat.msgs[1].members, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn edits_keep_the_cursor_on_its_message() {
+        let mut chat = OpenChat::new(1);
+        chat.edit(|m| m.extend((10..20).map(|id| msg(id, 0))));
+        chat.cursor = chat.position(15).unwrap();
+        chat.edit(|m| m.extend((0..10).map(|id| msg(id, 0))));
+        assert_eq!(chat.msgs[chat.cursor].id, 15);
+        // Deleting the cursor's message moves it to the next one.
+        chat.edit(|m| m.retain(|x| x.id != 15));
+        assert_eq!(chat.msgs[chat.cursor].id, 16);
+    }
+
+    #[test]
+    fn deleted_messages_from_the_archive_never_replace_live_ones() {
+        let mut chat = OpenChat::new(1);
+        chat.edit(|m| m.extend([msg(1, 0), msg(2, 0)]));
+        let mut ghost = msg(2, 0);
+        ghost.deleted = true;
+        ghost.text = "old".into();
+        let mut gone = msg(3, 0);
+        gone.deleted = true;
+        chat.edit(|m| m.extend([ghost, gone]));
+        assert_eq!(chat.msgs.len(), 3);
+        assert!(!chat.msgs[1].deleted);
+        assert!(chat.msgs[2].deleted);
+    }
+
+    #[test]
+    fn viewer_walks_photos_across_albums() {
+        use crate::tg::FileRef;
+        let photo = || Media::Photo {
+            preview: FileRef { id: 1, width: 10, height: 10, size: 0 },
+            full: FileRef { id: 2, width: 10, height: 10, size: 0 },
+        };
+        let mut chat = OpenChat::new(1);
+        let mut a = msg(1, 0);
+        a.media = vec![photo(), photo()];
+        let b = msg(2, 0);
+        let mut c = msg(3, 0);
+        c.media = vec![photo()];
+        chat.edit(|m| m.extend([a, b, c]));
+        let start = Viewer { msg_id: 1, item: 1 };
+        assert_eq!(chat.viewable_near(start, 1), Some(Viewer { msg_id: 3, item: 0 }));
+        assert_eq!(chat.viewable_near(start, -1), Some(Viewer { msg_id: 1, item: 0 }));
+        assert_eq!(chat.viewable_near(Viewer { msg_id: 3, item: 0 }, 1), None);
+    }
+
+    #[test]
+    fn themes_by_loose_name() {
+        assert_eq!(find_theme("tokyo night"), Some(Theme::TokyoNight));
+        assert_eq!(find_theme("Catppuccin-Mocha"), Some(Theme::CatppuccinMocha));
+        assert_eq!(find_theme("nope"), None);
+    }
+
+    #[test]
+    fn dates() {
+        assert_eq!(parse_date("01.05.2024"), NaiveDate::from_ymd_opt(2024, 5, 1));
+        assert_eq!(parse_date("2024-05-01"), NaiveDate::from_ymd_opt(2024, 5, 1));
+        assert_eq!(parse_date("01.05.24"), NaiveDate::from_ymd_opt(2024, 5, 1));
+        assert!(parse_date("01.05").is_some());
+        assert!(parse_date("yesterday").is_some());
+        assert_eq!(parse_date("nonsense"), None);
+    }
 }

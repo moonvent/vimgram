@@ -1,12 +1,17 @@
 mod app;
 mod archive;
+mod autostart;
+mod clipboard;
 mod config;
 mod export;
+mod fonts;
+mod icon;
 mod media;
 mod notify;
 mod player;
 mod stream;
 mod tg;
+mod tray;
 mod view;
 mod vim;
 mod voice;
@@ -23,12 +28,17 @@ fn main() -> iced::Result {
             std::process::exit(1);
         }
     };
+    // `--hidden`: start in the tray (used by autostart).
+    let hidden = std::env::args().any(|a| a == "--hidden");
+    if let Err(e) = fonts::setup() {
+        eprintln!("vimgram: emoji will be blank: {e}; run scripts/fetch-emoji.sh");
+    }
 
-    iced::application(move || App::new(cfg.clone()), App::update, view::view)
+    // A daemon rather than an application: closing the window to the tray
+    // must not end the program (Wayland can't hide a window, only close it).
+    iced::daemon(move || App::new(cfg.clone(), hidden), App::update, view::view)
         .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription)
-        .exit_on_close_request(false)
-        .window_size((1200.0, 800.0))
         .run()
 }

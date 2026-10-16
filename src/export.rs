@@ -142,6 +142,7 @@ mod tests {
             sending: false,
             scheduled: false,
             deleted,
+            local_files: Vec::new(),
         }
     }
 

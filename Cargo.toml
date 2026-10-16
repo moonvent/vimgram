@@ -12,15 +12,19 @@ futures = { version = "0.3.34", features = ["executor"] }
 gstreamer = "0.23"
 gstreamer-app = "0.23"
 gstreamer-video = "0.23"
-iced = { version = "0.14", features = ["tokio", "image"] }
+iced = { version = "0.14", features = ["tokio", "image", "advanced"] }
 iced_video_player = "0.6"
+image = "0.25"
+ksni = "0.3.6"
 notify-rust = "4.18.2"
 printpdf = "0.12.8"
 rfd = "0.17.2"
 rlottie = "0.5"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 tdlib-rs = { version = "1.4", features = ["local-tdlib"] }
+tiny-skia = "0.11.4"
 tokio = { version = "1", features = ["rt", "time"] }
 toml = "1.1.8"
 url = "2.5.8"

@@ -94,6 +94,8 @@ pub const PRIORITY_VIEWER: i32 = 32;
 /// Decoded animations kept around after scrolling out of view.
 const MAX_HIDDEN_FRAMES: usize = 12;
 const MAX_ANIMATION_FRAMES: usize = 180;
+/// A sticker that takes longer than this to decode is broken.
+const WEBM_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What to decode once a file is downloaded.
 pub struct Job {
@@ -234,8 +236,21 @@ fn bgra_premultiplied_to_rgba(bgra: &[u8]) -> Vec<u8> {
 }
 
 fn decode_webm(path: &str, size: Size) -> Result<Frames, String> {
-    gst::init().map_err(|e| e.to_string())?;
     let (w, h) = (size.width.max(1.0) as u32, size.height.max(1.0) as u32);
+    // GStreamer's alpha decoder rejects stickers whose first frame lacks
+    // the alpha layer; ffmpeg copes with those.
+    let (frames, fps) = match decode_webm_gst(path, w, h) {
+        Ok(decoded) => decoded,
+        Err(gst_error) => decode_webm_ffmpeg(path, w, h).map_err(|e| format!("{gst_error}; {e}"))?,
+    };
+    Ok(Frames {
+        frames,
+        frame_time: Duration::from_secs_f64(1.0 / fps),
+    })
+}
+
+fn decode_webm_gst(path: &str, w: u32, h: u32) -> Result<(Vec<Handle>, f64), String> {
+    gst::init().map_err(|e| e.to_string())?;
     // decodebin picks vp9alphadecodebin, which keeps the alpha channel.
     let description = format!(
         "filesrc location=\"{}\" ! decodebin ! videoconvert ! videoscale ! \
@@ -251,13 +266,30 @@ fn decode_webm(path: &str, size: Size) -> Result<Frames, String> {
         .by_name("sink")
         .and_then(|e| e.downcast::<AppSink>().ok())
         .ok_or_else(|| "webm: no appsink".to_string())?;
+    let bus = pipeline.bus().ok_or_else(|| "webm: no bus".to_string())?;
 
     pipeline.set_state(gst::State::Playing).map_err(|e| e.to_string())?;
+    let deadline = std::time::Instant::now() + WEBM_TIMEOUT;
     let mut frames = Vec::new();
     let mut fps = 30.0;
+    let mut error = None;
+    // A failing pipeline never reaches EOS, so poll the bus between samples.
     while frames.len() < MAX_ANIMATION_FRAMES {
-        let Ok(sample) = sink.pull_sample() else {
-            break; // EOS or error
+        if let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error]) {
+            if let gst::MessageView::Error(e) = msg.view() {
+                error = Some(e.error().to_string());
+            }
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            error = Some("timed out".into());
+            break;
+        }
+        let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_mseconds(50)) else {
+            if sink.is_eos() {
+                break;
+            }
+            continue;
         };
         if let Some(rate) = sample
             .caps()
@@ -272,13 +304,49 @@ fn decode_webm(path: &str, size: Size) -> Result<Frames, String> {
     }
     let _ = pipeline.set_state(gst::State::Null);
 
-    if frames.is_empty() {
-        return Err(format!("webm: no frames decoded from {path}"));
+    match error {
+        Some(e) => Err(format!("webm: {e}")),
+        None if frames.is_empty() => Err(format!("webm: no frames decoded from {path}")),
+        None => Ok((frames, fps)),
     }
-    Ok(Frames {
-        frames,
-        frame_time: Duration::from_secs_f64(1.0 / fps),
-    })
+}
+
+/// Fallback through the ffmpeg binary: libvpx decodes the alpha layer
+/// whenever a frame has one.
+fn decode_webm_ffmpeg(path: &str, w: u32, h: u32) -> Result<(Vec<Handle>, f64), String> {
+    use std::process::{Command, Stdio};
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("ffprobe: {e}"))?;
+    let fps = String::from_utf8_lossy(&probe.stdout)
+        .trim()
+        .split_once('/')
+        .and_then(|(n, d)| Some(n.parse::<f64>().ok()? / d.parse::<f64>().ok()?))
+        .filter(|fps| fps.is_finite() && *fps > 0.0)
+        .unwrap_or(30.0);
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-c:v", "libvpx-vp9", "-i"])
+        .arg(path)
+        .args(["-frames:v", &MAX_ANIMATION_FRAMES.to_string()])
+        .args(["-vf", &format!("scale={w}:{h}"), "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("ffmpeg: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("ffmpeg: {}", String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    let frame_len = (w * h * 4) as usize;
+    let frames: Vec<Handle> = output
+        .stdout
+        .chunks_exact(frame_len)
+        .map(|frame| Handle::from_rgba(w, h, frame.to_vec()))
+        .collect();
+    if frames.is_empty() {
+        return Err(format!("ffmpeg: no frames decoded from {path}"));
+    }
+    Ok((frames, fps))
 }
 
 fn open_video(path: &str) -> Result<Video, String> {
@@ -287,4 +355,33 @@ fn open_video(path: &str) -> Result<Video, String> {
     video.set_muted(true);
     video.set_looping(true);
     Ok(video)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decodes every sticker TDLib has cached; run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn decodes_cached_stickers() {
+        let dir = crate::config::dirs().data_dir().join("db/stickers");
+        let mut failed = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let p = path.to_string_lossy().into_owned();
+            let size = Size::new(160.0, 160.0);
+            let result = match path.extension().and_then(|e| e.to_str()) {
+                Some("tgs") => decode_tgs(&p, size).map(|f| f.frames.len()),
+                Some("webm") => decode_webm(&p, size).map(|f| f.frames.len()),
+                Some("webp") => image::open(&path).map(|_| 1).map_err(|e| e.to_string()),
+                _ => continue,
+            };
+            println!("{p}: {result:?}");
+            if result.is_err() {
+                failed.push(p);
+            }
+        }
+        assert!(failed.is_empty(), "{failed:?}");
+    }
 }

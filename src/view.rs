@@ -51,6 +51,8 @@ const PINNED_H: f32 = 40.0;
 /// previous (too tall) message.
 const MIN_PARTIAL: f32 = 40.0;
 const ALBUM_GAP: f32 = 4.0;
+/// Date separator above the first message of each day.
+const DAY_H: f32 = 30.0;
 
 pub fn chat_rows(size: Size) -> usize {
     (((size.height - STATUS_H - HEADER_H) / CHAT_ROW_H).floor() as usize).max(1)
@@ -141,11 +143,71 @@ pub fn message_height(m: &Msg, width: f32) -> f32 {
     12.0 + 18.0 + reply + media_block_height(&m.media, width) + lines as f32 * LINE_H + MSG_SPACING
 }
 
+fn local_day(unix: i32) -> Option<chrono::NaiveDate> {
+    Some(DateTime::from_timestamp(i64::from(unix), 0)?.with_timezone(&Local).date_naive())
+}
+
+/// The message is the first one of its day among the loaded ones.
+pub fn starts_day(msgs: &[Msg], i: usize) -> bool {
+    match i.checked_sub(1).and_then(|p| msgs.get(p)) {
+        Some(prev) => local_day(prev.date) != local_day(msgs[i].date),
+        None => true,
+    }
+}
+
+/// Height of message `i` in the list, with its date separator.
+pub fn item_height(msgs: &[Msg], i: usize, width: f32) -> f32 {
+    message_height(&msgs[i], width) + if starts_day(msgs, i) { DAY_H } else { 0.0 }
+}
+
+/// "Today", "Yesterday", "Monday, 13 October", "2 March 2024".
+pub fn fmt_day(unix: i32) -> String {
+    let Some(day) = local_day(unix) else {
+        return String::new();
+    };
+    let today = Local::now().date_naive();
+    let days_ago = (today - day).num_days();
+    match days_ago {
+        0 => "Today".into(),
+        1 => "Yesterday".into(),
+        2..=6 => day.format("%A, %-d %B").to_string(),
+        _ if day.format("%Y").to_string() == today.format("%Y").to_string() => day.format("%-d %B").to_string(),
+        _ => day.format("%-d %B %Y").to_string(),
+    }
+}
+
+fn day_separator<'a>(unix: i32) -> Element<'a, Message> {
+    container(
+        container(text(fmt_day(unix)).size(12).style(muted_text))
+            .padding([2.0, 10.0])
+            .style(|t: &Theme| container::Style {
+                background: Some(t.extended_palette().background.weak.color.into()),
+                border: iced::border::rounded(10.0),
+                ..Default::default()
+            }),
+    )
+    .width(Length::Fill)
+    .height(DAY_H - MSG_SPACING)
+    .align_x(Alignment::Center)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// A message of the list, below its date separator when it starts a day.
+fn list_item<'a>(app: &'a App, msgs: &'a [Msg], i: usize, selected: bool, width: f32) -> Element<'a, Message> {
+    let message = message_view(app, &msgs[i], selected, width, starts_run(msgs, i));
+    if starts_day(msgs, i) {
+        column![day_separator(msgs[i].date), message].spacing(MSG_SPACING).into()
+    } else {
+        message
+    }
+}
+
 /// First message that still fits entirely when `bottom` is the last one shown.
 pub fn top_for_bottom(msgs: &[Msg], bottom: usize, width: f32, height: f32) -> usize {
     let mut used = 0.0;
     for i in (0..=bottom).rev() {
-        used += message_height(&msgs[i], width);
+        used += item_height(msgs, i, width);
         if used > height {
             return (i + 1).min(bottom);
         }
@@ -156,8 +218,8 @@ pub fn top_for_bottom(msgs: &[Msg], bottom: usize, width: f32, height: f32) -> u
 /// Last message that still fits entirely when `top` is the first one shown.
 pub fn bottom_for_top(msgs: &[Msg], top: usize, width: f32, height: f32) -> usize {
     let mut used = 0.0;
-    for (i, m) in msgs.iter().enumerate().skip(top) {
-        used += message_height(m, width);
+    for i in top..msgs.len() {
+        used += item_height(msgs, i, width);
         if used > height {
             return i.saturating_sub(1).max(top);
         }
@@ -165,7 +227,7 @@ pub fn bottom_for_top(msgs: &[Msg], top: usize, width: f32, height: f32) -> usiz
     msgs.len().saturating_sub(1)
 }
 
-pub fn view(app: &App) -> Element<'_, Message> {
+pub fn view(app: &App, _window: iced::window::Id) -> Element<'_, Message> {
     let body: Element<_> = if app.auth != Auth::Ready {
         auth_screen(app)
     } else if let Some(viewer) = media_viewer(app) {
@@ -572,11 +634,9 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
     } else {
         let (width, height) = app.viewport();
         let top = top_for_bottom(&open.msgs, open.bottom, width, height);
-        let used: f32 = (top..=open.bottom).map(|i| message_height(&open.msgs[i], width)).sum();
+        let used: f32 = (top..=open.bottom).map(|i| item_height(&open.msgs, i, width)).sum();
         let leftover = height - used;
-        let items = (top..=open.bottom).map(|i| {
-            message_view(app, &open.msgs[i], selected == Some(i), width, starts_run(&open.msgs, i))
-        });
+        let items = (top..=open.bottom).map(|i| list_item(app, &open.msgs, i, selected == Some(i), width));
         // The spacer pushes messages to the bottom; heights are estimated
         // pessimistically, so the rendered range always fits.
         let mut children: Vec<Element<_>> = vec![space::vertical().height(Length::Fill).into()];
@@ -584,7 +644,7 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
         // end instead of leaving the space empty.
         if top > 0 && leftover >= MIN_PARTIAL {
             let i = top - 1;
-            let partial = message_view(app, &open.msgs[i], false, width, starts_run(&open.msgs, i));
+            let partial = list_item(app, &open.msgs, i, false, width);
             children.push(
                 scrollable(partial)
                     .direction(Direction::Vertical(Scrollbar::hidden()))
@@ -618,10 +678,12 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
 }
 
 /// A message starts a run of messages from the same sender, which shows
-/// the avatar (gaps of over 10 minutes start a new run too).
+/// the avatar (gaps of over 10 minutes and new days start a new run too).
 fn starts_run(msgs: &[Msg], i: usize) -> bool {
     match i.checked_sub(1).and_then(|p| msgs.get(p)) {
-        Some(prev) => prev.sender != msgs[i].sender || msgs[i].date - prev.date > 600,
+        Some(prev) => {
+            prev.sender != msgs[i].sender || msgs[i].date - prev.date > 600 || starts_day(msgs, i)
+        }
         None => true,
     }
 }
@@ -961,9 +1023,22 @@ fn input_text<'a>(input: &Input, editing: bool, mask: bool, prefix: &str) -> Ele
     text(content).size(TEXT).into()
 }
 
+/// "📎 photo.png" or "📎 3 files: a.png, b.mp4, …"
+fn attachments_label(paths: &[std::path::PathBuf]) -> String {
+    let names: Vec<String> = paths
+        .iter()
+        .map(|p| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned()))
+        .collect();
+    match names.len() {
+        1 => format!("📎 {}", names[0]),
+        n => format!("📎 {n} files: {}", names.join(", ")),
+    }
+}
+
 fn compose_banner(app: &App) -> Option<Element<'_, Message>> {
+    let attached = (!app.attachments.is_empty()).then(|| attachments_label(&app.attachments));
     let label = match app.compose {
-        Compose::New => return None,
+        Compose::New => attached.clone()?,
         Compose::Reply(id) => {
             let quoted = app.open.as_ref().and_then(|o| o.position(id).map(|i| &o.msgs[i]));
             match quoted {
@@ -976,6 +1051,10 @@ fn compose_banner(app: &App) -> Option<Element<'_, Message>> {
         }
         Compose::Edit(_) => "✎ Editing message".to_owned(),
     };
+    let label = match (app.compose, attached) {
+        (Compose::Reply(_), Some(attached)) => format!("{attached}  ·  {label}"),
+        _ => label,
+    };
     Some(
         row![
             text(label).size(12).wrapping(Wrapping::None).style(primary_text).width(Length::Fill),
@@ -985,6 +1064,10 @@ fn compose_banner(app: &App) -> Option<Element<'_, Message>> {
         .align_y(Alignment::Center)
         .into(),
     )
+}
+
+pub fn has_banner(app: &App) -> bool {
+    app.compose != Compose::New || !app.attachments.is_empty()
 }
 
 fn compose(app: &App) -> Element<'_, Message> {
@@ -1005,7 +1088,7 @@ fn compose(app: &App) -> Element<'_, Message> {
     container(body)
         .padding([10.0, MSG_PAD_X])
         .width(Length::Fill)
-        .max_height(compose_height(&app.input, app.compose != Compose::New))
+        .max_height(compose_height(&app.input, has_banner(app)))
         .clip(true)
         .into()
 }
@@ -1196,6 +1279,48 @@ fn status_line(app: &App) -> Element<'_, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn msg_at(id: i64, date: i32) -> Msg {
+        Msg {
+            id,
+            chat_id: 1,
+            sender: Sender::User(1),
+            outgoing: false,
+            date,
+            edited: false,
+            text: "hi".into(),
+            media: Vec::new(),
+            album: 0,
+            members: vec![id],
+            reply_to: None,
+            sending: false,
+            scheduled: false,
+            deleted: false,
+            local_files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn days_are_separated() {
+        let noon = Local::now().date_naive().and_hms_opt(12, 0, 0).unwrap();
+        let unix = |dt: chrono::NaiveDateTime| dt.and_local_timezone(Local).unwrap().timestamp() as i32;
+        let today = unix(noon);
+        let yesterday = unix(noon - chrono::Duration::days(1));
+        let msgs = [msg_at(1, yesterday), msg_at(2, yesterday + 60), msg_at(3, today), msg_at(4, today + 60)];
+        let starts: Vec<bool> = (0..msgs.len()).map(|i| starts_day(&msgs, i)).collect();
+        assert_eq!(starts, [true, false, true, false]);
+        assert_eq!(fmt_day(today), "Today");
+        assert_eq!(fmt_day(yesterday), "Yesterday");
+        let long_ago = noon - chrono::Duration::days(800);
+        assert!(fmt_day(unix(long_ago)).ends_with(&long_ago.format("%Y").to_string()), "older years show the year");
+        // The separator is part of the height used for layout.
+        let width = 500.0;
+        assert_eq!(item_height(&msgs, 2, width), message_height(&msgs[2], width) + DAY_H);
+        assert_eq!(item_height(&msgs, 3, width), message_height(&msgs[3], width));
+        // A new day also shows the sender's avatar again.
+        assert!(starts_run(&msgs, 2));
+        assert!(!starts_run(&msgs, 3));
+    }
 
     #[test]
     fn waveform_split() {

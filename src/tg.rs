@@ -4,12 +4,15 @@
 //! and the responses that resolve pending `functions::*` futures. It runs on a
 //! dedicated thread and its updates are exposed as an iced subscription stream.
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use iced::futures::channel::mpsc;
 use iced::futures::{Stream, StreamExt};
 use iced::widget::image::Handle;
+use serde::{Deserialize, Serialize};
 use tdlib_rs::enums::{
     self, ChatList, InputMessageContent, MessageContent, MessageSender, StickerFormat,
     ThumbnailFormat, Update,
@@ -103,7 +106,46 @@ pub async fn load_chats(list: ListKey, limit: i32) -> Res<()> {
 
 /// Download a file completely and return its local path. Already downloaded
 /// files return immediately.
+/// Files kept by the archive after Telegram deleted them. They get
+/// negative ids, which never clash with TDLib's.
+#[derive(Default)]
+struct LocalFiles {
+    paths: HashMap<i32, String>,
+    ids: HashMap<String, i32>,
+}
+
+static LOCAL: OnceLock<Mutex<LocalFiles>> = OnceLock::new();
+static NEXT_LOCAL: AtomicI32 = AtomicI32::new(-1);
+
+fn local_files() -> std::sync::MutexGuard<'static, LocalFiles> {
+    LOCAL.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A file id for a local file (the same path always gets the same id).
+pub fn local_file_id(path: &str) -> i32 {
+    let mut files = local_files();
+    if let Some(&id) = files.ids.get(path) {
+        return id;
+    }
+    let id = NEXT_LOCAL.fetch_sub(1, Ordering::Relaxed);
+    files.paths.insert(id, path.to_owned());
+    files.ids.insert(path.to_owned(), id);
+    id
+}
+
+/// A file id that refers to nothing (media the archive does not have).
+pub fn missing_file_id() -> i32 {
+    NEXT_LOCAL.fetch_sub(1, Ordering::Relaxed)
+}
+
 pub async fn download(file_id: i32, priority: i32) -> Res<String> {
+    if file_id < 0 {
+        return local_files()
+            .paths
+            .get(&file_id)
+            .cloned()
+            .ok_or_else(|| "the archive has no copy of this file".to_string());
+    }
     let enums::File::File(file) = functions::download_file(file_id, priority, 0, 0, true, client())
         .await
         .map_err(err)?;
@@ -116,6 +158,9 @@ pub async fn download(file_id: i32, priority: i32) -> Res<String> {
 
 /// File size in bytes, exact or expected; 0 when unknown.
 pub async fn file_size(file_id: i32) -> Res<u64> {
+    if file_id < 0 {
+        return Ok(0); // local: played straight from the file
+    }
     let enums::File::File(file) = functions::get_file(file_id, client()).await.map_err(err)?;
     Ok(file.size.max(file.expected_size).max(0) as u64)
 }
@@ -132,6 +177,15 @@ pub async fn downloaded_prefix(file_id: i32, offset: i64) -> Res<i64> {
 /// Move the download of a file to `offset` and keep going from there.
 pub async fn start_download(file_id: i32, offset: i64) -> Res<()> {
     functions::download_file(file_id, 32, offset, 0, false, client())
+        .await
+        .map(|_| ())
+        .map_err(err)
+}
+
+/// Download in the background at low priority, so the message's media
+/// survives if it gets deleted.
+pub async fn prefetch(file_id: i32) -> Res<()> {
+    functions::download_file(file_id, 1, 0, 0, false, client())
         .await
         .map(|_| ())
         .map_err(err)
@@ -282,8 +336,8 @@ impl FileKind {
     }
 }
 
-/// Send a local file as a photo, video or document, with an optional caption.
-pub async fn send_file(chat_id: i64, path: std::path::PathBuf, caption: String, options: SendOptions) -> Res<()> {
+/// A local file as a photo, video or document, with an optional caption.
+fn file_content(path: &std::path::Path, caption: String) -> InputMessageContent {
     let file = enums::InputFile::Local(types::InputFileLocal {
         path: path.to_string_lossy().into_owned(),
     });
@@ -291,7 +345,7 @@ pub async fn send_file(chat_id: i64, path: std::path::PathBuf, caption: String, 
         text: caption,
         entities: Vec::new(),
     });
-    let content = match FileKind::of(&path) {
+    match FileKind::of(path) {
         FileKind::Photo => InputMessageContent::InputMessagePhoto(types::InputMessagePhoto {
             photo: file,
             thumbnail: None,
@@ -325,8 +379,28 @@ pub async fn send_file(chat_id: i64, path: std::path::PathBuf, caption: String, 
             disable_content_type_detection: false,
             caption,
         }),
-    };
-    send(chat_id, content, options).await
+    }
+}
+
+/// Send local files; the caption goes with the first one. Two to ten
+/// photos and videos go as an album.
+pub async fn send_files(chat_id: i64, paths: Vec<std::path::PathBuf>, caption: String, options: SendOptions) -> Res<()> {
+    let album = (2..=10).contains(&paths.len()) && paths.iter().all(|p| FileKind::of(p) != FileKind::Document);
+    let mut caption = Some(caption);
+    let contents: Vec<InputMessageContent> = paths
+        .iter()
+        .map(|path| file_content(path, caption.take().unwrap_or_default()))
+        .collect();
+    if album {
+        return functions::send_message_album(chat_id, None, options.reply_to(), options.options(), contents, client())
+            .await
+            .map(|_| ())
+            .map_err(err);
+    }
+    for content in contents {
+        send(chat_id, content, options).await?;
+    }
+    Ok(())
 }
 
 /// The pinned message of a chat, if there is one.
@@ -554,7 +628,7 @@ impl From<&types::User> for User {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Sender {
     User(i64),
     Chat(i64),
@@ -570,11 +644,14 @@ impl From<&MessageSender> for Sender {
 }
 
 /// A remote file with the pixel size it will have once downloaded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileRef {
     pub id: i32,
     pub width: u32,
     pub height: u32,
+    /// Bytes, exact or expected; 0 when unknown.
+    #[serde(default)]
+    pub size: i64,
 }
 
 impl FileRef {
@@ -583,11 +660,12 @@ impl FileRef {
             id: file.id,
             width: width.max(1) as u32,
             height: height.max(1) as u32,
+            size: file.size.max(file.expected_size),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StickerKind {
     /// Static WebP image.
     Webp,
@@ -598,7 +676,7 @@ pub enum StickerKind {
 }
 
 /// Media the UI can render inline.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Media {
     Photo {
         /// Size used in the message list.
@@ -622,6 +700,7 @@ pub enum Media {
         /// Still preview image, if Telegram has one in a decodable format.
         thumb: Option<i32>,
         /// Tiny blurred preview embedded in the message.
+        #[serde(skip)]
         mini: Option<Handle>,
         duration: i32,
         round: bool,
@@ -642,6 +721,37 @@ impl Media {
             Media::Sticker { file, .. } | Media::Animation { file } => Some(file.id),
             Media::Video { thumb, .. } => *thumb,
             Media::Voice { .. } => None,
+        }
+    }
+
+    /// Every file the media consists of, with its size (0 when unknown).
+    pub fn files(&self) -> Vec<(i32, i64)> {
+        match self {
+            Media::Photo { preview, full } => vec![(preview.id, preview.size), (full.id, full.size)],
+            Media::Sticker { file, .. } | Media::Animation { file } => vec![(file.id, file.size)],
+            Media::Video { video, thumb, .. } => {
+                let mut files = vec![(video.id, video.size)];
+                files.extend(thumb.map(|t| (t, 0)));
+                files
+            }
+            Media::Voice { file, .. } => vec![(*file, 0)],
+        }
+    }
+
+    /// Replace file ids, e.g. with the archive's local copies.
+    pub fn remap_files(&mut self, mut f: impl FnMut(i32) -> i32) {
+        match self {
+            Media::Photo { preview, full } => {
+                let same = preview.id == full.id;
+                preview.id = f(preview.id);
+                full.id = if same { preview.id } else { f(full.id) };
+            }
+            Media::Sticker { file, .. } | Media::Animation { file } => file.id = f(file.id),
+            Media::Video { video, thumb, .. } => {
+                video.id = f(video.id);
+                *thumb = thumb.map(&mut f);
+            }
+            Media::Voice { file, .. } => *file = f(*file),
         }
     }
 
@@ -683,7 +793,7 @@ pub fn fmt_duration(secs: i32) -> String {
 }
 
 /// The parts of a TDLib message the UI cares about.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Msg {
     pub id: i64,
     pub chat_id: i64,
@@ -707,6 +817,9 @@ pub struct Msg {
     pub scheduled: bool,
     /// Deleted, but kept from the local archive.
     pub deleted: bool,
+    /// Media files already downloaded when the message arrived: (id, path).
+    #[serde(skip)]
+    pub local_files: Vec<(i32, String)>,
 }
 
 impl From<types::Message> for Msg {
@@ -715,8 +828,13 @@ impl From<types::Message> for Msg {
         let text = if media.is_some() {
             caption(&m.content)
         } else {
-            content_text(&m.content)
+            content_text(&m.content, m.is_outgoing)
         };
+        let local_files = content_files(&m.content)
+            .into_iter()
+            .filter(|f| f.local.is_downloading_completed && !f.local.path.is_empty())
+            .map(|f| (f.id, f.local.path.clone()))
+            .collect();
         let reply_to = match &m.reply_to {
             Some(enums::MessageReplyTo::Message(r)) if r.chat_id == m.chat_id => Some(r.message_id),
             _ => None,
@@ -736,6 +854,7 @@ impl From<types::Message> for Msg {
             sending: matches!(m.sending_state, Some(enums::MessageSendingState::Pending(_))),
             scheduled: m.scheduling_state.is_some(),
             deleted: false,
+            local_files,
         }
     }
 }
@@ -743,6 +862,20 @@ impl From<types::Message> for Msg {
 impl From<Record> for Msg {
     /// A deleted message, as remembered by the archive.
     fn from(r: Record) -> Self {
+        // Newer records keep the whole message; media points at the
+        // archive's copies of the files.
+        if let Some(mut msg) = r.data.as_deref().and_then(|d| serde_json::from_str::<Msg>(d).ok()) {
+            let saved: HashMap<i32, &str> = r.files.iter().map(|(id, path)| (*id, path.as_str())).collect();
+            for media in &mut msg.media {
+                media.remap_files(|id| match saved.get(&id) {
+                    Some(path) => local_file_id(path),
+                    None => missing_file_id(),
+                });
+            }
+            msg.deleted = true;
+            msg.sending = false;
+            return msg;
+        }
         Msg {
             id: r.id,
             chat_id: r.chat_id,
@@ -758,6 +891,7 @@ impl From<Record> for Msg {
             sending: false,
             scheduled: false,
             deleted: true,
+            local_files: Vec::new(),
         }
     }
 }
@@ -910,7 +1044,60 @@ pub fn media(content: &MessageContent) -> Option<Media> {
     }
 }
 
-pub fn content_text(content: &MessageContent) -> String {
+/// Every file attached to a message (all photo sizes, thumbnails, …).
+fn content_files(content: &MessageContent) -> Vec<&types::File> {
+    match content {
+        MessageContent::MessagePhoto(p) => p.photo.sizes.iter().map(|s| &s.photo).collect(),
+        MessageContent::MessageSticker(s) => vec![&s.sticker.sticker],
+        MessageContent::MessageAnimation(a) => vec![&a.animation.animation],
+        MessageContent::MessageVideo(v) => {
+            let mut files = vec![&v.video.video];
+            files.extend(v.video.thumbnail.as_ref().map(|t| &t.file));
+            files
+        }
+        MessageContent::MessageVideoNote(v) => {
+            let mut files = vec![&v.video_note.video];
+            files.extend(v.video_note.thumbnail.as_ref().map(|t| &t.file));
+            files
+        }
+        MessageContent::MessageVoiceNote(v) => vec![&v.voice_note.voice],
+        MessageContent::MessageDocument(d) => vec![&d.document.document],
+        MessageContent::MessageAudio(a) => vec![&a.audio.audio],
+        _ => Vec::new(),
+    }
+}
+
+fn call_text(call: &types::MessageCall, outgoing: bool) -> String {
+    use enums::CallDiscardReason as Reason;
+    let icon = if call.is_video { "📹" } else { "📞" };
+    let kind = if call.is_video { "video call" } else { "call" };
+    let direction = if outgoing { "Outgoing" } else { "Incoming" };
+    match call.discard_reason {
+        Reason::Missed if outgoing => format!("{icon} Cancelled {kind}"),
+        Reason::Missed => format!("{icon} Missed {kind}"),
+        Reason::Declined => format!("{icon} Declined {kind}"),
+        _ if call.duration > 0 => format!("{icon} {direction} {kind} ({})", fmt_duration(call.duration)),
+        _ => format!("{icon} {direction} {kind}"),
+    }
+}
+
+/// "MessageGiftedPremium" → "gifted premium": better than nothing for
+/// service messages without their own text.
+fn variant_name(content: &MessageContent) -> String {
+    let debug = format!("{content:?}");
+    let name = debug.split(['(', ' ', '{']).next().unwrap_or_default();
+    let name = name.strip_prefix("Message").unwrap_or(name);
+    let mut out = String::new();
+    for (i, c) in name.chars().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            out.push(' ');
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
+}
+
+pub fn content_text(content: &MessageContent, outgoing: bool) -> String {
     let with_caption = |label: &str, caption: &types::FormattedText| {
         if caption.text.is_empty() {
             format!("[{label}]")
@@ -929,8 +1116,99 @@ pub fn content_text(content: &MessageContent) -> String {
         MessageContent::MessageVoiceNote(_) => "[voice message]".into(),
         MessageContent::MessageVideoNote(_) => "[video message]".into(),
         MessageContent::MessageLocation(_) => "[location]".into(),
-        MessageContent::MessageContact(_) => "[contact]".into(),
-        MessageContent::MessagePoll(_) => "[poll]".into(),
-        _ => "[unsupported message]".into(),
+        MessageContent::MessageContact(c) => {
+            let name = format!("{} {}", c.contact.first_name, c.contact.last_name);
+            format!("👤 {} {}", name.trim(), c.contact.phone_number)
+        }
+        MessageContent::MessagePoll(p) => format!("📊 Poll: {}", p.poll.question.text),
+        MessageContent::MessageCall(call) => call_text(call, outgoing),
+        MessageContent::MessageGroupCall(call) => {
+            let kind = if call.is_video { "group video call" } else { "group call" };
+            match () {
+                _ if call.is_active => format!("📞 Ongoing {kind}"),
+                _ if call.was_missed => format!("📞 Missed {kind}"),
+                _ if call.duration > 0 => format!("📞 {} ({})", capitalize(kind), fmt_duration(call.duration)),
+                _ => format!("📞 {}", capitalize(kind)),
+            }
+        }
+        MessageContent::MessageVideoChatStarted(_) => "🎙 Video chat started".into(),
+        MessageContent::MessageVideoChatScheduled(_) => "🎙 Video chat scheduled".into(),
+        MessageContent::MessageVideoChatEnded(v) => format!("🎙 Video chat ended ({})", fmt_duration(v.duration)),
+        MessageContent::MessageInviteVideoChatParticipants(_) => "🎙 Invited to the video chat".into(),
+        MessageContent::MessageVenue(v) => format!("📍 {}", v.venue.title),
+        MessageContent::MessageAnimatedEmoji(e) => e.emoji.clone(),
+        MessageContent::MessageDice(d) => format!("{} {}", d.emoji, d.value),
+        MessageContent::MessageStory(_) => "[story]".into(),
+        MessageContent::MessageChatChangeTitle(t) => format!("changed the title to «{}»", t.title),
+        MessageContent::MessageChatChangePhoto(_) => "changed the chat photo".into(),
+        MessageContent::MessageChatDeletePhoto => "removed the chat photo".into(),
+        MessageContent::MessageChatAddMembers(_) => "added members".into(),
+        MessageContent::MessageChatJoinByLink => "joined by link".into(),
+        MessageContent::MessageChatJoinByRequest => "joined the chat".into(),
+        MessageContent::MessageChatDeleteMember(_) => "removed a member".into(),
+        MessageContent::MessageBasicGroupChatCreate(_) | MessageContent::MessageSupergroupChatCreate(_) => {
+            "created the group".into()
+        }
+        MessageContent::MessagePinMessage(_) => "📌 pinned a message".into(),
+        MessageContent::MessageScreenshotTaken => "took a screenshot".into(),
+        MessageContent::MessageContactRegistered => "joined Telegram".into(),
+        MessageContent::MessageExpiredPhoto => "[photo has expired]".into(),
+        MessageContent::MessageExpiredVideo => "[video has expired]".into(),
+        MessageContent::MessageExpiredVideoNote => "[video message has expired]".into(),
+        MessageContent::MessageExpiredVoiceNote => "[voice message has expired]".into(),
+        MessageContent::MessageGift(_) => "🎁 Gift".into(),
+        MessageContent::MessageUnsupported => "[not supported by TDLib yet]".into(),
+        other => format!("[{}]", variant_name(other)),
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(reason: enums::CallDiscardReason, duration: i32, is_video: bool) -> types::MessageCall {
+        types::MessageCall { is_video, discard_reason: reason, duration }
+    }
+
+    #[test]
+    fn calls_are_described() {
+        use enums::CallDiscardReason as R;
+        assert_eq!(call_text(&call(R::HungUp, 83, false), true), "📞 Outgoing call (1:23)");
+        assert_eq!(call_text(&call(R::HungUp, 5, true), false), "📹 Incoming video call (0:05)");
+        assert_eq!(call_text(&call(R::Missed, 0, false), false), "📞 Missed call");
+        assert_eq!(call_text(&call(R::Missed, 0, false), true), "📞 Cancelled call");
+        assert_eq!(call_text(&call(R::Declined, 0, false), false), "📞 Declined call");
+        let content = MessageContent::MessageCall(call(R::Disconnected, 0, false));
+        assert_eq!(content_text(&content, false), "📞 Incoming call");
+    }
+
+    #[test]
+    fn unknown_service_messages_get_a_readable_name() {
+        assert_eq!(content_text(&MessageContent::MessageScreenshotTaken, false), "took a screenshot");
+        let other = MessageContent::MessageChatSetMessageAutoDeleteTime(Default::default());
+        assert_eq!(content_text(&other, false), "[chat set message auto delete time]");
+    }
+
+    #[test]
+    fn media_files_can_be_remapped() {
+        let mut photo = Media::Photo {
+            preview: FileRef { id: 5, width: 1, height: 1, size: 10 },
+            full: FileRef { id: 5, width: 1, height: 1, size: 10 },
+        };
+        assert_eq!(photo.files(), vec![(5, 10), (5, 10)]);
+        let mut calls = 0;
+        photo.remap_files(|id| {
+            calls += 1;
+            -id
+        });
+        assert_eq!(calls, 1, "a shared file is remapped once");
+        assert_eq!(photo.files(), vec![(-5, 10), (-5, 10)]);
+        assert!(local_file_id("/a") < 0);
+        assert_eq!(local_file_id("/a"), local_file_id("/a"));
     }
 }
