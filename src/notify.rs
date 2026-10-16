@@ -23,6 +23,22 @@ struct Shown {
 }
 
 static SHOWN: Mutex<Vec<Shown>> = Mutex::new(Vec::new());
+/// Per chat: messages up to this id are read. A notification still being
+/// prepared when its message gets read is closed as soon as it shows.
+static READ: Mutex<Vec<(i64, i64)>> = Mutex::new(Vec::new());
+
+fn read_up_to(chat_id: i64) -> i64 {
+    let read = READ.lock().unwrap_or_else(|e| e.into_inner());
+    read.iter().find(|(c, _)| *c == chat_id).map_or(0, |(_, up_to)| *up_to)
+}
+
+fn set_read_up_to(chat_id: i64, up_to: i64) {
+    let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
+    match read.iter_mut().find(|(c, _)| *c == chat_id) {
+        Some(entry) => entry.1 = entry.1.max(up_to),
+        None => read.push((chat_id, up_to)),
+    }
+}
 const MAX_SHOWN: usize = 500;
 
 fn shown() -> std::sync::MutexGuard<'static, Vec<Shown>> {
@@ -41,6 +57,7 @@ fn take_read(chat_id: i64, up_to: i64) -> Vec<u32> {
 /// Close the notifications of messages read in the meantime (here or on
 /// another device), like the official apps do.
 pub async fn withdraw(chat_id: i64, up_to: i64) {
+    set_read_up_to(chat_id, up_to);
     let ids = take_read(chat_id, up_to);
     if ids.is_empty() {
         return;
@@ -92,6 +109,13 @@ pub async fn show(
         let mut clicked = false;
         if let Ok(handle) = n.show() {
             let id = handle.id();
+            // Read while the notification was being prepared.
+            if read_up_to(chat_id) >= msg_id {
+                handle.close();
+                WAITING.fetch_sub(1, Ordering::SeqCst);
+                let _ = tx.send(false);
+                return;
+            }
             {
                 let mut shown = shown();
                 if shown.len() >= MAX_SHOWN {
@@ -137,6 +161,14 @@ mod tests {
         assert_eq!(take_read(-77, 10), vec![9002]);
         assert!(take_read(-77, 10).is_empty());
         assert_eq!(take_read(-78, i64::MAX), vec![9003]);
+    }
+
+    #[test]
+    fn read_marks_only_grow() {
+        set_read_up_to(-90, 10);
+        set_read_up_to(-90, 4);
+        assert_eq!(read_up_to(-90), 10);
+        assert_eq!(read_up_to(-91), 0);
     }
 
     #[test]

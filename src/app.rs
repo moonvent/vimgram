@@ -692,7 +692,7 @@ impl App {
         let Some(chat) = self.chats.get(&msg.chat_id) else {
             return Task::none();
         };
-        let looking = self.focused && self.open.as_ref().is_some_and(|o| o.id == chat.id);
+        let looking = self.looking() && self.open.as_ref().is_some_and(|o| o.id == chat.id);
         let age = chrono::Utc::now().timestamp() - i64::from(msg.date);
         if looking || self.muted(chat) || age > NOTIFY_MAX_AGE {
             return Task::none();
@@ -985,7 +985,10 @@ impl App {
             }
             Message::WindowEvent(event) => {
                 match event {
-                    window::Event::Focused => self.focused = true,
+                    window::Event::Focused => {
+                        self.focused = true;
+                        return self.view_visible();
+                    }
                     window::Event::Unfocused => self.focused = false,
                     _ => {}
                 }
@@ -1228,7 +1231,7 @@ impl App {
                     self.list_dirty = true;
                 }
                 // Read here or on another device: its notifications go away.
-                let up_to = if u.unread_count == 0 { i64::MAX } else { u.last_read_inbox_message_id };
+                let up_to = u.last_read_inbox_message_id;
                 return Task::perform(notify::withdraw(u.chat_id, up_to), |()| Message::Done(Ok(())));
             }
             Update::ChatFolders(u) => {
@@ -1397,11 +1400,39 @@ impl App {
             open.cursor = open.msgs.len() - 1;
             open.bottom = open.cursor;
         }
-        if incoming {
-            Task::perform(tg::view_messages(chat_id, vec![id]), Message::Done)
+        if incoming { self.view_messages(chat_id, vec![id]) } else { Task::none() }
+    }
+
+    /// The user can see the window (focused; not minimized, on another
+    /// workspace or closed to the tray).
+    fn looking(&self) -> bool {
+        self.focused && self.window.is_some()
+    }
+
+    /// Mark messages read, but only while the user is looking: a chat left
+    /// open in a window in the background stays unread (and notifies).
+    fn view_messages(&self, chat_id: i64, ids: Vec<i64>) -> Task<Message> {
+        if self.looking() && !ids.is_empty() {
+            Task::perform(tg::view_messages(chat_id, ids), Message::Done)
         } else {
             Task::none()
         }
+    }
+
+    /// Back at the window: read what is on screen in the open chat.
+    fn view_visible(&self) -> Task<Message> {
+        let Some(open) = self.open.as_ref().filter(|o| !o.msgs.is_empty()) else {
+            return Task::none();
+        };
+        let (width, height) = self.viewport();
+        let bottom = open.bottom.min(open.msgs.len() - 1);
+        let top = view::top_for_bottom(&open.msgs, bottom, width, height);
+        let ids: Vec<i64> = open.msgs[top..=bottom]
+            .iter()
+            .filter(|m| !m.outgoing && !m.deleted)
+            .flat_map(|m| m.members.iter().copied())
+            .collect();
+        self.view_messages(open.id, ids)
     }
 
     fn on_history(&mut self, chat_id: i64, newer: bool, result: Result<Vec<Msg>, String>) -> Task<Message> {
@@ -1431,7 +1462,7 @@ impl App {
             open.edit(|msgs| msgs.extend(batch));
             self.scroll_messages();
             return Task::batch([
-                Task::perform(tg::view_messages(chat_id, ids), Message::Done),
+                self.view_messages(chat_id, ids),
                 self.load_archived(chat_id, lo, hi),
             ]);
         }
@@ -1457,7 +1488,7 @@ impl App {
         self.scroll_messages();
 
         let mut tasks = vec![
-            Task::perform(tg::view_messages(chat_id, ids), Message::Done),
+            self.view_messages(chat_id, ids),
             self.load_archived(chat_id, lo, hi),
         ];
         if want_more {
@@ -1623,7 +1654,7 @@ impl App {
         self.reset_tall();
         self.scroll_messages();
         Task::batch([
-            Task::perform(tg::view_messages(chat_id, ids), Message::Done),
+            self.view_messages(chat_id, ids),
             self.load_archived(chat_id, lo, hi),
             self.scroll_tall(),
         ])
