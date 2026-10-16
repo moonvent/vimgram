@@ -359,8 +359,12 @@ fn fmt_secs(secs: f64) -> String {
 }
 
 fn badge<'a>(count: impl ToString) -> Element<'a, Message> {
-    container(text(count.to_string()).size(11))
-        .padding([1, 7])
+    // Digits have no descenders and sit high in a normal line box: a tight
+    // line and a pixel more room on top center them visually.
+    container(text(count.to_string()).size(11).line_height(1.0))
+        .height(18)
+        .padding(iced::Padding { top: 1.0, right: 7.0, bottom: 0.0, left: 7.0 })
+        .align_y(Alignment::Center)
         .style(|t: &Theme| {
             let p = t.extended_palette().primary.base;
             container::Style {
@@ -580,13 +584,12 @@ fn selection_style(t: &Theme, selected: bool, focused: bool) -> container::Style
     if focused {
         container::Style {
             background: Some(p.primary.base.color.scale_alpha(0.22).into()),
-            border: iced::border::rounded(6).width(1).color(p.primary.base.color.scale_alpha(0.5)),
+            border: iced::border::width(1).color(p.primary.base.color.scale_alpha(0.5)),
             ..Default::default()
         }
     } else {
         container::Style {
             background: Some(p.background.weak.color.scale_alpha(0.7).into()),
-            border: iced::border::rounded(6),
             ..Default::default()
         }
     }
@@ -595,10 +598,7 @@ fn selection_style(t: &Theme, selected: bool, focused: bool) -> container::Style
 /// The message under the cursor: a neutral lift with a thin accent
 /// outline, so sender colors, times and ticks stay readable.
 fn message_style(t: &Theme, selected: bool) -> container::Style {
-    let mut style = container::Style {
-        border: iced::border::rounded(6),
-        ..Default::default()
-    };
+    let mut style = container::Style::default();
     if selected {
         let p = t.extended_palette();
         style.background = Some(p.background.weak.color.scale_alpha(0.6).into());
@@ -1204,10 +1204,7 @@ fn compose_banner(app: &App) -> Option<Element<'_, Message>> {
     Some(
         row![
             text(label).size(12).wrapping(Wrapping::None).style(primary_text).width(Length::Fill),
-            // From Insert mode the first Esc only leaves it.
-            text(if app.mode == Mode::Insert { "Esc ×2 — cancel" } else { "Esc — cancel" })
-                .size(12)
-                .style(muted_text),
+            text("Esc — cancel").size(12).style(muted_text),
         ]
         .height(BANNER_H)
         .align_y(Alignment::Center)
@@ -1236,8 +1233,11 @@ fn compose(app: &App) -> Element<'_, Message> {
     body = body.push(content);
     let open = app.emoji.is_some();
     let button = mouse_area(
-        container(text("😀").size(18))
-            .padding([2, 6])
+        container(text("😀").size(18).line_height(1.0))
+            .width(32)
+            .height(32)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
             .style(move |t: &Theme| selection_style(t, open, true)),
     )
     .on_press(Message::ToggleEmoji)
