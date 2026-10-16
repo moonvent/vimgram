@@ -2,18 +2,20 @@
 //! so thousands of chats or messages cost nothing extra per frame.
 
 use chrono::{DateTime, Local};
+use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Column, Row, center, column, container, image, mouse_area, row, rule, space, stack, text,
+    Column, Row, center, column, container, image, mouse_area, row, rule, scrollable, space, stack,
+    text, tooltip,
 };
 use iced::mouse::Interaction;
 use iced::{Alignment, Color, ContentFit, Element, Length, Size, Theme};
 use iced_video_player::VideoPlayer;
 
-use crate::app::{App, Auth, Chat, Compose, Confirm, Focus, Message, Pane, VideoPlayback};
+use crate::app::{App, Auth, Chat, Compose, Confirm, Focus, Message, Pane, TALL_ID, VideoPlayback};
 use crate::media::Loaded;
 use crate::player;
-use crate::tg::{Media, Msg, Sender, fmt_duration};
+use crate::tg::{ChatKind, Media, Msg, Presence, Sender, fmt_duration};
 use crate::vim::{Input, Mode};
 
 pub const FOLDER_W: f32 = 76.0;
@@ -40,6 +42,14 @@ const STICKER_MAX: Size = Size::new(170.0, 170.0);
 const VOICE: Size = Size::new(380.0, 30.0);
 const VOICE_BARS: usize = 48;
 const MEDIA_GAP: f32 = 4.0;
+/// Sender avatar next to messages.
+const MSG_AVATAR: f32 = 34.0;
+const MSG_AVATAR_GAP: f32 = 8.0;
+const HEADER_AVATAR: f32 = 32.0;
+const PINNED_H: f32 = 40.0;
+/// Space above the visible messages worth filling with the end of the
+/// previous (too tall) message.
+const MIN_PARTIAL: f32 = 40.0;
 const ALBUM_GAP: f32 = 4.0;
 
 pub fn chat_rows(size: Size) -> usize {
@@ -52,9 +62,10 @@ fn compose_height(input: &Input, banner: bool) -> f32 {
 }
 
 /// Width and height available to the message list.
-pub fn messages_viewport(size: Size, compose: &Input, banner: bool) -> (f32, f32) {
-    let width = size.width - FOLDER_W - SIDEBAR_W - 2.0 - 2.0 * MSG_PAD_X;
-    let height = size.height - STATUS_H - HEADER_H - 2.0 - compose_height(compose, banner);
+pub fn messages_viewport(size: Size, compose: &Input, banner: bool, pinned: bool) -> (f32, f32) {
+    let width = size.width - FOLDER_W - SIDEBAR_W - 2.0 - 2.0 * MSG_PAD_X - MSG_AVATAR - MSG_AVATAR_GAP;
+    let pinned = if pinned { PINNED_H + 1.0 } else { 0.0 };
+    let height = size.height - STATUS_H - HEADER_H - 2.0 - pinned - compose_height(compose, banner);
     (width.max(100.0), height.max(LINE_H))
 }
 
@@ -199,6 +210,65 @@ fn fmt_time(date: i32, short: bool) -> String {
     }
 }
 
+pub fn fmt_datetime(unix: i32) -> String {
+    DateTime::from_timestamp(i64::from(unix), 0)
+        .map(|d| d.with_timezone(&Local).format("%d.%m.%Y %H:%M").to_string())
+        .unwrap_or_default()
+}
+
+/// Full date for the hover tooltip: "Thursday, 16 October 2026, 19:42:07".
+fn fmt_full_date(unix: i32) -> String {
+    DateTime::from_timestamp(i64::from(unix), 0)
+        .map(|d| d.with_timezone(&Local).format("%A, %-d %B %Y, %H:%M:%S").to_string())
+        .unwrap_or_default()
+}
+
+pub fn fmt_presence(presence: Presence) -> String {
+    match presence {
+        Presence::Online => "online".into(),
+        Presence::Offline(at) => {
+            let Some(utc) = DateTime::from_timestamp(i64::from(at), 0) else {
+                return String::new();
+            };
+            let local = utc.with_timezone(&Local);
+            let today = Local::now().date_naive();
+            if local.date_naive() == today {
+                format!("last seen today at {}", local.format("%H:%M"))
+            } else if today.pred_opt() == Some(local.date_naive()) {
+                format!("last seen yesterday at {}", local.format("%H:%M"))
+            } else {
+                format!("last seen {}", local.format("%d.%m.%y"))
+            }
+        }
+        Presence::Recently => "last seen recently".into(),
+        Presence::LastWeek => "last seen within a week".into(),
+        Presence::LastMonth => "last seen within a month".into(),
+        Presence::Unknown => String::new(),
+    }
+}
+
+/// Delivery mark of an outgoing message: sending, sent, read.
+fn delivery_mark(app: &App, m: &Msg) -> Option<(&'static str, bool)> {
+    if !m.outgoing || m.deleted {
+        return None;
+    }
+    if m.sending {
+        return Some(("🕓", false));
+    }
+    let read = app.chats.get(&m.chat_id).is_some_and(|c| c.read_outbox >= m.id);
+    Some(if read { ("✓✓", true) } else { ("✓", false) })
+}
+
+fn mark_text<'a>(mark: Option<(&'static str, bool)>) -> Option<Element<'a, Message>> {
+    let (mark, read) = mark?;
+    Some(
+        text(mark)
+            .size(12)
+            .style(move |t: &Theme| if read { primary_text(t) } else { muted_text(t) })
+            .into(),
+    )
+}
+
 fn fmt_secs(secs: f64) -> String {
     fmt_duration(secs.round() as i32)
 }
@@ -327,24 +397,29 @@ fn initials(title: &str) -> String {
 }
 
 fn avatar<'a>(app: &'a App, chat: &'a Chat) -> Element<'a, Message> {
-    if let Some(handle) = chat.avatar.and_then(|file| app.media.image(file)) {
+    avatar_image(app, chat.avatar, chat.id, &chat.title, AVATAR)
+}
+
+/// Round photo, or colored initials while there is none.
+fn avatar_image<'a>(app: &'a App, file: Option<i32>, id: i64, name: &str, size: f32) -> Element<'a, Message> {
+    if let Some(handle) = file.and_then(|file| app.media.image(file)) {
         return image(handle.clone())
-            .width(AVATAR)
-            .height(AVATAR)
+            .width(size)
+            .height(size)
             .content_fit(ContentFit::Cover)
-            .border_radius(AVATAR / 2.0)
+            .border_radius(size / 2.0)
             .into();
     }
-    let color = AVATAR_COLORS[chat.id.unsigned_abs() as usize % AVATAR_COLORS.len()];
-    container(text(initials(&chat.title)).size(15))
-        .width(AVATAR)
-        .height(AVATAR)
+    let color = AVATAR_COLORS[id.unsigned_abs() as usize % AVATAR_COLORS.len()];
+    container(text(initials(name)).size(size * 0.36))
+        .width(size)
+        .height(size)
         .align_x(Alignment::Center)
         .align_y(Alignment::Center)
         .style(move |_: &Theme| container::Style {
             background: Some(color.into()),
             text_color: Some(Color::WHITE),
-            border: iced::border::rounded(AVATAR / 2.0),
+            border: iced::border::rounded(size / 2.0),
             ..Default::default()
         })
         .into()
@@ -364,13 +439,17 @@ fn chat_row<'a>(app: &'a App, chat: &'a Chat, selected: bool, focused: bool) -> 
         .unwrap_or_default();
 
     // Text is clipped to its own column so it never runs under the time.
-    let title_line = row![
+    let mut title_line = row![
         container(text(&chat.title).size(TEXT).wrapping(Wrapping::None))
             .width(Length::Fill)
             .clip(true),
-        text(time).size(12).style(muted_text),
     ]
-    .spacing(8);
+    .spacing(6)
+    .align_y(Alignment::Center);
+    if let Some(mark) = mark_text(chat.last.as_ref().and_then(|m| delivery_mark(app, m))) {
+        title_line = title_line.push(mark);
+    }
+    let title_line = title_line.push(text(time).size(12).style(muted_text));
 
     let mut preview_line = row![
         container(
@@ -437,20 +516,36 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
         .into();
     };
 
-    let title = app.chats.get(&open.id).map_or("", |c| c.title.as_str());
-    let mut details = match open.total {
-        Some(total) => format!("{total} messages"),
-        None => String::new(),
-    };
-    if !open.at_latest {
-        details.push_str("   viewing history — G for latest");
+    let chat = app.chats.get(&open.id);
+    let title = chat.map_or("", |c| c.title.as_str());
+    let mut details: Vec<String> = Vec::new();
+    if let Some(presence) = app.presence(open.id).map(fmt_presence).filter(|p| !p.is_empty()) {
+        details.push(presence);
     }
+    if let Some(total) = open.total {
+        details.push(format!("{total} messages"));
+    }
+    if !open.at_latest {
+        details.push("viewing history — G for latest".into());
+    }
+    let online = app.presence(open.id) == Some(Presence::Online);
+    let header_avatar = match chat {
+        Some(chat) => avatar_image(app, chat.avatar, chat.id, &chat.title, HEADER_AVATAR),
+        None => space::horizontal().width(HEADER_AVATAR).into(),
+    };
     let header = container(
         row![
-            text(title).size(16).wrapping(Wrapping::None),
-            text(details).size(12).style(muted_text),
+            header_avatar,
+            column![
+                text(title).size(15).wrapping(Wrapping::None),
+                text(details.join(" · "))
+                    .size(12)
+                    .wrapping(Wrapping::None)
+                    .style(move |t: &Theme| if online { primary_text(t) } else { muted_text(t) }),
+            ]
+            .spacing(1),
         ]
-        .spacing(12)
+        .spacing(10)
         .align_y(Alignment::Center),
     )
     .height(HEADER_H)
@@ -459,19 +554,48 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
     .align_y(Alignment::Center)
     .clip(true);
 
+    let selected = (app.focus == Focus::Messages).then_some(open.cursor);
     let messages: Element<_> = if open.msgs.is_empty() {
         center(text(if open.loading { "Loading…" } else { "No messages" }).size(14)).into()
+    } else if app.is_tall() {
+        // Taller than the screen: the message gets its own scrollable,
+        // moved by j/k (and the wheel) before the cursor moves on.
+        let (width, _) = app.viewport();
+        let i = open.cursor;
+        let item = message_view(app, &open.msgs[i], selected == Some(i), width, starts_run(&open.msgs, i));
+        scrollable(container(item).padding([0.0, MSG_PAD_X]))
+            .id(TALL_ID)
+            .on_scroll(Message::TallScroll)
+            .direction(Direction::Vertical(Scrollbar::new().width(4).scroller_width(4)))
+            .height(Length::Fill)
+            .into()
     } else {
         let (width, height) = app.viewport();
         let top = top_for_bottom(&open.msgs, open.bottom, width, height);
-        let selected = (app.focus == Focus::Messages).then_some(open.cursor);
-        let items = (top..=open.bottom)
-            .map(|i| message_view(app, &open.msgs[i], selected == Some(i), width));
+        let used: f32 = (top..=open.bottom).map(|i| message_height(&open.msgs[i], width)).sum();
+        let leftover = height - used;
+        let items = (top..=open.bottom).map(|i| {
+            message_view(app, &open.msgs[i], selected == Some(i), width, starts_run(&open.msgs, i))
+        });
         // The spacer pushes messages to the bottom; heights are estimated
         // pessimistically, so the rendered range always fits.
-        let spacer = space::vertical().height(Length::Fill).into();
+        let mut children: Vec<Element<_>> = vec![space::vertical().height(Length::Fill).into()];
+        // A message too tall to fit above the visible ones still shows its
+        // end instead of leaving the space empty.
+        if top > 0 && leftover >= MIN_PARTIAL {
+            let i = top - 1;
+            let partial = message_view(app, &open.msgs[i], false, width, starts_run(&open.msgs, i));
+            children.push(
+                scrollable(partial)
+                    .direction(Direction::Vertical(Scrollbar::hidden()))
+                    .anchor_bottom()
+                    .height(leftover - MSG_SPACING)
+                    .into(),
+            );
+        }
+        children.extend(items);
         container(
-            Column::with_children(std::iter::once(spacer).chain(items))
+            Column::with_children(children)
                 .spacing(MSG_SPACING)
                 .padding([0.0, MSG_PAD_X])
                 .height(Length::Fill),
@@ -481,15 +605,50 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
         .into()
     };
 
-    column![
-        header,
-        rule::horizontal(1),
-        mouse_area(messages).on_scroll(|delta| Message::Scroll(Pane::Messages, delta)),
-        rule::horizontal(1),
-        compose(app)
-    ]
-    .width(Length::Fill)
-    .height(Length::Fill)
+    let mut pane = column![header, rule::horizontal(1)];
+    if let Some(pinned) = &open.pinned {
+        pane = pane.push(pinned_bar(pinned)).push(rule::horizontal(1));
+    }
+    pane.push(mouse_area(messages).on_scroll(|delta| Message::Scroll(Pane::Messages, delta)))
+        .push(rule::horizontal(1))
+        .push(compose(app))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// A message starts a run of messages from the same sender, which shows
+/// the avatar (gaps of over 10 minutes start a new run too).
+fn starts_run(msgs: &[Msg], i: usize) -> bool {
+    match i.checked_sub(1).and_then(|p| msgs.get(p)) {
+        Some(prev) => prev.sender != msgs[i].sender || msgs[i].date - prev.date > 600,
+        None => true,
+    }
+}
+
+fn pinned_bar(pinned: &Msg) -> Element<'_, Message> {
+    let summary: String = pinned.summary().split_whitespace().collect::<Vec<_>>().join(" ");
+    mouse_area(
+        container(
+            row![
+                text("📌").size(16),
+                column![
+                    text("Pinned message   gp").size(11).style(primary_text),
+                    text(summary).size(13).wrapping(Wrapping::None),
+                ]
+                .spacing(1),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        )
+        .height(PINNED_H)
+        .width(Length::Fill)
+        .padding([0.0, MSG_PAD_X])
+        .align_y(Alignment::Center)
+        .clip(true),
+    )
+    .on_press(Message::JumpPinned)
+    .interaction(Interaction::Pointer)
     .into()
 }
 
@@ -679,7 +838,7 @@ fn reply_quote<'a>(app: &'a App, reply_to: i64) -> Element<'a, Message> {
         .into()
 }
 
-fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32) -> Element<'a, Message> {
+fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_avatar: bool) -> Element<'a, Message> {
     let sender = m.sender;
     let mut header = row![
         text(app.sender_name(sender))
@@ -687,9 +846,20 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32) -> Ele
             .style(move |t: &Theme| text::Style { color: Some(sender_color(t, sender)) }),
         text(fmt_time(m.date, false)).size(12).style(muted_text),
     ]
-    .spacing(8);
+    .spacing(8)
+    .align_y(Alignment::Center);
     if m.edited {
         header = header.push(text("edited").size(12).style(muted_text));
+    }
+    if let Some(mark) = mark_text(delivery_mark(app, m)) {
+        header = header.push(mark);
+    }
+    if m.deleted {
+        header = header.push(
+            text("🗑 deleted")
+                .size(12)
+                .style(|t: &Theme| text::Style { color: Some(t.palette().danger) }),
+        );
     }
 
     let mut body = column![header].spacing(2);
@@ -700,20 +870,41 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32) -> Ele
         body = body.push(container(media_block(app, m, width)).padding([MEDIA_GAP / 2.0, 0.0]));
     }
     if !m.text.is_empty() {
-        body = body.push(text(&m.text).size(TEXT));
+        let deleted = m.deleted;
+        body = body.push(text(&m.text).size(TEXT).style(move |t: &Theme| {
+            if deleted { muted_text(t) } else { text::Style::default() }
+        }));
     }
 
-    mouse_area(
-        container(body)
-            .padding([6, 10])
-            .width(Length::Fill)
-            .style(move |t: &Theme| {
-                let mut style = selection_style(t, selected, true);
-                style.border = iced::border::rounded(6);
-                style
-            }),
+    let bubble = container(body)
+        .padding([6, 10])
+        .width(Length::Fill)
+        .style(move |t: &Theme| {
+            let mut style = selection_style(t, selected, true);
+            style.border = iced::border::rounded(6);
+            style
+        });
+    let channel = app.chats.get(&m.chat_id).is_some_and(|c| c.kind == ChatKind::Channel);
+    let face: Element<_> = if show_avatar && !channel {
+        let name = app.sender_name(sender);
+        let id = match sender {
+            Sender::User(id) | Sender::Chat(id) => id,
+        };
+        container(avatar_image(app, app.sender_avatar(sender), id, name, MSG_AVATAR))
+            .padding(iced::Padding { top: 4.0, ..Default::default() })
+            .into()
+    } else {
+        space::horizontal().width(MSG_AVATAR).into()
+    };
+    let line = row![face, bubble].spacing(MSG_AVATAR_GAP);
+    let tip = container(text(fmt_full_date(m.date)).size(12))
+        .padding([4, 8])
+        .style(container::bordered_box);
+    tooltip(
+        mouse_area(line).on_press(Message::SelectMsg(m.id)),
+        tip,
+        tooltip::Position::FollowCursor,
     )
-    .on_press(Message::SelectMsg(m.id))
     .into()
 }
 
@@ -799,7 +990,7 @@ fn compose_banner(app: &App) -> Option<Element<'_, Message>> {
 fn compose(app: &App) -> Element<'_, Message> {
     let editing = app.mode == Mode::Insert;
     let content = if app.input.is_empty() && !editing {
-        text("i — write a message   q — record voice")
+        text("i — write a message   q — record voice   ga — attach file")
             .size(TEXT)
             .style(muted_text)
             .into()

@@ -1,19 +1,23 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use iced::keyboard::key::{Named, Physical};
 use iced::keyboard::{self, Key, Modifiers};
 use iced::mouse::ScrollDelta;
+use iced::widget::scrollable::{AbsoluteOffset, Viewport};
 use iced::{Size, Subscription, Task, Theme, window};
 use tdlib_rs::enums::{AuthorizationState, Update};
-use tdlib_rs::types::{ChatPhotoInfo, ChatPosition};
+use tdlib_rs::types::{ChatNotificationSettings, ChatPhotoInfo, ChatPosition};
 
+use crate::archive::{Archive, Record};
 use crate::config::{self, Config};
+use crate::{export, notify};
 use crate::media::{self, Kind, Loaded, Shared, Store};
 use crate::player::{self, Audio, Movie};
-use crate::tg::{self, Folder, ListKey, Media, Msg, SendOptions, Sender};
+use crate::tg::{self, ChatKind, Folder, ListKey, Media, Msg, Presence, Scope, SendOptions, Sender, User};
 use crate::view;
-use crate::vim::{Action, Input, Mode, NKey, Pending, normalize};
+use crate::vim::{Action, History, Input, Mode, NKey, Pending, normalize};
 use crate::voice::Recorder;
 
 const HISTORY_PAGE: i32 = 50;
@@ -28,12 +32,21 @@ const SEEK_SHORT: f64 = 5.0;
 const SEEK_LONG: f64 = 30.0;
 /// Touchpad pixels per list step.
 const SCROLL_PIXELS: f32 = 40.0;
+/// Messages kept visible above and below the cursor, like Vim's `scrolloff`.
+const SCROLLOFF: usize = 2;
+/// Pixels `j`/`k` scroll inside a message taller than the screen.
+const TALL_STEP: f32 = 90.0;
+/// Older messages arriving (e.g. after being offline) don't notify.
+const NOTIFY_MAX_AGE: i64 = 120;
+/// Scrollable showing a message taller than the screen.
+pub const TALL_ID: &str = "tall-message";
 
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l panes  J/K gt/gT Alt-N folders  \
                     Enter open/play  i insert  q record  r reply  cc/e edit  f forward  dd delete  \
                     yy/Y copy  p/P paste  Space play/pause  [ ] speed  = 1x  H/L seek  \
-                    / filter chats or search messages  n/N next/prev match  \
-                    :date 01.05.2024  :folder  :theme  :q";
+                    / filter chats or search messages  n/N next/prev match  ga attach  gp pinned  \
+                    Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
+                    :folder  :theme  :q";
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -83,6 +96,20 @@ pub enum Message {
         file_id: i32,
         result: Result<Shared<Movie>, String>,
     },
+    /// Deleted messages remembered by the archive.
+    Archived {
+        chat_id: i64,
+        result: Result<Vec<Record>, String>,
+    },
+    Pinned {
+        chat_id: i64,
+        result: Result<Option<Msg>, String>,
+    },
+    JumpPinned,
+    Picked(Vec<PathBuf>),
+    Exported(Result<(PathBuf, usize), String>),
+    WindowEvent(window::Event),
+    TallScroll(Viewport),
     Paste(Option<String>),
     ClickFolder(usize),
     ClickChat(i64),
@@ -181,11 +208,31 @@ enum PasteTarget {
     Cmdline,
 }
 
+/// Per-chat notification override.
+#[derive(Debug, Clone, Copy, Default)]
+struct Mute {
+    use_default: bool,
+    mute_for: i32,
+}
+
+impl Mute {
+    fn of(settings: &ChatNotificationSettings) -> Self {
+        Mute {
+            use_default: settings.use_default_mute_for,
+            mute_for: settings.mute_for,
+        }
+    }
+}
+
 pub struct Chat {
     pub id: i64,
     pub title: String,
+    pub kind: ChatKind,
     pub last: Option<Msg>,
     pub unread: i32,
+    /// Outgoing messages up to this id were read by the other side.
+    pub read_outbox: i64,
+    mute: Mute,
     /// Order within each chat list the chat belongs to.
     positions: HashMap<ListKey, i64>,
     /// File id of the small chat photo.
@@ -225,6 +272,7 @@ pub struct OpenChat {
     pub at_latest: bool,
     /// Total number of messages in the chat.
     pub total: Option<i32>,
+    pub pinned: Option<Msg>,
 }
 
 impl OpenChat {
@@ -238,6 +286,7 @@ impl OpenChat {
             exhausted: false,
             at_latest: true,
             total: None,
+            pinned: None,
         }
     }
 
@@ -333,7 +382,18 @@ pub struct App {
     pub mode: Mode,
     pub focus: Focus,
     pub chats: HashMap<i64, Chat>,
-    users: HashMap<i64, String>,
+    pub users: HashMap<i64, User>,
+    archive: Option<Archive>,
+    /// Default mute duration per kind of chat.
+    scope_mute: HashMap<Scope, i32>,
+    /// The window has keyboard focus (no notifications for the open chat).
+    focused: bool,
+    search_history: History,
+    command_history: History,
+    /// Scroll position inside a message taller than the screen.
+    pub tall_offset: f32,
+    /// How far that message can scroll, once the scrollable reported it.
+    tall_max: Option<f32>,
     pub folders: Vec<Folder>,
     pub folder: usize,
     /// Number of chats with unread messages, per folder.
@@ -403,6 +463,13 @@ impl App {
             focus: Focus::Chats,
             chats: HashMap::new(),
             users: HashMap::new(),
+            archive: Archive::open(config::dirs().data_dir().join("archive.sqlite")).ok(),
+            scope_mute: HashMap::new(),
+            focused: true,
+            search_history: load_history('/'),
+            command_history: load_history(':'),
+            tall_offset: 0.0,
+            tall_max: None,
             folders: tg::folders(tdlib_rs::types::UpdateChatFolders::default()),
             folder: 0,
             folder_unread: HashMap::new(),
@@ -466,6 +533,7 @@ impl App {
             keyboard::listen().map(Message::Key),
             window::resize_events().map(|(_, size)| Message::Resized(size)),
             window::close_requests().map(|_| Message::Quit),
+            window::events().map(|(_, event)| Message::WindowEvent(event)),
             tick,
         ])
     }
@@ -476,10 +544,90 @@ impl App {
 
     pub fn sender_name(&self, sender: Sender) -> &str {
         let name = match sender {
-            Sender::User(id) => self.users.get(&id).map(String::as_str),
+            Sender::User(id) => self.users.get(&id).map(|u| u.name.as_str()),
             Sender::Chat(id) => self.chats.get(&id).map(|c| c.title.as_str()),
         };
         name.unwrap_or("…")
+    }
+
+    pub fn sender_avatar(&self, sender: Sender) -> Option<i32> {
+        match sender {
+            Sender::User(id) => self.users.get(&id)?.avatar,
+            Sender::Chat(id) => self.chats.get(&id)?.avatar,
+        }
+    }
+
+    /// Online status of the other side of a private chat.
+    pub fn presence(&self, chat_id: i64) -> Option<Presence> {
+        match self.chats.get(&chat_id)?.kind {
+            ChatKind::Private(user_id) => Some(self.users.get(&user_id)?.presence),
+            _ => None,
+        }
+    }
+
+    /// The message under the cursor is taller than the message pane.
+    pub fn is_tall(&self) -> bool {
+        let (width, height) = self.viewport();
+        self.open
+            .as_ref()
+            .and_then(OpenChat::current)
+            .is_some_and(|m| view::message_height(m, width) > height)
+    }
+
+    fn muted(&self, chat: &Chat) -> bool {
+        let mute_for = if chat.mute.use_default {
+            self.scope_mute.get(&chat.kind.scope()).copied().unwrap_or(0)
+        } else {
+            chat.mute.mute_for
+        };
+        mute_for > 0
+    }
+
+    /// A desktop notification for an incoming message, unless unwanted.
+    fn notification(&self, msg: &Msg) -> Task<Message> {
+        if msg.outgoing || msg.scheduled {
+            return Task::none();
+        }
+        let Some(chat) = self.chats.get(&msg.chat_id) else {
+            return Task::none();
+        };
+        let looking = self.focused && self.open.as_ref().is_some_and(|o| o.id == chat.id);
+        let age = chrono::Utc::now().timestamp() - i64::from(msg.date);
+        if looking || self.muted(chat) || age > NOTIFY_MAX_AGE {
+            return Task::none();
+        }
+        let title = match chat.kind {
+            ChatKind::Group => format!("{} · {}", self.sender_name(msg.sender), chat.title),
+            _ => chat.title.clone(),
+        };
+        Task::perform(notify::show(title, notify::preview(&msg.summary())), |()| {
+            Message::Done(Ok(()))
+        })
+    }
+
+    fn archive_save(&self, msgs: &[Msg]) {
+        if let Some(archive) = &self.archive {
+            archive.save(msgs);
+        }
+    }
+
+    /// Bring back messages deleted in `lo..=hi` that the archive remembers.
+    fn load_archived(&self, chat_id: i64, lo: i64, hi: i64) -> Task<Message> {
+        let Some(archive) = self.archive.clone() else {
+            return Task::none();
+        };
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || archive.deleted_between(chat_id, lo, hi))
+                    .await
+                    .map_err(|e| e.to_string())?
+            },
+            move |result| Message::Archived { chat_id, result },
+        )
+    }
+
+    fn load_pinned(chat_id: i64) -> Task<Message> {
+        Task::perform(tg::pinned(chat_id), move |result| Message::Pinned { chat_id, result })
     }
 
     pub fn selected_index(&self) -> Option<usize> {
@@ -489,7 +637,8 @@ impl App {
 
     /// Size of the message list, which shrinks with the compose box.
     pub fn viewport(&self) -> (f32, f32) {
-        view::messages_viewport(self.size, &self.input, self.compose != Compose::New)
+        let pinned = self.open.as_ref().is_some_and(|o| o.pinned.is_some());
+        view::messages_viewport(self.size, &self.input, self.compose != Compose::New, pinned)
     }
 
     pub fn viewer_media(&self) -> Option<&Media> {
@@ -609,6 +758,57 @@ impl App {
                 }
                 Task::none()
             }
+            Message::Archived { chat_id, result } => {
+                match result {
+                    Ok(records) if !records.is_empty() => {
+                        if let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id) {
+                            open.edit(|msgs| msgs.extend(records.into_iter().map(Msg::from)));
+                            self.scroll_messages();
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.error(format!("Archive: {e}")),
+                }
+                Task::none()
+            }
+            Message::Pinned { chat_id, result } => {
+                if let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id) {
+                    open.pinned = result.ok().flatten();
+                }
+                self.scroll_messages();
+                Task::none()
+            }
+            Message::JumpPinned => match self.open.as_ref().and_then(|o| o.pinned.as_ref()) {
+                Some(pinned) => {
+                    let id = pinned.id;
+                    self.jump_to_message(id)
+                }
+                None => {
+                    self.error("No pinned message");
+                    Task::none()
+                }
+            },
+            Message::Picked(paths) => self.send_files(paths),
+            Message::Exported(result) => {
+                match result {
+                    Ok((path, count)) => self.info(format!("Exported {count} messages to {}", path.display())),
+                    Err(e) => self.error(format!("Export failed: {e}")),
+                }
+                Task::none()
+            }
+            Message::WindowEvent(event) => {
+                match event {
+                    window::Event::Focused => self.focused = true,
+                    window::Event::Unfocused => self.focused = false,
+                    _ => {}
+                }
+                Task::none()
+            }
+            Message::TallScroll(viewport) => {
+                self.tall_offset = viewport.absolute_offset().y;
+                self.tall_max = Some((viewport.content_bounds().height - viewport.bounds().height).max(0.0));
+                Task::none()
+            }
             Message::Paste(text) => {
                 self.on_paste(text);
                 Task::none()
@@ -639,6 +839,10 @@ impl App {
                 Task::none()
             }
             Message::Quit => {
+                // Commit what the archive has queued before TDLib closes.
+                if let Some(archive) = &self.archive {
+                    archive.flush();
+                }
                 self.stop_recording(false);
                 self.voice = None;
                 self.video = None;
@@ -656,11 +860,18 @@ impl App {
             Update::AuthorizationState(u) => return self.on_auth(u.authorization_state),
             Update::NewChat(u) => {
                 let c = u.chat;
+                let last = c.last_message.map(Msg::from);
+                if let Some(last) = &last {
+                    self.archive_save(std::slice::from_ref(last));
+                }
                 let mut chat = Chat {
                     id: c.id,
                     title: c.title,
-                    last: c.last_message.map(Msg::from),
+                    kind: ChatKind::of(&c.r#type),
+                    last,
                     unread: c.unread_count,
+                    read_outbox: c.last_read_outbox_message_id,
+                    mute: Mute::of(&c.notification_settings),
                     positions: HashMap::new(),
                     avatar: avatar_of(c.photo.as_ref()),
                 };
@@ -688,12 +899,39 @@ impl App {
                 }
             }
             Update::ChatLastMessage(u) => {
+                let last = u.last_message.map(Msg::from);
+                if let Some(last) = &last {
+                    self.archive_save(std::slice::from_ref(last));
+                }
                 if let Some(chat) = self.chats.get_mut(&u.chat_id) {
-                    chat.last = u.last_message.map(Msg::from);
+                    chat.last = last;
                     for p in &u.positions {
                         chat.set_position(p);
                     }
                     self.list_dirty = true;
+                }
+            }
+            Update::ChatReadOutbox(u) => {
+                if let Some(chat) = self.chats.get_mut(&u.chat_id) {
+                    chat.read_outbox = u.last_read_outbox_message_id;
+                }
+            }
+            Update::ChatNotificationSettings(u) => {
+                if let Some(chat) = self.chats.get_mut(&u.chat_id) {
+                    chat.mute = Mute::of(&u.notification_settings);
+                }
+            }
+            Update::ScopeNotificationSettings(u) => {
+                self.scope_mute.insert(Scope::of(&u.scope), u.notification_settings.mute_for);
+            }
+            Update::UserStatus(u) => {
+                if let Some(user) = self.users.get_mut(&u.user_id) {
+                    user.presence = Presence::of(&u.status);
+                }
+            }
+            Update::MessageIsPinned(u) => {
+                if self.open.as_ref().is_some_and(|o| o.id == u.chat_id) {
+                    return Self::load_pinned(u.chat_id);
                 }
             }
             Update::ChatReadInbox(u) => {
@@ -713,13 +951,17 @@ impl App {
                 self.list_dirty = true;
             }
             Update::User(u) => {
-                let user = u.user;
-                let name = format!("{} {}", user.first_name, user.last_name);
-                self.users.insert(user.id, name.trim().to_owned());
+                self.users.insert(u.user.id, User::from(&u.user));
             }
-            Update::NewMessage(u) => return self.on_new_message(Msg::from(u.message)),
+            Update::NewMessage(u) => {
+                let msg = Msg::from(u.message);
+                self.archive_save(std::slice::from_ref(&msg));
+                let notify = self.notification(&msg);
+                return Task::batch([notify, self.on_new_message(msg)]);
+            }
             Update::MessageSendSucceeded(u) => {
                 let msg = Msg::from(u.message);
+                self.archive_save(std::slice::from_ref(&msg));
                 if let Some(open) = self.open.as_mut().filter(|o| o.id == msg.chat_id) {
                     let follow = open.at_end();
                     open.edit(|msgs| {
@@ -742,6 +984,8 @@ impl App {
                     if msg.media.is_empty() {
                         msg.text = tg::content_text(&u.new_content);
                     }
+                    let msg = msg.clone();
+                    self.archive_save(&[msg]);
                 }
             }
             Update::MessageEdited(u) => {
@@ -751,13 +995,15 @@ impl App {
                     open.msgs[i].edited = true;
                 }
             }
-            Update::DeleteMessages(u) => {
-                if let Some(open) = self.open.as_mut().filter(|o| o.id == u.chat_id)
-                    && u.is_permanent
-                {
-                    open.edit(|msgs| msgs.retain(|m| !u.message_ids.contains(&m.id)));
-                    if self.viewer.is_some_and(|v| u.message_ids.contains(&v.msg_id)) {
-                        self.close_viewer();
+            // `from_cache` only drops TDLib's local copy: not a deletion.
+            Update::DeleteMessages(u) if u.is_permanent && !u.from_cache => {
+                if let Some(archive) = &self.archive {
+                    archive.mark_deleted(u.chat_id, u.message_ids.clone());
+                }
+                // Keep showing deleted messages, marked as such.
+                if let Some(open) = self.open.as_mut().filter(|o| o.id == u.chat_id) {
+                    for msg in open.msgs.iter_mut().filter(|m| u.message_ids.contains(&m.id)) {
+                        msg.deleted = true;
                     }
                 }
             }
@@ -804,6 +1050,10 @@ impl App {
     }
 
     fn on_new_message(&mut self, msg: Msg) -> Task<Message> {
+        // Scheduled messages live in their own list, not in the history.
+        if msg.scheduled {
+            return Task::none();
+        }
         // While looking at old history, new messages load when scrolling down.
         let Some(open) = self.open.as_mut().filter(|o| o.id == msg.chat_id && o.at_latest) else {
             return Task::none();
@@ -837,15 +1087,23 @@ impl App {
                 return Task::none();
             }
         };
+        if let Some(archive) = &self.archive {
+            archive.save(&batch);
+        }
         if newer {
             // The page includes the message it starts from.
             if batch.len() <= 1 {
                 open.at_latest = true;
             }
             let ids: Vec<i64> = batch.iter().map(|m| m.id).collect();
+            let lo = open.msgs.last().map_or(0, |m| m.id);
+            let hi = if open.at_latest { i64::MAX } else { ids.iter().copied().max().unwrap_or(lo) };
             open.edit(|msgs| msgs.extend(batch));
             self.scroll_messages();
-            return Task::perform(tg::view_messages(chat_id, ids), Message::Done);
+            return Task::batch([
+                Task::perform(tg::view_messages(chat_id, ids), Message::Done),
+                self.load_archived(chat_id, lo, hi),
+            ]);
         }
         if batch.is_empty() {
             open.exhausted = true;
@@ -854,6 +1112,12 @@ impl App {
 
         let ids: Vec<i64> = batch.iter().map(|m| m.id).collect();
         let first_load = open.msgs.is_empty();
+        let lo = ids.iter().copied().min().unwrap_or(0);
+        let hi = match open.msgs.first() {
+            Some(first) => first.id,
+            None if open.at_latest => i64::MAX,
+            None => ids.iter().copied().max().unwrap_or(lo),
+        };
         open.edit(|msgs| msgs.extend(batch));
         if first_load {
             open.cursor = open.msgs.len() - 1;
@@ -862,7 +1126,10 @@ impl App {
         let want_more = open.msgs.len() < MIN_HISTORY || open.cursor < PREFETCH;
         self.scroll_messages();
 
-        let mut tasks = vec![Task::perform(tg::view_messages(chat_id, ids), Message::Done)];
+        let mut tasks = vec![
+            Task::perform(tg::view_messages(chat_id, ids), Message::Done),
+            self.load_archived(chat_id, lo, hi),
+        ];
         if want_more {
             tasks.push(self.load_history(true));
         }
@@ -1009,7 +1276,12 @@ impl App {
                 return Task::none();
             }
         };
+        if let Some(archive) = &self.archive {
+            archive.save(&batch);
+        }
         let ids: Vec<i64> = batch.iter().map(|m| m.id).collect();
+        let lo = ids.iter().copied().min().unwrap_or(0);
+        let hi = ids.iter().copied().max().unwrap_or(0);
         // Replace what was loaded: the window is not contiguous with it.
         open.msgs.clear();
         open.exhausted = false;
@@ -1017,8 +1289,13 @@ impl App {
         open.edit(|msgs| msgs.extend(batch));
         open.cursor = open.position(target).unwrap_or(0);
         open.bottom = open.cursor;
+        self.reset_tall();
         self.scroll_messages();
-        Task::perform(tg::view_messages(chat_id, ids), Message::Done)
+        Task::batch([
+            Task::perform(tg::view_messages(chat_id, ids), Message::Done),
+            self.load_archived(chat_id, lo, hi),
+            self.scroll_tall(),
+        ])
     }
 
     fn show_match(&mut self) {
@@ -1076,7 +1353,14 @@ impl App {
         {
             let (width, height) = self.viewport();
             let top = view::top_for_bottom(&open.msgs, open.bottom, width, height);
-            for msg in &open.msgs[top..=open.bottom] {
+            if let Some(file) = self.chats.get(&open.id).and_then(|c| c.avatar) {
+                wanted.push((file, Kind::Image, Size::ZERO, media::PRIORITY_AVATAR));
+            }
+            let first = top.saturating_sub(1);
+            for msg in &open.msgs[first..=open.bottom] {
+                if let Some(file) = self.sender_avatar(msg.sender) {
+                    wanted.push((file, Kind::Image, Size::ZERO, media::PRIORITY_AVATAR));
+                }
                 let sizes = view::media_sizes(&msg.media, width);
                 for (media, size) in msg.media.iter().zip(sizes) {
                     if let Some(file) = media.inline_file() {
@@ -1120,35 +1404,115 @@ impl App {
             chat_id: id,
             result,
         }));
+        tasks.push(Self::load_pinned(id));
+        self.reset_tall();
         tasks.push(self.load_history(false));
         Task::batch(tasks)
     }
 
     fn send(&mut self) -> Task<Message> {
+        self.send_with(SendOptions::default())
+    }
+
+    /// Send (or save the edit of) the composed message.
+    fn send_with(&mut self, mut options: SendOptions) -> Task<Message> {
         let Some(open) = &self.open else {
             return Task::none();
         };
         let text = self.input.as_str().trim();
         if text.is_empty() {
+            self.error("Nothing to send: write a message first (i)");
             return Task::none();
         }
         let (chat_id, text) = (open.id, text.to_owned());
         self.input.clear();
         let compose = std::mem::replace(&mut self.compose, Compose::New);
         match compose {
-            Compose::New => Task::perform(tg::send_text(chat_id, text, SendOptions::default()), Message::Done),
-            Compose::Reply(id) => {
-                let options = SendOptions {
-                    reply_to: Some(id),
-                    ..SendOptions::default()
-                };
-                Task::perform(tg::send_text(chat_id, text, options), Message::Done)
-            }
             Compose::Edit(id) => {
                 self.mode = Mode::Normal;
-                Task::perform(tg::edit_text(chat_id, id, text), Message::Done)
+                return Task::perform(tg::edit_text(chat_id, id, text), Message::Done);
             }
+            Compose::Reply(id) => options.reply_to = Some(id),
+            Compose::New => {}
         }
+        if let Some(at) = options.at {
+            self.info(format!("Scheduled for {}", view::fmt_datetime(at)));
+        } else if options.silent {
+            self.info("Sent without sound");
+        }
+        Task::perform(tg::send_text(chat_id, text, options), Message::Done)
+    }
+
+    fn pick_files(&mut self) -> Task<Message> {
+        if self.open.is_none() {
+            self.error("Open a chat first (Enter)");
+            return Task::none();
+        }
+        Task::perform(
+            async {
+                rfd::AsyncFileDialog::new()
+                    .set_title("Attach files")
+                    .pick_files()
+                    .await
+                    .map(|files| files.iter().map(|f| f.path().to_path_buf()).collect())
+                    .unwrap_or_default()
+            },
+            Message::Picked,
+        )
+    }
+
+    /// Send files; the composed text becomes the caption of the first one.
+    fn send_files(&mut self, paths: Vec<PathBuf>) -> Task<Message> {
+        let Some(chat_id) = self.open.as_ref().map(|o| o.id) else {
+            return Task::none();
+        };
+        if paths.is_empty() {
+            return Task::none();
+        }
+        if let Some(missing) = paths.iter().find(|p| !p.is_file()) {
+            self.error(format!("No such file: {}", missing.display()));
+            return Task::none();
+        }
+        let mut options = SendOptions::default();
+        if let Compose::Reply(id) = self.compose {
+            options.reply_to = Some(id);
+        }
+        let mut caption = match self.compose {
+            Compose::Edit(_) => String::new(),
+            _ => self.input.take().trim().to_owned(),
+        };
+        self.compose = Compose::New;
+        self.info(format!("Sending {} file(s)…", paths.len()));
+        Task::batch(paths.into_iter().map(|path| {
+            let caption = std::mem::take(&mut caption);
+            Task::perform(tg::send_file(chat_id, path, caption, options), Message::Done)
+        }))
+    }
+
+    fn export(&mut self, arg: Option<&str>) -> Task<Message> {
+        let Some(open) = &self.open else {
+            self.error("Open a chat first (Enter)");
+            return Task::none();
+        };
+        let chat_id = open.id;
+        let title = self.chats.get(&chat_id).map_or("chat".to_owned(), |c| c.title.clone());
+        let path = arg.map_or_else(|| export::default_path(&title), expand_home);
+        let mut names: HashMap<Sender, String> =
+            self.users.iter().map(|(id, u)| (Sender::User(*id), u.name.clone())).collect();
+        names.extend(self.chats.iter().map(|(id, c)| (Sender::Chat(*id), c.title.clone())));
+        let archive = self.archive.clone();
+        self.info(format!("Exporting {title}… (big chats take a while)"));
+        Task::perform(
+            async move {
+                let msgs = export::collect(chat_id, archive).await?;
+                let count = msgs.len();
+                let html = export::html(&title, &msgs, &names);
+                tokio::task::spawn_blocking(move || export::write_pdf(&html, &path).map(|()| (path, count)))
+                    .await
+                    .map_err(|e| e.to_string())?
+            },
+            Message::Exported,
+        )
     }
 
     fn submit_auth(&mut self) -> Task<Message> {
@@ -1433,6 +1797,12 @@ impl App {
             self.input.insert("\n");
             return Task::none();
         }
+        if self.auth == Auth::Ready && mods.alt() && matches!(key, Key::Named(Named::Enter)) {
+            return self.send_with(SendOptions {
+                silent: true,
+                ..SendOptions::default()
+            });
+        }
         match edit(&mut self.input, key, physical, mods, text) {
             Edit::Submit if self.auth == Auth::Ready => self.send(),
             Edit::Submit => self.submit_auth(),
@@ -1447,8 +1817,39 @@ impl App {
 
     fn key_cmdline(&mut self, key: &Key, physical: Physical, mods: Modifiers, text: Option<&str>) -> Task<Message> {
         let search = self.mode == Mode::Search;
+        let up = match key {
+            Key::Named(Named::ArrowUp) => Some(true),
+            Key::Named(Named::ArrowDown) => Some(false),
+            _ if mods.control() => match key.to_latin(physical) {
+                Some('p') => Some(true),
+                Some('n') => Some(false),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(up) = up {
+            let history = if search { &mut self.search_history } else { &mut self.command_history };
+            let current = self.cmdline.as_str().to_owned();
+            let entry = if up { history.prev(&current) } else { history.next() }.map(str::to_owned);
+            if let Some(entry) = entry {
+                self.cmdline.set(&entry);
+                if search && !self.search_messages {
+                    self.set_filter(entry);
+                }
+            }
+            return Task::none();
+        }
         let was_empty = self.cmdline.is_empty();
         let mut result = edit(&mut self.cmdline, key, physical, mods, text);
+        if !matches!(result, Edit::Ignored) {
+            let history = if search { &mut self.search_history } else { &mut self.command_history };
+            if matches!(result, Edit::Submit) {
+                history.push(self.cmdline.as_str());
+                self.save_histories();
+            } else {
+                history.reset();
+            }
+        }
         // Like Vim: backspace on an empty command line leaves it.
         if was_empty && matches!(key, Key::Named(Named::Backspace)) {
             result = Edit::Cancel;
@@ -1521,6 +1922,21 @@ impl App {
         })
     }
 
+    fn save_histories(&self) {
+        let lines: Vec<String> = self
+            .search_history
+            .entries()
+            .iter()
+            .map(|e| format!("/{e}"))
+            .chain(self.command_history.entries().iter().map(|e| format!(":{e}")))
+            .collect();
+        let path = history_path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, lines.join("\n"));
+    }
+
     fn read_clipboard(&mut self, target: PasteTarget) -> Task<Message> {
         self.paste = target;
         iced::clipboard::read().map(Message::Paste)
@@ -1590,6 +2006,25 @@ impl App {
                 }
             }
             ("d" | "date", Some(value)) => return self.jump_to_date(value),
+            ("a" | "attach", None) => return self.pick_files(),
+            ("a" | "attach", Some(path)) => return self.send_files(vec![expand_home(path)]),
+            ("silent", _) => {
+                return self.send_with(SendOptions {
+                    silent: true,
+                    ..SendOptions::default()
+                });
+            }
+            ("later" | "schedule", Some(when)) => match parse_when(when, chrono::Local::now()) {
+                Some(at) => {
+                    return self.send_with(SendOptions {
+                        at: Some(at),
+                        ..SendOptions::default()
+                    });
+                }
+                None => self.error(format!("Bad time: {when} (try 21:00, +30m, +2h, 01.11 09:00)")),
+            },
+            ("export", path) => return self.export(path),
+            ("pin" | "pinned", _) => return self.handle(Message::JumpPinned),
             ("s" | "search", Some(query)) => {
                 self.search_messages = true;
                 return self.search_chat(query.to_owned());
@@ -1691,6 +2126,8 @@ impl App {
                 }
                 Task::none()
             }
+            Action::Attach => self.pick_files(),
+            Action::Pinned => self.handle(Message::JumpPinned),
             Action::SearchNext => self.next_match(1),
             Action::SearchPrev => self.next_match(-1),
             Action::Delete => {
@@ -1908,8 +2345,55 @@ impl App {
     }
 
     fn step(&mut self, delta: isize) -> Task<Message> {
+        // j/k scroll through a message taller than the screen first.
+        if self.focus == Focus::Messages && delta.abs() == 1 && self.is_tall() {
+            let max = self.tall_limit();
+            if delta > 0 && self.tall_offset < max - 1.0 {
+                self.tall_offset = (self.tall_offset + TALL_STEP).min(max);
+                return self.scroll_tall();
+            }
+            if delta < 0 && self.tall_offset > 1.0 {
+                self.tall_offset = (self.tall_offset - TALL_STEP).max(0.0);
+                return self.scroll_tall();
+            }
+        }
         let target = self.current().saturating_add_signed(delta);
-        self.jump(target)
+        let task = self.jump(target);
+        // Coming from below, a tall message starts at its end.
+        if self.focus == Focus::Messages && delta < 0 && self.is_tall() {
+            self.tall_offset = self.tall_limit();
+            return Task::batch([task, self.scroll_tall()]);
+        }
+        task
+    }
+
+    /// How far the tall message under the cursor can scroll.
+    fn tall_limit(&self) -> f32 {
+        let (width, height) = self.viewport();
+        self.tall_max.unwrap_or_else(|| {
+            self.open
+                .as_ref()
+                .and_then(OpenChat::current)
+                .map_or(0.0, |m| (view::message_height(m, width) - height).max(0.0))
+        })
+    }
+
+    fn reset_tall(&mut self) {
+        self.tall_offset = 0.0;
+        self.tall_max = None;
+    }
+
+    fn scroll_tall(&self) -> Task<Message> {
+        if !self.is_tall() {
+            return Task::none();
+        }
+        iced::widget::operation::scroll_to(
+            TALL_ID,
+            AbsoluteOffset {
+                x: 0.0,
+                y: self.tall_offset,
+            },
+        )
     }
 
     /// Move the cursor of the focused pane to `index` (clamped).
@@ -1919,16 +2403,23 @@ impl App {
                 if open.msgs.is_empty() {
                     return Task::none();
                 }
+                let before = open.cursor;
                 open.cursor = index.min(open.msgs.len() - 1);
+                let moved = open.cursor != before;
                 let near_top = open.cursor < PREFETCH;
                 let near_bottom = open.cursor + PREFETCH >= open.msgs.len();
+                if moved {
+                    self.reset_tall();
+                }
                 self.scroll_messages();
+                let scroll = if moved { self.scroll_tall() } else { Task::none() };
                 if near_top {
-                    return self.load_history(true);
+                    return Task::batch([scroll, self.load_history(true)]);
                 }
                 if near_bottom {
-                    return self.load_newer();
+                    return Task::batch([scroll, self.load_newer()]);
                 }
+                return scroll;
             }
             _ => {
                 if self.list.is_empty() {
@@ -1957,6 +2448,7 @@ impl App {
     }
 
     fn scroll_messages(&mut self) {
+        let tall = self.is_tall();
         let (width, height) = self.viewport();
         let Some(open) = self.open.as_mut() else {
             return;
@@ -1967,11 +2459,28 @@ impl App {
         let last = open.msgs.len() - 1;
         open.cursor = open.cursor.min(last);
         open.bottom = open.bottom.min(last);
-        if open.cursor > open.bottom {
-            open.bottom = open.cursor;
-        } else if open.cursor < view::top_for_bottom(&open.msgs, open.bottom, width, height) {
-            open.bottom = view::bottom_for_top(&open.msgs, open.cursor, width, height);
+        let (cursor, msgs) = (open.cursor, &open.msgs);
+        let top_of = |bottom: usize| view::top_for_bottom(msgs, bottom, width, height);
+        let bottom_of = |top: usize| view::bottom_for_top(msgs, top, width, height);
+        if tall {
+            open.bottom = cursor;
+            return;
         }
+        let mut bottom = open.bottom;
+        // Keep a few messages below the cursor in view...
+        bottom = bottom.max((cursor + SCROLLOFF).min(last));
+        while bottom > cursor && cursor < top_of(bottom) {
+            bottom -= 1;
+        }
+        // ...and a few above it.
+        let want_top = cursor.saturating_sub(SCROLLOFF);
+        if want_top < top_of(bottom) {
+            bottom = bottom_of(want_top).max(cursor);
+            while bottom > cursor && cursor < top_of(bottom) {
+                bottom -= 1;
+            }
+        }
+        open.bottom = bottom;
     }
 }
 
@@ -2066,6 +2575,109 @@ mod tests {
     use chrono::NaiveDate;
 
     #[test]
+    fn schedule_times() {
+        use chrono::TimeZone;
+        let now = chrono::Local.with_ymd_and_hms(2026, 10, 16, 20, 0, 0).unwrap();
+        let at = |s: &str| parse_when(s, now).map(|t| chrono::Local.timestamp_opt(i64::from(t), 0).unwrap());
+        assert_eq!(at("21:30"), chrono::Local.with_ymd_and_hms(2026, 10, 16, 21, 30, 0).single());
+        // Already past today: tomorrow.
+        assert_eq!(at("09:00"), chrono::Local.with_ymd_and_hms(2026, 10, 17, 9, 0, 0).single());
+        assert_eq!(at("+30m"), Some(now + chrono::Duration::minutes(30)));
+        assert_eq!(at("+2h"), Some(now + chrono::Duration::hours(2)));
+        assert_eq!(at("01.11 09:15"), chrono::Local.with_ymd_and_hms(2026, 11, 1, 9, 15, 0).single());
+        assert_eq!(at("01.01.2020 10:00"), None);
+        assert_eq!(at("soon"), None);
+    }
+
+    fn msg(id: i64, album: i64) -> Msg {
+        Msg {
+            id,
+            chat_id: 1,
+            sender: Sender::User(1),
+            outgoing: false,
+            date: 0,
+            edited: false,
+            text: format!("m{id}"),
+            media: Vec::new(),
+            album,
+            members: vec![id],
+            reply_to: None,
+            sending: false,
+            scheduled: false,
+            deleted: false,
+        }
+    }
+
+    #[test]
+    fn albums_merge_in_any_order() {
+        let mut chat = OpenChat::new(1);
+        chat.edit(|m| m.extend([msg(1, 0), msg(3, 7), msg(4, 7)]));
+        assert_eq!(chat.msgs.len(), 2);
+        // An older part of the album arrives later (previous history page).
+        chat.edit(|m| m.push(msg(2, 7)));
+        assert_eq!(chat.msgs.len(), 2);
+        assert_eq!(chat.msgs[1].members, vec![2, 3, 4]);
+        assert_eq!(chat.position(4), Some(1));
+        // Seeing a part again does not duplicate it.
+        chat.edit(|m| m.push(msg(3, 7)));
+        assert_eq!(chat.msgs[1].members, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn edits_keep_the_cursor_on_its_message() {
+        let mut chat = OpenChat::new(1);
+        chat.edit(|m| m.extend((10..20).map(|id| msg(id, 0))));
+        chat.cursor = chat.position(15).unwrap();
+        chat.edit(|m| m.extend((0..10).map(|id| msg(id, 0))));
+        assert_eq!(chat.msgs[chat.cursor].id, 15);
+        // Deleting the cursor's message moves it to the next one.
+        chat.edit(|m| m.retain(|x| x.id != 15));
+        assert_eq!(chat.msgs[chat.cursor].id, 16);
+    }
+
+    #[test]
+    fn deleted_messages_from_the_archive_never_replace_live_ones() {
+        let mut chat = OpenChat::new(1);
+        chat.edit(|m| m.extend([msg(1, 0), msg(2, 0)]));
+        let mut ghost = msg(2, 0);
+        ghost.deleted = true;
+        ghost.text = "old".into();
+        let mut gone = msg(3, 0);
+        gone.deleted = true;
+        chat.edit(|m| m.extend([ghost, gone]));
+        assert_eq!(chat.msgs.len(), 3);
+        assert!(!chat.msgs[1].deleted);
+        assert!(chat.msgs[2].deleted);
+    }
+
+    #[test]
+    fn viewer_walks_photos_across_albums() {
+        use crate::tg::FileRef;
+        let photo = || Media::Photo {
+            preview: FileRef { id: 1, width: 10, height: 10 },
+            full: FileRef { id: 2, width: 10, height: 10 },
+        };
+        let mut chat = OpenChat::new(1);
+        let mut a = msg(1, 0);
+        a.media = vec![photo(), photo()];
+        let b = msg(2, 0);
+        let mut c = msg(3, 0);
+        c.media = vec![photo()];
+        chat.edit(|m| m.extend([a, b, c]));
+        let start = Viewer { msg_id: 1, item: 1 };
+        assert_eq!(chat.viewable_near(start, 1), Some(Viewer { msg_id: 3, item: 0 }));
+        assert_eq!(chat.viewable_near(start, -1), Some(Viewer { msg_id: 1, item: 0 }));
+        assert_eq!(chat.viewable_near(Viewer { msg_id: 3, item: 0 }, 1), None);
+    }
+
+    #[test]
+    fn themes_by_loose_name() {
+        assert_eq!(find_theme("tokyo night"), Some(Theme::TokyoNight));
+        assert_eq!(find_theme("Catppuccin-Mocha"), Some(Theme::CatppuccinMocha));
+        assert_eq!(find_theme("nope"), None);
+    }
+
+    #[test]
     fn dates() {
         assert_eq!(parse_date("01.05.2024"), NaiveDate::from_ymd_opt(2024, 5, 1));
         assert_eq!(parse_date("2024-05-01"), NaiveDate::from_ymd_opt(2024, 5, 1));
@@ -2074,4 +2686,63 @@ mod tests {
         assert!(parse_date("yesterday").is_some());
         assert_eq!(parse_date("nonsense"), None);
     }
+}
+
+fn history_path() -> PathBuf {
+    config::dirs().data_dir().join("cmdline_history")
+}
+
+/// Load the saved `/` or `:` history.
+fn load_history(prefix: char) -> History {
+    let mut history = History::default();
+    if let Ok(text) = std::fs::read_to_string(history_path()) {
+        for line in text.lines() {
+            if let Some(entry) = line.strip_prefix(prefix) {
+                history.push(entry);
+            }
+        }
+    }
+    history
+}
+
+fn expand_home(path: &str) -> PathBuf {
+    let path = path.trim();
+    match (path.strip_prefix("~/"), directories::UserDirs::new()) {
+        (Some(rest), Some(dirs)) => dirs.home_dir().join(rest),
+        _ => PathBuf::from(path),
+    }
+}
+
+/// When to send a scheduled message: `21:00` (today, or tomorrow if past),
+/// `+30m` / `+2h` / `+1d`, `01.11 09:00`, `01.11.2026 09:00`.
+fn parse_when(arg: &str, now: chrono::DateTime<chrono::Local>) -> Option<i32> {
+    use chrono::{Datelike, Duration as Span, NaiveDate, NaiveTime};
+    let arg = arg.trim();
+    if let Some(rel) = arg.strip_prefix('+') {
+        let (num, unit) = rel.split_at(rel.find(|c: char| !c.is_ascii_digit())?);
+        let n: i64 = num.parse().ok()?;
+        let span = match unit {
+            "m" | "min" => Span::minutes(n),
+            "h" => Span::hours(n),
+            "d" => Span::days(n),
+            _ => return None,
+        };
+        return i32::try_from((now + span).timestamp()).ok();
+    }
+    let (date, time) = match arg.split_once(' ') {
+        Some((date, time)) => (Some(date), time),
+        None => (None, arg),
+    };
+    let time = NaiveTime::parse_from_str(time, "%H:%M").ok()?;
+    let date = match date {
+        Some(d) => NaiveDate::parse_from_str(d, "%d.%m.%Y")
+            .ok()
+            .or_else(|| NaiveDate::parse_from_str(&format!("{d}.{}", now.year()), "%d.%m.%Y").ok())?,
+        None => now.date_naive(),
+    };
+    let mut at = date.and_time(time).and_local_timezone(chrono::Local).earliest()?;
+    if at <= now && arg.split_once(' ').is_none() {
+        at += Span::days(1);
+    }
+    (at > now).then(|| i32::try_from(at.timestamp()).ok()).flatten()
 }

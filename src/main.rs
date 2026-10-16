@@ -1,7 +1,9 @@
 mod app;
 mod archive;
 mod config;
+mod export;
 mod media;
+mod notify;
 mod player;
 mod stream;
 mod tg;

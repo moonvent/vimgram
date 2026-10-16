@@ -554,7 +554,7 @@ impl From<&types::User> for User {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Sender {
     User(i64),
     Chat(i64),

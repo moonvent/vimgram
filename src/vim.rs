@@ -130,6 +130,10 @@ pub enum Action {
     Edit,
     Forward,
     Delete,
+    /// Attach files (`ga`).
+    Attach,
+    /// Jump to the pinned message (`gp`).
+    Pinned,
     SearchNext,
     SearchPrev,
     Cancel,
@@ -165,6 +169,8 @@ impl Pending {
                 None => Action::NextFolder,
             }),
             (Some('g'), NKey::Char('T')) => Some(Action::PrevFolder),
+            (Some('g'), NKey::Char('a')) => Some(Action::Attach),
+            (Some('g'), NKey::Char('p')) => Some(Action::Pinned),
             (Some('y'), NKey::Char('y')) => Some(Action::Yank),
             // `cc` changes the line in Vim; here it edits the message.
             (Some('c'), NKey::Char('c')) => Some(Action::Edit),
@@ -318,6 +324,77 @@ impl Input {
     }
 }
 
+/// Command-line history, like Vim's: Up/Down recall entries that start
+/// with what has been typed so far.
+#[derive(Debug, Default)]
+pub struct History {
+    entries: Vec<String>,
+    /// Index of the entry being shown while browsing.
+    pos: Option<usize>,
+    /// What was typed before browsing started; also the search prefix.
+    draft: String,
+}
+
+impl History {
+    const MAX: usize = 500;
+
+    pub fn entries(&self) -> &[String] {
+        &self.entries
+    }
+
+    pub fn push(&mut self, entry: &str) {
+        let entry = entry.trim();
+        self.reset();
+        if entry.is_empty() {
+            return;
+        }
+        self.entries.retain(|e| e != entry);
+        self.entries.push(entry.to_owned());
+        if self.entries.len() > Self::MAX {
+            self.entries.remove(0);
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.pos = None;
+        self.draft.clear();
+    }
+
+    /// Older entry matching the prefix typed before browsing.
+    pub fn prev(&mut self, current: &str) -> Option<&str> {
+        if self.pos.is_none() {
+            self.draft = current.to_owned();
+        }
+        let end = self.pos.unwrap_or(self.entries.len());
+        let found = self.entries[..end].iter().rposition(|e| e.starts_with(&self.draft))?;
+        self.pos = Some(found);
+        Some(&self.entries[found])
+    }
+
+    /// Newer entry, or back to the draft past the newest one.
+    pub fn next(&mut self) -> Option<&str> {
+        let pos = self.pos?;
+        match self.entries[pos + 1..].iter().position(|e| e.starts_with(&self.draft)) {
+            Some(offset) => {
+                self.pos = Some(pos + 1 + offset);
+                Some(&self.entries[pos + 1 + offset])
+            }
+            None => {
+                self.pos = None;
+                Some(&self.draft)
+            }
+        }
+    }
+}
+
+impl Input {
+    /// Replace the contents, cursor at the end.
+    pub fn set(&mut self, text: &str) {
+        self.text = text.to_owned();
+        self.cursor = self.text.len();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,7 +417,45 @@ mod tests {
         assert_eq!(feed("gTJK"), vec![Action::PrevFolder, Action::NextFolder, Action::PrevFolder]);
         assert_eq!(feed("cce"), vec![Action::Edit, Action::Edit]);
         assert_eq!(feed("ddnN"), vec![Action::Delete, Action::SearchNext, Action::SearchPrev]);
+        assert_eq!(feed("gagp"), vec![Action::Attach, Action::Pinned]);
         assert_eq!(feed("][="), vec![Action::Faster, Action::Slower, Action::NormalSpeed]);
+    }
+
+    #[test]
+    fn history_browses_with_prefix() {
+        let mut h = History::default();
+        for e in ["привет", "pin", "погода", "", "pin"] {
+            h.push(e);
+        }
+        assert_eq!(h.entries(), ["привет", "погода", "pin"]);
+        assert_eq!(h.prev(""), Some("pin"));
+        assert_eq!(h.prev(""), Some("погода"));
+        assert_eq!(h.prev(""), Some("привет"));
+        assert_eq!(h.prev(""), None);
+        assert_eq!(h.next(), Some("погода"));
+        assert_eq!(h.next(), Some("pin"));
+        assert_eq!(h.next(), Some(""));
+        h.reset();
+        assert_eq!(h.prev("п"), Some("погода"));
+        assert_eq!(h.prev("п"), Some("привет"));
+        assert_eq!(h.next(), Some("погода"));
+        assert_eq!(h.next(), Some("п"));
+    }
+
+    #[test]
+    fn normalizes_layouts() {
+        use iced::keyboard::key::{Code, Physical};
+        let key = |s: &str| Key::Character(s.into());
+        let none = Modifiers::empty();
+        // Cyrillic о is on the J key.
+        assert_eq!(normalize(&key("о"), Physical::Code(Code::KeyJ), none), Some(NKey::Char('j')));
+        assert_eq!(normalize(&key("П"), Physical::Code(Code::KeyG), Modifiers::SHIFT), Some(NKey::Char('G')));
+        assert_eq!(normalize(&key("."), Physical::Code(Code::Slash), none), Some(NKey::Char('/')));
+        assert_eq!(normalize(&key("Ж"), Physical::Code(Code::Semicolon), Modifiers::SHIFT), Some(NKey::Char(':')));
+        assert_eq!(normalize(&key("х"), Physical::Code(Code::BracketLeft), none), Some(NKey::Char('[')));
+        assert_eq!(normalize(&key("2"), Physical::Code(Code::Digit2), Modifiers::ALT), Some(NKey::Alt('2')));
+        assert_eq!(normalize(&key("["), Physical::Code(Code::BracketLeft), Modifiers::CTRL), Some(NKey::Esc));
+        assert_eq!(normalize(&Key::Named(Named::Space), Physical::Code(Code::Space), none), Some(NKey::Space));
     }
 
     #[test]
