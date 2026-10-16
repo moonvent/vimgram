@@ -12,6 +12,7 @@ flate2 = "1.1.10"
 futures = { version = "0.3.34", features = ["executor"] }
 gstreamer = "0.23"
 gstreamer-app = "0.23"
+gstreamer-pbutils = "0.23"
 gstreamer-video = "0.23"
 iced = { version = "0.14", features = ["tokio", "image", "advanced"] }
 iced_video_player = "0.6"

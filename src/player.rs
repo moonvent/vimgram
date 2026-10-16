@@ -277,9 +277,54 @@ impl Drop for Audio {
     }
 }
 
+/// Length and picture of a local video, for sending it: Telegram takes
+/// these from the sender and shows 0:00 otherwise.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VideoInfo {
+    /// Whole seconds, rounded.
+    pub duration: i32,
+    /// As displayed, i.e. after the rotation phones record in the metadata.
+    pub width: i32,
+    pub height: i32,
+}
+
+/// Read a video's duration and size from the file (blocking, quick: only
+/// headers are parsed).
+pub fn probe_video(path: &std::path::Path) -> Option<VideoInfo> {
+    use gstreamer_pbutils::prelude::*;
+    gst::init().ok()?;
+    let discoverer = gstreamer_pbutils::Discoverer::new(gst::ClockTime::from_seconds(15)).ok()?;
+    let uri = url::Url::from_file_path(path).ok()?;
+    let info = discoverer.discover_uri(uri.as_str()).ok()?;
+    let duration = info.duration().map_or(0, |d| (d.mseconds() as f64 / 1000.0).round() as i32);
+    let (mut width, mut height) = (0, 0);
+    if let Some(video) = info.video_streams().into_iter().next() {
+        (width, height) = (video.width() as i32, video.height() as i32);
+        let rotated = video
+            .tags()
+            .and_then(|tags| tags.get::<gst::tags::ImageOrientation>().map(|t| t.get().to_owned()))
+            .is_some_and(|o| o.contains("90") || o.contains("270"));
+        if rotated {
+            (width, height) = (height, width);
+        }
+    }
+    Some(VideoInfo { duration, width, height })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probes_video_length_and_size() {
+        let Some(sample) = crate::stream::tests::sample_mp4() else {
+            eprintln!("skipped: cannot encode a sample video");
+            return;
+        };
+        let info = probe_video(&sample).expect("probe");
+        assert_eq!((info.width, info.height), (320, 240));
+        assert_eq!(info.duration, 3);
+    }
 
     #[test]
     fn speeds_round_trip() {

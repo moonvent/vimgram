@@ -362,7 +362,7 @@ impl FileKind {
 }
 
 /// A local file as a photo, video or document, with an optional caption.
-fn file_content(path: &std::path::Path, caption: String) -> InputMessageContent {
+fn file_content(path: &std::path::Path, caption: String, video: Option<crate::player::VideoInfo>) -> InputMessageContent {
     let file = enums::InputFile::Local(types::InputFileLocal {
         path: path.to_string_lossy().into_owned(),
     });
@@ -382,16 +382,16 @@ fn file_content(path: &std::path::Path, caption: String) -> InputMessageContent 
             self_destruct_type: None,
             has_spoiler: false,
         }),
-        // TDLib reads duration and size from the file itself.
+        // TDLib sends duration and size as given; they come from the file.
         FileKind::Video => InputMessageContent::InputMessageVideo(types::InputMessageVideo {
             video: file,
             thumbnail: None,
             cover: None,
             start_timestamp: 0,
             added_sticker_file_ids: Vec::new(),
-            duration: 0,
-            width: 0,
-            height: 0,
+            duration: video.map_or(0, |v| v.duration),
+            width: video.map_or(0, |v| v.width),
+            height: video.map_or(0, |v| v.height),
             supports_streaming: true,
             caption,
             show_caption_above_media: false,
@@ -411,10 +411,21 @@ fn file_content(path: &std::path::Path, caption: String) -> InputMessageContent 
 /// photos and videos go as an album.
 pub async fn send_files(chat_id: i64, paths: Vec<std::path::PathBuf>, caption: String, options: SendOptions) -> Res<()> {
     let album = (2..=10).contains(&paths.len()) && paths.iter().all(|p| FileKind::of(p) != FileKind::Document);
+    // Videos: read length and size from the file first.
+    let probe_paths = paths.clone();
+    let infos: Vec<Option<crate::player::VideoInfo>> = tokio::task::spawn_blocking(move || {
+        probe_paths
+            .iter()
+            .map(|p| (FileKind::of(p) == FileKind::Video).then(|| crate::player::probe_video(p)).flatten())
+            .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     let mut caption = Some(caption);
     let contents: Vec<InputMessageContent> = paths
         .iter()
-        .map(|path| file_content(path, caption.take().unwrap_or_default()))
+        .zip(infos)
+        .map(|(path, info)| file_content(path, caption.take().unwrap_or_default(), info))
         .collect();
     if album {
         return functions::send_message_album(chat_id, None, options.reply_to(), options.options(), contents, client())
