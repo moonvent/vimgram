@@ -82,7 +82,7 @@ fn compose_height(input: &Input, banner: bool) -> f32 {
 /// Width and height available to the message list.
 pub fn messages_viewport(size: Size, compose: &Input, banner: bool, pinned: bool, emoji: bool) -> (f32, f32) {
     let panel = if emoji { EMOJI_W } else { 0.0 };
-    let width = size.width - FOLDER_W - SIDEBAR_W - 2.0 - 2.0 * MSG_PAD_X - MSG_AVATAR - MSG_AVATAR_GAP - panel;
+    let width = size.width - FOLDER_W - SIDEBAR_W - 1.0 - 2.0 * MSG_PAD_X - MSG_AVATAR - MSG_AVATAR_GAP - panel;
     let pinned = if pinned { PINNED_H + 1.0 } else { 0.0 };
     let height = size.height - STATUS_H - HEADER_H - 2.0 - pinned - compose_height(compose, banner);
     (width.max(100.0), height.max(LINE_H))
@@ -255,8 +255,8 @@ pub fn view(app: &App, _window: iced::window::Id) -> Element<'_, Message> {
         viewer
     } else {
         row![
+            // The folder strip's own background separates it from the list.
             folder_strip(app),
-            rule::vertical(1),
             chat_list(app),
             rule::vertical(1),
             chat_pane(app)

@@ -2704,9 +2704,15 @@ impl App {
             }
             Action::Cancel => {
                 self.pending.clear();
-                if !self.attachments.is_empty() {
-                    self.attachments.clear();
-                    self.info("Attachment dropped");
+                // Attachments go one per Esc, newest first.
+                if let Some(path) = self.attachments.pop() {
+                    let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+                    self.info(match self.attachments.len() {
+                        0 => format!("Removed {name}"),
+                        left => format!("Removed {name}, {left} left (Esc removes the next)"),
+                    });
+                    self.scroll_messages();
+                    return Task::none();
                 }
                 if self.forward.take().is_some() {
                     self.info("Forward cancelled");
