@@ -46,7 +46,9 @@ const MEDIA_GAP: f32 = 4.0;
 const MSG_AVATAR: f32 = 34.0;
 const MSG_AVATAR_GAP: f32 = 8.0;
 const HEADER_AVATAR: f32 = 32.0;
-const PINNED_H: f32 = 40.0;
+/// Two lines of the pinned message.
+const PINNED_TEXT_H: f32 = 13.0 * 1.3 * 2.0;
+const PINNED_H: f32 = 11.0 * 1.3 + PINNED_TEXT_H + 13.0;
 /// Space above the visible messages worth filling with the end of the
 /// previous (too tall) message.
 const MIN_PARTIAL: f32 = 40.0;
@@ -178,7 +180,11 @@ pub fn fmt_day(unix: i32) -> String {
 
 fn day_separator<'a>(unix: i32) -> Element<'a, Message> {
     container(
-        container(text(fmt_day(unix)).size(12).style(muted_text))
+        container(
+            text(fmt_day(unix))
+                .size(12)
+                .style(|t: &Theme| text::Style { color: Some(t.palette().text.scale_alpha(0.85)) }),
+        )
             .padding([2.0, 10.0])
             .style(|t: &Theme| container::Style {
                 background: Some(t.extended_palette().background.weak.color.into()),
@@ -246,8 +252,10 @@ pub fn view(app: &App, _window: iced::window::Id) -> Element<'_, Message> {
     column![body, status_line(app)].into()
 }
 
+/// Secondary text: the text color, faded. Readable on the background and
+/// on highlighted rows alike.
 fn muted(theme: &Theme) -> Color {
-    theme.extended_palette().background.strong.color
+    theme.palette().text.scale_alpha(0.6)
 }
 
 fn muted_text(theme: &Theme) -> text::Style {
@@ -559,6 +567,21 @@ fn selection_style(t: &Theme, selected: bool, focused: bool) -> container::Style
     }
 }
 
+/// The message under the cursor: a neutral lift with a thin accent
+/// outline, so sender colors, times and ticks stay readable.
+fn message_style(t: &Theme, selected: bool) -> container::Style {
+    let mut style = container::Style {
+        border: iced::border::rounded(6),
+        ..Default::default()
+    };
+    if selected {
+        let p = t.extended_palette();
+        style.background = Some(p.background.weak.color.scale_alpha(0.6).into());
+        style.border = style.border.width(1).color(p.primary.base.color.scale_alpha(0.45));
+    }
+    style
+}
+
 fn sender_color(t: &Theme, sender: Sender) -> Color {
     let p = t.palette();
     let colors = [p.primary, p.success, p.warning, p.danger];
@@ -690,16 +713,23 @@ fn starts_run(msgs: &[Msg], i: usize) -> bool {
 
 fn pinned_bar(pinned: &Msg) -> Element<'_, Message> {
     let summary: String = pinned.summary().split_whitespace().collect::<Vec<_>>().join(" ");
+    let summary: String = summary.chars().take(400).collect();
     mouse_area(
         container(
             row![
                 text("📌").size(16),
                 column![
                     text("Pinned message   gp").size(11).style(primary_text),
-                    text(summary).size(13).wrapping(Wrapping::None),
+                    // Two lines at most, wrapped within the pane.
+                    container(text(summary).size(13).wrapping(Wrapping::WordOrGlyph).width(Length::Fill))
+                        .width(Length::Fill)
+                        .max_height(PINNED_TEXT_H)
+                        .clip(true),
                 ]
+                .width(Length::Fill)
                 .spacing(1),
             ]
+            .width(Length::Fill)
             .spacing(10)
             .align_y(Alignment::Center),
         )
@@ -941,11 +971,7 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
     let bubble = container(body)
         .padding([6, 10])
         .width(Length::Fill)
-        .style(move |t: &Theme| {
-            let mut style = selection_style(t, selected, true);
-            style.border = iced::border::rounded(6);
-            style
-        });
+        .style(move |t: &Theme| message_style(t, selected));
     let channel = app.chats.get(&m.chat_id).is_some_and(|c| c.kind == ChatKind::Channel);
     let face: Element<_> = if show_avatar && !channel {
         let name = app.sender_name(sender);

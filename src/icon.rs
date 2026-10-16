@@ -81,6 +81,49 @@ pub fn render(size: u32, unread: bool) -> Pixmap {
     pixmap
 }
 
+/// Tray icon: just the white plane on transparent, filling the square,
+/// with a red dot for unread chats.
+pub fn render_tray(size: u32, unread: bool) -> Pixmap {
+    let mut pixmap = Pixmap::new(size, size).expect("non-zero icon size");
+    let s = size as f32;
+    let (min_x, max_x) = PLANE.iter().fold((f32::MAX, f32::MIN), |(lo, hi), (x, _)| (lo.min(*x), hi.max(*x)));
+    let (min_y, max_y) = PLANE.iter().fold((f32::MAX, f32::MIN), |(lo, hi), (_, y)| (lo.min(*y), hi.max(*y)));
+    let margin = s * 0.06;
+    let scale = (s - 2.0 * margin) / (max_x - min_x).max(max_y - min_y);
+    let (dx, dy) = (
+        (s - (max_x - min_x) * scale) / 2.0 - min_x * scale,
+        (s - (max_y - min_y) * scale) / 2.0 - min_y * scale,
+    );
+    let mut plane = PathBuilder::new();
+    for (i, (x, y)) in PLANE.iter().enumerate() {
+        let (x, y) = (x * scale + dx, y * scale + dy);
+        if i == 0 {
+            plane.move_to(x, y);
+        } else {
+            plane.line_to(x, y);
+        }
+    }
+    plane.close();
+    let mut white = Paint {
+        anti_alias: true,
+        ..Paint::default()
+    };
+    white.set_color(Color::WHITE);
+    if let Some(path) = plane.finish() {
+        pixmap.fill_path(&path, &white, FillRule::Winding, Transform::identity(), None);
+    }
+    if unread {
+        let r = s * 0.2;
+        let mut red = Paint {
+            anti_alias: true,
+            ..Paint::default()
+        };
+        red.set_color(rgb(BADGE));
+        pixmap.fill_path(&circle(s - r, s - r, r), &red, FillRule::Winding, Transform::identity(), None);
+    }
+    pixmap
+}
+
 /// Straight (not premultiplied) RGBA.
 pub fn rgba(pixmap: &Pixmap) -> Vec<u8> {
     pixmap
@@ -186,6 +229,20 @@ mod tests {
         let dot = render(64, true);
         let red = dot.pixel(64 - 12, 12).unwrap().demultiply();
         assert!(red.red() > 200 && red.green() < 100);
+    }
+
+    #[test]
+    fn tray_icon_is_a_bare_plane() {
+        let pixmap = render_tray(64, false);
+        let px = |x: u32, y: u32| pixmap.pixel(x, y).unwrap().demultiply();
+        assert_eq!(px(0, 0).alpha(), 0);
+        assert_eq!(px(63, 0).alpha(), 0, "no blue circle");
+        let covered = pixmap.pixels().iter().filter(|p| p.alpha() > 0).count();
+        assert!(covered > 64 * 64 / 5, "the plane fills the icon: {covered}");
+        assert!(pixmap.pixels().iter().all(|p| {
+            let c = p.demultiply();
+            c.alpha() == 0 || (c.red(), c.green(), c.blue()) == (255, 255, 255)
+        }));
     }
 
     #[test]

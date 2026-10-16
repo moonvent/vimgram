@@ -38,7 +38,7 @@ impl ksni::Tray for Tray {
         [22, 32, 48, 64]
             .into_iter()
             .map(|size| {
-                let pixmap = icon::render(size, self.unread > 0);
+                let pixmap = icon::render_tray(size, self.unread > 0);
                 ksni::Icon {
                     width: size as i32,
                     height: size as i32,
