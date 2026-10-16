@@ -352,7 +352,7 @@ mod tests {
         let tdlib_file = dir.join("voice.oga");
         std::fs::write(&tdlib_file, b"OggS").unwrap();
         let mut voice = msg(1, 20, "");
-        voice.media = vec![crate::tg::Media::Voice { file: 77, duration: 3, waveform: vec![1, 2, 3] }];
+        voice.media = vec![crate::tg::Media::Voice { file: 77, duration: 3, waveform: vec![1, 2, 3], listened: false }];
         archive.save(&[voice]);
         archive.link(1, 20, 77, tdlib_file.to_string_lossy().into_owned());
         archive.mark_deleted(1, vec![20]);
@@ -365,7 +365,7 @@ mod tests {
         assert_eq!(records[0].files.len(), 1);
         let restored = Msg::from(records[0].clone());
         assert!(restored.deleted);
-        let crate::tg::Media::Voice { file, duration, waveform } = &restored.media[0] else {
+        let crate::tg::Media::Voice { file, duration, waveform, .. } = &restored.media[0] else {
             panic!("voice expected, got {:?}", restored.media);
         };
         assert_eq!((*duration, waveform.as_slice()), (3, &[1u8, 2, 3][..]));

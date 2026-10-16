@@ -181,6 +181,7 @@ pub struct Viewer {
 }
 
 pub struct VoicePlayback {
+    chat_id: i64,
     pub msg_id: i64,
     file_id: i32,
     /// `None` while the file downloads.
@@ -189,6 +190,8 @@ pub struct VoicePlayback {
 
 pub struct VideoPlayback {
     file_id: i32,
+    /// Chat and message of a round video not yet watched to the end.
+    unwatched: Option<(i64, i64)>,
     /// Video or round video message: each keeps its own speed.
     kind: SpeedKind,
     /// `None` until the stream has started.
@@ -1115,8 +1118,7 @@ impl App {
             Message::Scroll(pane, delta) => self.on_scroll(pane, delta),
             Message::Tick(now) => {
                 self.now = now;
-                self.poll_players();
-                Task::none()
+                self.poll_players()
             }
             Message::Done(Ok(())) => Task::none(),
             Message::Done(Err(e)) => {
@@ -1276,6 +1278,14 @@ impl App {
                     }
                     let msg = msg.clone();
                     self.archive_save(&[msg]);
+                }
+            }
+            // Listened on another device, or by the recipient.
+            Update::MessageContentOpened(u) => {
+                if let Some(open) = self.open.as_mut().filter(|o| o.id == u.chat_id)
+                    && let Some(i) = open.position(u.message_id)
+                {
+                    open.msgs[i].media.iter_mut().for_each(Media::set_listened);
                 }
             }
             Update::MessageEdited(u) => {
@@ -1966,7 +1976,9 @@ impl App {
             }
             return Task::none();
         }
+        let chat_id = self.open.as_ref().map_or(0, |o| o.id);
         self.voice = Some(VoicePlayback {
+            chat_id,
             msg_id,
             file_id,
             audio: None,
@@ -1982,6 +1994,10 @@ impl App {
             }
             _ => None,
         };
+        let unwatched = self
+            .viewer_media()
+            .filter(|m| m.unlistened())
+            .and_then(|_| Some((self.open.as_ref()?.id, viewer.msg_id)));
         if let Some(open) = self.open.as_mut()
             && let Some(i) = open.position(viewer.msg_id)
         {
@@ -1995,6 +2011,7 @@ impl App {
                 self.voice = None;
                 self.video = Some(VideoPlayback {
                     file_id,
+                    unwatched,
                     kind,
                     movie: None,
                     speed_pending: false,
@@ -2021,12 +2038,22 @@ impl App {
         self.video = None;
     }
 
-    fn poll_players(&mut self) {
+    fn poll_players(&mut self) -> Task<Message> {
+        let mut finished = Vec::new();
         if let Some(playback) = self.video.as_mut().filter(|p| p.speed_pending) {
             let speed = self.speeds.get(playback.kind);
             if let Some(video) = playback.video_mut() {
                 playback.speed_pending = video.set_speed(speed).is_err();
             }
+        }
+        // A round video counts as watched once it played to the end.
+        if let Some(playback) = self.video.as_mut()
+            && let Some(video) = playback.video()
+            && (video.eos() || video.position() + Duration::from_millis(300) >= video.duration())
+            && video.duration() > Duration::ZERO
+            && let Some(message) = playback.unwatched.take()
+        {
+            finished.push(message);
         }
         if let Some(recorder) = self.recorder.as_mut()
             && let Err(e) = recorder.poll()
@@ -2034,15 +2061,41 @@ impl App {
             self.stop_recording(false);
             self.error(e);
         }
-        if let Some(audio) = self.voice.as_mut().and_then(|v| v.audio.as_mut()) {
+        if let Some(voice) = self.voice.as_mut()
+            && let Some(audio) = voice.audio.as_mut()
+        {
             match audio.poll() {
-                Ok(()) if audio.finished() => self.voice = None,
+                Ok(()) if audio.finished() => {
+                    finished.push((voice.chat_id, voice.msg_id));
+                    self.voice = None;
+                }
                 Ok(()) => {}
                 Err(e) => {
                     self.voice = None;
                     self.error(e);
                 }
             }
+        }
+        Task::batch(finished.into_iter().map(|(chat_id, msg_id)| self.mark_listened(chat_id, msg_id)))
+    }
+
+    /// Played to the end: mark it listened here and, for incoming
+    /// messages, tell Telegram (the sender sees it too).
+    fn mark_listened(&mut self, chat_id: i64, msg_id: i64) -> Task<Message> {
+        let mut report = false;
+        if let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id)
+            && let Some(i) = open.position(msg_id)
+        {
+            let msg = &mut open.msgs[i];
+            for media in msg.media.iter_mut().filter(|m| m.unlistened()) {
+                media.set_listened();
+                report = !msg.outgoing;
+            }
+        }
+        if report {
+            Task::perform(tg::open_content(chat_id, msg_id), Message::Done)
+        } else {
+            Task::none()
         }
     }
 

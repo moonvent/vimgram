@@ -182,6 +182,11 @@ pub async fn start_download(file_id: i32, offset: i64) -> Res<()> {
         .map_err(err)
 }
 
+/// Mark a voice or round video message as listened (for the sender too).
+pub async fn open_content(chat_id: i64, message_id: i64) -> Res<()> {
+    functions::open_message_content(chat_id, message_id, client()).await.map_err(err)
+}
+
 /// Delete cached files (photos, videos, voice, …) not opened for `days`
 /// days; profile photos stay. Returns the bytes freed.
 pub async fn clean_cache(days: i32) -> Res<i64> {
@@ -724,12 +729,19 @@ pub enum Media {
         mini: Option<Handle>,
         duration: i32,
         round: bool,
+        /// Round video messages: watched to the end (by the recipient, for
+        /// outgoing ones). Always true for other videos.
+        #[serde(default = "yes")]
+        listened: bool,
     },
     Voice {
         file: i32,
         duration: i32,
         /// Bar heights, 0..=31.
         waveform: Vec<u8>,
+        /// Played to the end (by the recipient, for outgoing ones).
+        #[serde(default = "yes")]
+        listened: bool,
     },
 }
 
@@ -741,6 +753,17 @@ impl Media {
             Media::Sticker { file, .. } | Media::Animation { file } => Some(file.id),
             Media::Video { thumb, .. } => *thumb,
             Media::Voice { .. } => None,
+        }
+    }
+
+    /// A voice or round video message nobody has played yet.
+    pub fn unlistened(&self) -> bool {
+        matches!(self, Media::Voice { listened: false, .. } | Media::Video { listened: false, .. })
+    }
+
+    pub fn set_listened(&mut self) {
+        if let Media::Voice { listened, .. } | Media::Video { listened, .. } = self {
+            *listened = true;
         }
     }
 
@@ -1040,24 +1063,27 @@ pub fn media(content: &MessageContent) -> Option<Media> {
                 mini: minithumbnail(v.minithumbnail.as_ref()),
                 duration: v.duration,
                 round: false,
+                listened: true,
             })
         }
-        MessageContent::MessageVideoNote(v) => {
-            let v = &v.video_note;
+        MessageContent::MessageVideoNote(note) => {
+            let v = &note.video_note;
             Some(Media::Video {
                 video: FileRef::new(&v.video, v.length, v.length),
                 thumb: still_thumbnail(v.thumbnail.as_ref()),
                 mini: minithumbnail(v.minithumbnail.as_ref()),
                 duration: v.duration,
                 round: true,
+                listened: note.is_viewed,
             })
         }
-        MessageContent::MessageVoiceNote(v) => {
-            let v = &v.voice_note;
+        MessageContent::MessageVoiceNote(note) => {
+            let v = &note.voice_note;
             Some(Media::Voice {
                 file: v.voice.id,
                 duration: v.duration,
                 waveform: unpack_waveform(&v.waveform),
+                listened: note.is_listened,
             })
         }
         _ => None,
@@ -1187,6 +1213,10 @@ fn capitalize(s: &str) -> String {
     chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
 }
 
+fn yes() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1230,5 +1260,21 @@ mod tests {
         assert_eq!(photo.files(), vec![(-5, 10), (-5, 10)]);
         assert!(local_file_id("/a") < 0);
         assert_eq!(local_file_id("/a"), local_file_id("/a"));
+    }
+
+    #[test]
+    fn listened_state() {
+        let mut voice = Media::Voice { file: 1, duration: 2, waveform: Vec::new(), listened: false };
+        assert!(voice.unlistened());
+        voice.set_listened();
+        assert!(!voice.unlistened());
+        // Archived before the field existed: no unlistened dot.
+        let old: Media = serde_json::from_str(r#"{"Voice":{"file":1,"duration":2,"waveform":[]}}"#).unwrap();
+        assert!(!old.unlistened());
+        let photo = Media::Photo {
+            preview: FileRef { id: 1, width: 1, height: 1, size: 0 },
+            full: FileRef { id: 1, width: 1, height: 1, size: 0 },
+        };
+        assert!(!photo.unlistened());
     }
 }

@@ -880,7 +880,7 @@ fn placeholder<'a>(size: Size, label: &'a str, label_size: f32, radius: f32) -> 
 
 /// Thumbnail, blurred mini-thumbnail or empty box, plus ▶ and duration.
 fn video_cell<'a>(app: &'a App, media: &'a Media, size: Size, radius: f32) -> Element<'a, Message> {
-    let Media::Video { thumb, mini, duration, .. } = media else {
+    let Media::Video { thumb, mini, duration, listened, .. } = media else {
         return placeholder(size, "", 14.0, radius);
     };
     let still = thumb.and_then(|file| app.media.image(file)).or(mini.as_ref());
@@ -893,7 +893,8 @@ fn video_cell<'a>(app: &'a App, media: &'a Media, size: Size, radius: f32) -> El
             .into(),
         None => placeholder(size, "", 14.0, radius),
     };
-    let label = container(text(format!("▶ {}", fmt_duration(*duration))).size(12))
+    let dot = if *listened { "" } else { "  ●" };
+    let label = container(text(format!("▶ {}{dot}", fmt_duration(*duration))).size(12))
         .padding([2, 8])
         .style(|_: &Theme| container::Style {
             background: Some(Color::from_rgba8(0, 0, 0, 0.6).into()),
@@ -927,7 +928,12 @@ fn waveform_bars(waveform: &[u8], progress: f64) -> (String, String) {
     (bars[..at].to_owned(), bars[at..].to_owned())
 }
 
-fn voice_view<'a>(app: &'a App, msg_id: i64, duration: i32, waveform: &'a [u8]) -> Element<'a, Message> {
+/// Blue dot of a voice or round video message nobody has played yet.
+fn unlistened_dot<'a>() -> Element<'a, Message> {
+    text("●").size(9).style(primary_text).into()
+}
+
+fn voice_view<'a>(app: &'a App, msg_id: i64, duration: i32, waveform: &'a [u8], listened: bool) -> Element<'a, Message> {
     let playback = app.voice.as_ref().filter(|v| v.msg_id == msg_id);
     let (icon, progress, time) = match playback.map(|v| v.audio.as_ref()) {
         Some(Some(audio)) => {
@@ -947,6 +953,9 @@ fn voice_view<'a>(app: &'a App, msg_id: i64, duration: i32, waveform: &'a [u8]) 
     ]
     .spacing(10)
     .align_y(Alignment::Center);
+    if !listened {
+        line = line.push(unlistened_dot());
+    }
     if playback.is_some() {
         line = line.push(text(player::fmt_speed(app.speed())).size(12).style(primary_text));
     }
@@ -960,7 +969,7 @@ fn media_cell<'a>(app: &'a App, msg_id: i64, item: usize, media: &'a Media, size
         _ => 8.0,
     };
     let cell: Element<_> = match media {
-        Media::Voice { duration, waveform, .. } => voice_view(app, msg_id, *duration, waveform),
+        Media::Voice { duration, waveform, listened, .. } => voice_view(app, msg_id, *duration, waveform, *listened),
         Media::Video { .. } => video_cell(app, media, size, radius),
         _ => match media.inline_file().and_then(|file| app.media.get(file)) {
             Some(Loaded::Image(handle)) => image(handle.clone())
