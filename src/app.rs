@@ -1,0 +1,2077 @@
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+
+use iced::keyboard::key::{Named, Physical};
+use iced::keyboard::{self, Key, Modifiers};
+use iced::mouse::ScrollDelta;
+use iced::{Size, Subscription, Task, Theme, window};
+use tdlib_rs::enums::{AuthorizationState, Update};
+use tdlib_rs::types::{ChatPhotoInfo, ChatPosition};
+
+use crate::config::{self, Config};
+use crate::media::{self, Kind, Loaded, Shared, Store};
+use crate::player::{self, Audio, Movie};
+use crate::tg::{self, Folder, ListKey, Media, Msg, SendOptions, Sender};
+use crate::view;
+use crate::vim::{Action, Input, Mode, NKey, Pending, normalize};
+use crate::voice::Recorder;
+
+const HISTORY_PAGE: i32 = 50;
+/// Keep fetching older history until at least this many messages are loaded.
+const MIN_HISTORY: usize = 40;
+/// Start loading more when the cursor gets this close to the loaded edge.
+const PREFETCH: usize = 8;
+const CHATS_PAGE: i32 = 100;
+/// Redraw rate while something animates, plays or records.
+const TICK: Duration = Duration::from_millis(33);
+const SEEK_SHORT: f64 = 5.0;
+const SEEK_LONG: f64 = 30.0;
+/// Touchpad pixels per list step.
+const SCROLL_PIXELS: f32 = 40.0;
+
+const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l panes  J/K gt/gT Alt-N folders  \
+                    Enter open/play  i insert  q record  r reply  cc/e edit  f forward  dd delete  \
+                    yy/Y copy  p/P paste  Space play/pause  [ ] speed  = 1x  H/L seek  \
+                    / filter chats or search messages  n/N next/prev match  \
+                    :date 01.05.2024  :folder  :theme  :q";
+
+#[derive(Debug, Clone)]
+pub enum Message {
+    Tg(Vec<Update>),
+    Key(keyboard::Event),
+    Resized(Size),
+    History {
+        chat_id: i64,
+        newer: bool,
+        result: Result<Vec<Msg>, String>,
+    },
+    /// History around a message we jump to (search result or date).
+    Window {
+        chat_id: i64,
+        target: i64,
+        result: Result<Vec<Msg>, String>,
+    },
+    Count {
+        chat_id: i64,
+        result: Result<i32, String>,
+    },
+    Found {
+        chat_id: i64,
+        query: String,
+        result: Result<(Vec<i64>, i32), String>,
+    },
+    DateFound {
+        chat_id: i64,
+        result: Result<i64, String>,
+    },
+    ChatsLoaded(ListKey, Result<(), String>),
+    /// An inline file (avatar, photo, sticker, thumbnail) finished downloading.
+    Downloaded {
+        file_id: i32,
+        result: Result<String, String>,
+    },
+    Decoded {
+        file_id: i32,
+        result: Result<Shared<Loaded>, String>,
+    },
+    /// A voice message to play finished downloading.
+    PlayFile {
+        file_id: i32,
+        result: Result<String, String>,
+    },
+    VideoReady {
+        file_id: i32,
+        result: Result<Shared<Movie>, String>,
+    },
+    Paste(Option<String>),
+    ClickFolder(usize),
+    ClickChat(i64),
+    SelectMsg(i64),
+    ClickMedia { msg_id: i64, item: usize },
+    Scroll(Pane, ScrollDelta),
+    Tick(Instant),
+    Done(Result<(), String>),
+    Quit,
+    Exit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Auth {
+    Starting,
+    Phone,
+    Code,
+    Password { hint: String },
+    Ready,
+    Info(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Chats,
+    Messages,
+}
+
+/// Mouse wheel targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Folders,
+    Chats,
+    Messages,
+}
+
+/// What Enter in Insert mode does with the composed text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compose {
+    New,
+    Reply(i64),
+    Edit(i64),
+}
+
+/// Media item shown full screen: message id and index within an album.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Viewer {
+    pub msg_id: i64,
+    pub item: usize,
+}
+
+pub struct VoicePlayback {
+    pub msg_id: i64,
+    file_id: i32,
+    /// `None` while the file downloads.
+    pub audio: Option<Audio>,
+}
+
+pub struct VideoPlayback {
+    file_id: i32,
+    /// `None` until the stream has started.
+    pub movie: Option<Movie>,
+    /// A speed change failed (e.g. mid-seek) and is retried on the next tick.
+    speed_pending: bool,
+}
+
+impl VideoPlayback {
+    pub fn video(&self) -> Option<&iced_video_player::Video> {
+        self.movie.as_ref().map(|m| &m.video)
+    }
+
+    fn video_mut(&mut self) -> Option<&mut iced_video_player::Video> {
+        self.movie.as_mut().map(|m| &mut m.video)
+    }
+}
+
+/// Results of `/` in the message pane.
+pub struct Found {
+    pub query: String,
+    /// Matching message ids, newest first.
+    pub ids: Vec<i64>,
+    pub total: i32,
+    pub index: usize,
+}
+
+/// A destructive action waiting for confirmation.
+#[derive(Debug, Clone)]
+pub enum Confirm {
+    Delete { chat_id: i64, ids: Vec<i64> },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PasteTarget {
+    /// Message (or login) input; `Some(before)` pastes at the start/end.
+    Input(Option<bool>),
+    Cmdline,
+}
+
+pub struct Chat {
+    pub id: i64,
+    pub title: String,
+    pub last: Option<Msg>,
+    pub unread: i32,
+    /// Order within each chat list the chat belongs to.
+    positions: HashMap<ListKey, i64>,
+    /// File id of the small chat photo.
+    pub avatar: Option<i32>,
+}
+
+impl Chat {
+    fn set_position(&mut self, position: &ChatPosition) {
+        let key = ListKey::from_tg(&position.list);
+        if position.order == 0 {
+            self.positions.remove(&key);
+        } else {
+            self.positions.insert(key, position.order);
+        }
+    }
+
+    fn order(&self, list: ListKey) -> Option<i64> {
+        self.positions.get(&list).copied()
+    }
+}
+
+fn avatar_of(photo: Option<&ChatPhotoInfo>) -> Option<i32> {
+    photo.map(|p| p.small.id)
+}
+
+pub struct OpenChat {
+    pub id: i64,
+    /// Sorted by id, oldest first; album parts are merged.
+    pub msgs: Vec<Msg>,
+    pub cursor: usize,
+    /// Last message shown at the bottom of the viewport.
+    pub bottom: usize,
+    pub loading: bool,
+    /// No older history left.
+    pub exhausted: bool,
+    /// The newest message is loaded; false after jumping into the past.
+    pub at_latest: bool,
+    /// Total number of messages in the chat.
+    pub total: Option<i32>,
+}
+
+impl OpenChat {
+    fn new(id: i64) -> Self {
+        OpenChat {
+            id,
+            msgs: Vec::new(),
+            cursor: 0,
+            bottom: 0,
+            loading: false,
+            exhausted: false,
+            at_latest: true,
+            total: None,
+        }
+    }
+
+    fn at_end(&self) -> bool {
+        self.cursor + 1 >= self.msgs.len()
+    }
+
+    /// Index of the message with this id, also when it is part of an album.
+    pub fn position(&self, id: i64) -> Option<usize> {
+        self.msgs.iter().rposition(|m| m.contains(id))
+    }
+
+    pub fn current(&self) -> Option<&Msg> {
+        self.msgs.get(self.cursor)
+    }
+
+    /// Apply `f` to the message list while keeping the cursor and the
+    /// viewport anchored to the same messages.
+    fn edit(&mut self, f: impl FnOnce(&mut Vec<Msg>)) {
+        let cursor = self.msgs.get(self.cursor).map(|m| m.id);
+        let bottom = self.msgs.get(self.bottom).map(|m| m.id);
+        f(&mut self.msgs);
+        self.msgs.sort_by_key(|m| m.id);
+        self.msgs.dedup_by_key(|m| m.id);
+        merge_albums(&mut self.msgs);
+        // A deleted anchor falls through to the next newer message.
+        let last = self.msgs.len().saturating_sub(1);
+        let find = |id: Option<i64>| {
+            id.map_or(last, |id| {
+                self.position(id)
+                    .unwrap_or_else(|| self.msgs.partition_point(|m| m.id < id).min(last))
+            })
+        };
+        let (cursor, bottom) = (find(cursor), find(bottom));
+        self.cursor = cursor;
+        self.bottom = bottom;
+    }
+
+    fn media(&self, viewer: Viewer) -> Option<&Media> {
+        self.msgs.get(self.position(viewer.msg_id)?)?.media.get(viewer.item)
+    }
+
+    /// Next/previous photo or video in the chat, across albums.
+    fn viewable_near(&self, from: Viewer, step: isize) -> Option<Viewer> {
+        let all: Vec<Viewer> = self
+            .msgs
+            .iter()
+            .flat_map(|m| {
+                m.media
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, media)| media.viewable())
+                    .map(|(item, _)| Viewer { msg_id: m.id, item })
+            })
+            .collect();
+        let at = all.iter().position(|v| *v == from)?;
+        all.get(at.checked_add_signed(step)?).copied()
+    }
+}
+
+/// Telegram sends each album item as its own message; show them as one.
+fn merge_albums(msgs: &mut Vec<Msg>) {
+    let mut merged: Vec<Msg> = Vec::with_capacity(msgs.len());
+    for msg in msgs.drain(..) {
+        if let Some(prev) = merged.last_mut()
+            && msg.album != 0
+            && prev.album == msg.album
+        {
+            if !prev.contains(msg.id) {
+                prev.absorb(msg);
+            }
+            continue;
+        }
+        merged.push(msg);
+    }
+    *msgs = merged;
+}
+
+#[derive(Default)]
+struct ListLoad {
+    loading: bool,
+    exhausted: bool,
+}
+
+pub struct Status {
+    pub text: String,
+    pub error: bool,
+}
+
+pub struct App {
+    cfg: Config,
+    pub auth: Auth,
+    pub mode: Mode,
+    pub focus: Focus,
+    pub chats: HashMap<i64, Chat>,
+    users: HashMap<i64, String>,
+    pub folders: Vec<Folder>,
+    pub folder: usize,
+    /// Number of chats with unread messages, per folder.
+    pub folder_unread: HashMap<ListKey, usize>,
+    /// Remembered selection of folders that are not shown.
+    folder_selection: HashMap<ListKey, i64>,
+    list_load: HashMap<ListKey, ListLoad>,
+    /// Chat ids shown in the sidebar: current folder, filtered, sorted.
+    pub list: Vec<i64>,
+    list_dirty: bool,
+    pub selected: Option<i64>,
+    pub chat_top: usize,
+    pub open: Option<OpenChat>,
+    pub viewer: Option<Viewer>,
+    pub video: Option<VideoPlayback>,
+    pub voice: Option<VoicePlayback>,
+    /// Playback speed shared by voice messages and videos.
+    pub speed: f64,
+    pub media: Store,
+    /// Time base for animations: frame = (now - clock) / frame time.
+    pub clock: Instant,
+    pub now: Instant,
+    /// Animated media is on screen, so redraw on every tick.
+    animating: bool,
+    pub recorder: Option<Recorder>,
+    /// Message being composed, or the login field before authorization.
+    pub input: Input,
+    pub compose: Compose,
+    /// Messages being forwarded: source chat and message ids.
+    pub forward: Option<(i64, Vec<i64>)>,
+    pub found: Option<Found>,
+    /// `/` searches messages instead of filtering chats.
+    pub search_messages: bool,
+    pub confirm: Option<Confirm>,
+    paste: PasteTarget,
+    scroll_pixels: f32,
+    pub cmdline: Input,
+    pub filter: String,
+    pub pending: Pending,
+    pub status: Option<Status>,
+    pub theme: Theme,
+    pub size: Size,
+}
+
+pub fn find_theme(name: &str) -> Option<Theme> {
+    let wanted = normalize_name(name);
+    Theme::ALL
+        .iter()
+        .find(|t| normalize_name(&t.to_string()) == wanted)
+        .cloned()
+}
+
+fn normalize_name(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect::<String>()
+        .to_lowercase()
+}
+
+impl App {
+    pub fn new(cfg: Config) -> (Self, Task<Message>) {
+        let theme = find_theme(&cfg.theme).unwrap_or(Theme::TokyoNight);
+        let app = App {
+            cfg,
+            auth: Auth::Starting,
+            mode: Mode::Normal,
+            focus: Focus::Chats,
+            chats: HashMap::new(),
+            users: HashMap::new(),
+            folders: tg::folders(tdlib_rs::types::UpdateChatFolders::default()),
+            folder: 0,
+            folder_unread: HashMap::new(),
+            folder_selection: HashMap::new(),
+            list_load: HashMap::new(),
+            list: Vec::new(),
+            list_dirty: false,
+            selected: None,
+            chat_top: 0,
+            open: None,
+            viewer: None,
+            video: None,
+            voice: None,
+            speed: 1.0,
+            media: Store::default(),
+            clock: Instant::now(),
+            now: Instant::now(),
+            animating: false,
+            recorder: None,
+            input: Input::default(),
+            compose: Compose::New,
+            forward: None,
+            found: None,
+            search_messages: false,
+            confirm: None,
+            paste: PasteTarget::Input(None),
+            scroll_pixels: 0.0,
+            cmdline: Input::default(),
+            filter: String::new(),
+            pending: Pending::default(),
+            status: None,
+            theme,
+            size: Size::new(1200.0, 800.0),
+        };
+        (app, Task::perform(tg::start(), Message::Done))
+    }
+
+    pub fn title(&self) -> String {
+        match self.open.as_ref().and_then(|o| self.chats.get(&o.id)) {
+            Some(chat) => format!("{} — vimgram", chat.title),
+            None => "vimgram".into(),
+        }
+    }
+
+    pub fn theme(&self) -> Theme {
+        self.theme.clone()
+    }
+
+    pub fn subscription(&self) -> Subscription<Message> {
+        let ticking = self.animating
+            || self.recorder.is_some()
+            || self.voice.is_some()
+            || self.video.is_some();
+        let tick = if ticking {
+            iced::time::every(TICK).map(Message::Tick)
+        } else {
+            Subscription::none()
+        };
+        Subscription::batch([
+            Subscription::run(tg::updates).map(Message::Tg),
+            keyboard::listen().map(Message::Key),
+            window::resize_events().map(|(_, size)| Message::Resized(size)),
+            window::close_requests().map(|_| Message::Quit),
+            tick,
+        ])
+    }
+
+    pub fn current_list(&self) -> ListKey {
+        self.folders.get(self.folder).map_or(ListKey::Main, |f| f.key)
+    }
+
+    pub fn sender_name(&self, sender: Sender) -> &str {
+        let name = match sender {
+            Sender::User(id) => self.users.get(&id).map(String::as_str),
+            Sender::Chat(id) => self.chats.get(&id).map(|c| c.title.as_str()),
+        };
+        name.unwrap_or("…")
+    }
+
+    pub fn selected_index(&self) -> Option<usize> {
+        let id = self.selected?;
+        self.list.iter().position(|&c| c == id)
+    }
+
+    /// Size of the message list, which shrinks with the compose box.
+    pub fn viewport(&self) -> (f32, f32) {
+        view::messages_viewport(self.size, &self.input, self.compose != Compose::New)
+    }
+
+    pub fn viewer_media(&self) -> Option<&Media> {
+        self.open.as_ref()?.media(self.viewer?)
+    }
+
+    fn info(&mut self, text: impl Into<String>) {
+        self.status = Some(Status { text: text.into(), error: false });
+    }
+
+    fn error(&mut self, text: impl Into<String>) {
+        self.status = Some(Status { text: text.into(), error: true });
+    }
+
+    pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.handle(message);
+        // Whatever changed, make sure what is on screen gets downloaded.
+        Task::batch([task, self.fetch_visible()])
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Tg(updates) => {
+                let tasks: Vec<_> = updates.into_iter().map(|u| self.on_update(u)).collect();
+                self.refresh_list();
+                Task::batch(tasks)
+            }
+            Message::Key(keyboard::Event::KeyPressed {
+                key,
+                physical_key,
+                modifiers,
+                text,
+                ..
+            }) => self.on_key(&key, physical_key, modifiers, text.as_deref()),
+            Message::Key(_) => Task::none(),
+            Message::Resized(size) => {
+                self.size = size;
+                self.scroll_chats();
+                self.scroll_messages();
+                Task::none()
+            }
+            Message::History { chat_id, newer, result } => self.on_history(chat_id, newer, result),
+            Message::Window { chat_id, target, result } => self.on_window(chat_id, target, result),
+            Message::Count { chat_id, result } => {
+                if let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id) {
+                    open.total = result.ok();
+                }
+                Task::none()
+            }
+            Message::Found { chat_id, query, result } => {
+                if self.open.as_ref().is_none_or(|o| o.id != chat_id) {
+                    return Task::none();
+                }
+                match result {
+                    Ok((ids, _)) if ids.is_empty() => {
+                        self.found = None;
+                        self.error(format!("Pattern not found: {query}"));
+                        Task::none()
+                    }
+                    Ok((ids, total)) => {
+                        let first = ids[0];
+                        self.found = Some(Found { query, ids, total, index: 0 });
+                        self.show_match();
+                        self.jump_to_message(first)
+                    }
+                    Err(e) => {
+                        self.error(e);
+                        Task::none()
+                    }
+                }
+            }
+            Message::DateFound { chat_id, result } => match result {
+                Ok(id) if self.open.as_ref().is_some_and(|o| o.id == chat_id) => {
+                    self.jump_to_message(id)
+                }
+                Ok(_) => Task::none(),
+                Err(e) => {
+                    self.error(e);
+                    Task::none()
+                }
+            },
+            Message::ChatsLoaded(list, result) => {
+                let state = self.list_load.entry(list).or_default();
+                state.loading = false;
+                match result {
+                    // TDLib answers 404 once the whole list is loaded.
+                    Err(e) if e.ends_with("(404)") => state.exhausted = true,
+                    Err(e) => self.error(e),
+                    Ok(()) => {}
+                }
+                Task::none()
+            }
+            Message::Downloaded { file_id, result } => {
+                // Failed files stay "requested" so they are not retried in a loop.
+                let job = result.ok().and_then(|path| self.media.downloaded(file_id, path));
+                match job {
+                    Some(job) => Task::perform(media::decode(job), move |result| {
+                        Message::Decoded { file_id, result }
+                    }),
+                    None => Task::none(),
+                }
+            }
+            Message::Decoded { file_id, result } => {
+                match result {
+                    Ok(shared) => self.media.decoded(file_id, &shared),
+                    Err(e) => self.error(e),
+                }
+                Task::none()
+            }
+            Message::PlayFile { file_id, result } => self.on_play_file(file_id, result),
+            Message::VideoReady { file_id, result } => {
+                if let Some(playback) = self.video.as_mut().filter(|p| p.file_id == file_id) {
+                    match result {
+                        Ok(shared) => playback.movie = shared.take(),
+                        Err(e) => self.error(format!("Cannot play video: {e}")),
+                    }
+                }
+                Task::none()
+            }
+            Message::Paste(text) => {
+                self.on_paste(text);
+                Task::none()
+            }
+            Message::ClickFolder(index) => self.switch_folder(index),
+            Message::ClickChat(id) => {
+                self.selected = Some(id);
+                self.focus = Focus::Chats;
+                self.act(Action::Open)
+            }
+            Message::SelectMsg(id) => {
+                self.select_message(id);
+                Task::none()
+            }
+            Message::ClickMedia { msg_id, item } => {
+                self.select_message(msg_id);
+                self.activate_media(msg_id, item)
+            }
+            Message::Scroll(pane, delta) => self.on_scroll(pane, delta),
+            Message::Tick(now) => {
+                self.now = now;
+                self.poll_players();
+                Task::none()
+            }
+            Message::Done(Ok(())) => Task::none(),
+            Message::Done(Err(e)) => {
+                self.error(e);
+                Task::none()
+            }
+            Message::Quit => {
+                self.stop_recording(false);
+                self.voice = None;
+                self.video = None;
+                self.info("Closing…");
+                Task::perform(tg::close(), |()| Message::Exit)
+            }
+            Message::Exit => iced::exit(),
+        }
+    }
+
+    // ---- TDLib updates -------------------------------------------------
+
+    fn on_update(&mut self, update: Update) -> Task<Message> {
+        match update {
+            Update::AuthorizationState(u) => return self.on_auth(u.authorization_state),
+            Update::NewChat(u) => {
+                let c = u.chat;
+                let mut chat = Chat {
+                    id: c.id,
+                    title: c.title,
+                    last: c.last_message.map(Msg::from),
+                    unread: c.unread_count,
+                    positions: HashMap::new(),
+                    avatar: avatar_of(c.photo.as_ref()),
+                };
+                for p in &c.positions {
+                    chat.set_position(p);
+                }
+                self.chats.insert(c.id, chat);
+                self.list_dirty = true;
+            }
+            Update::ChatTitle(u) => {
+                if let Some(chat) = self.chats.get_mut(&u.chat_id) {
+                    chat.title = u.title;
+                    self.list_dirty = true;
+                }
+            }
+            Update::ChatPhoto(u) => {
+                if let Some(chat) = self.chats.get_mut(&u.chat_id) {
+                    chat.avatar = avatar_of(u.photo.as_ref());
+                }
+            }
+            Update::ChatPosition(u) => {
+                if let Some(chat) = self.chats.get_mut(&u.chat_id) {
+                    chat.set_position(&u.position);
+                    self.list_dirty = true;
+                }
+            }
+            Update::ChatLastMessage(u) => {
+                if let Some(chat) = self.chats.get_mut(&u.chat_id) {
+                    chat.last = u.last_message.map(Msg::from);
+                    for p in &u.positions {
+                        chat.set_position(p);
+                    }
+                    self.list_dirty = true;
+                }
+            }
+            Update::ChatReadInbox(u) => {
+                if let Some(chat) = self.chats.get_mut(&u.chat_id) {
+                    chat.unread = u.unread_count;
+                    self.list_dirty = true;
+                }
+            }
+            Update::ChatFolders(u) => {
+                let current = self.current_list();
+                self.folders = tg::folders(u);
+                self.folder = self
+                    .folders
+                    .iter()
+                    .position(|f| f.key == current)
+                    .unwrap_or(0);
+                self.list_dirty = true;
+            }
+            Update::User(u) => {
+                let user = u.user;
+                let name = format!("{} {}", user.first_name, user.last_name);
+                self.users.insert(user.id, name.trim().to_owned());
+            }
+            Update::NewMessage(u) => return self.on_new_message(Msg::from(u.message)),
+            Update::MessageSendSucceeded(u) => {
+                let msg = Msg::from(u.message);
+                if let Some(open) = self.open.as_mut().filter(|o| o.id == msg.chat_id) {
+                    let follow = open.at_end();
+                    open.edit(|msgs| {
+                        msgs.retain(|m| m.id != u.old_message_id);
+                        msgs.push(msg);
+                    });
+                    if follow {
+                        open.cursor = open.msgs.len() - 1;
+                        open.bottom = open.cursor;
+                    }
+                }
+            }
+            Update::MessageContent(u) => {
+                if let Some(open) = self.open.as_mut().filter(|o| o.id == u.chat_id)
+                    && let Some(i) = open.position(u.message_id)
+                    && open.msgs[i].members.len() == 1
+                {
+                    let msg = &mut open.msgs[i];
+                    msg.media = tg::media(&u.new_content).into_iter().collect();
+                    if msg.media.is_empty() {
+                        msg.text = tg::content_text(&u.new_content);
+                    }
+                }
+            }
+            Update::MessageEdited(u) => {
+                if let Some(open) = self.open.as_mut().filter(|o| o.id == u.chat_id)
+                    && let Some(i) = open.position(u.message_id)
+                {
+                    open.msgs[i].edited = true;
+                }
+            }
+            Update::DeleteMessages(u) => {
+                if let Some(open) = self.open.as_mut().filter(|o| o.id == u.chat_id)
+                    && u.is_permanent
+                {
+                    open.edit(|msgs| msgs.retain(|m| !u.message_ids.contains(&m.id)));
+                    if self.viewer.is_some_and(|v| u.message_ids.contains(&v.msg_id)) {
+                        self.close_viewer();
+                    }
+                }
+            }
+            _ => {}
+        }
+        Task::none()
+    }
+
+    fn on_auth(&mut self, state: AuthorizationState) -> Task<Message> {
+        use AuthorizationState as S;
+        let prompt = |app: &mut Self, auth: Auth| {
+            app.auth = auth;
+            app.mode = Mode::Insert;
+            app.input.clear();
+        };
+        match state {
+            S::WaitTdlibParameters => {
+                return Task::perform(tg::set_parameters(self.cfg.clone()), Message::Done);
+            }
+            S::WaitPhoneNumber => prompt(self, Auth::Phone),
+            S::WaitCode(_) => prompt(self, Auth::Code),
+            S::WaitPassword(p) => prompt(self, Auth::Password { hint: p.password_hint }),
+            S::WaitOtherDeviceConfirmation(x) => {
+                self.auth = Auth::Info(format!("Confirm this login on another device: {}", x.link));
+            }
+            S::Ready => {
+                self.auth = Auth::Ready;
+                self.mode = Mode::Normal;
+                self.input.clear();
+                self.status = None;
+                return self.load_more_chats();
+            }
+            S::LoggingOut | S::Closing => self.auth = Auth::Info("Closing…".into()),
+            S::Closed => self.auth = Auth::Info("Session closed".into()),
+            _ => {
+                self.auth = Auth::Info(
+                    "This login step (email/registration) is not supported yet — \
+                     finish it in another client first"
+                        .into(),
+                );
+            }
+        }
+        Task::none()
+    }
+
+    fn on_new_message(&mut self, msg: Msg) -> Task<Message> {
+        // While looking at old history, new messages load when scrolling down.
+        let Some(open) = self.open.as_mut().filter(|o| o.id == msg.chat_id && o.at_latest) else {
+            return Task::none();
+        };
+        if let Some(total) = open.total.as_mut() {
+            *total += 1;
+        }
+        let (chat_id, id, incoming) = (msg.chat_id, msg.id, !msg.outgoing);
+        let follow = open.msgs.is_empty() || open.at_end();
+        open.edit(|msgs| msgs.push(msg));
+        if follow {
+            open.cursor = open.msgs.len() - 1;
+            open.bottom = open.cursor;
+        }
+        if incoming {
+            Task::perform(tg::view_messages(chat_id, vec![id]), Message::Done)
+        } else {
+            Task::none()
+        }
+    }
+
+    fn on_history(&mut self, chat_id: i64, newer: bool, result: Result<Vec<Msg>, String>) -> Task<Message> {
+        let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id) else {
+            return Task::none();
+        };
+        open.loading = false;
+        let batch = match result {
+            Ok(batch) => batch,
+            Err(e) => {
+                self.error(e);
+                return Task::none();
+            }
+        };
+        if newer {
+            // The page includes the message it starts from.
+            if batch.len() <= 1 {
+                open.at_latest = true;
+            }
+            let ids: Vec<i64> = batch.iter().map(|m| m.id).collect();
+            open.edit(|msgs| msgs.extend(batch));
+            self.scroll_messages();
+            return Task::perform(tg::view_messages(chat_id, ids), Message::Done);
+        }
+        if batch.is_empty() {
+            open.exhausted = true;
+            return Task::none();
+        }
+
+        let ids: Vec<i64> = batch.iter().map(|m| m.id).collect();
+        let first_load = open.msgs.is_empty();
+        open.edit(|msgs| msgs.extend(batch));
+        if first_load {
+            open.cursor = open.msgs.len() - 1;
+            open.bottom = open.cursor;
+        }
+        let want_more = open.msgs.len() < MIN_HISTORY || open.cursor < PREFETCH;
+        self.scroll_messages();
+
+        let mut tasks = vec![Task::perform(tg::view_messages(chat_id, ids), Message::Done)];
+        if want_more {
+            tasks.push(self.load_history(true));
+        }
+        Task::batch(tasks)
+    }
+
+    fn refresh_list(&mut self) {
+        if !self.list_dirty {
+            return;
+        }
+        self.list_dirty = false;
+
+        self.folder_unread.clear();
+        for chat in self.chats.values().filter(|c| c.unread > 0) {
+            for key in chat.positions.keys() {
+                *self.folder_unread.entry(*key).or_default() += 1;
+            }
+        }
+
+        let list = self.current_list();
+        let filter = self.filter.to_lowercase();
+        let mut chats: Vec<(i64, i64)> = self
+            .chats
+            .values()
+            .filter(|c| filter.is_empty() || c.title.to_lowercase().contains(&filter))
+            .filter_map(|c| Some((c.order(list)?, c.id)))
+            .collect();
+        chats.sort_unstable_by_key(|&(order, _)| std::cmp::Reverse(order));
+        self.list = chats.into_iter().map(|(_, id)| id).collect();
+        if self.selected_index().is_none() {
+            self.selected = self.list.first().copied();
+        }
+        self.scroll_chats();
+    }
+
+    fn set_filter(&mut self, filter: String) {
+        self.filter = filter;
+        self.list_dirty = true;
+        self.selected = None;
+        self.refresh_list();
+    }
+
+    fn switch_folder(&mut self, index: usize) -> Task<Message> {
+        if index >= self.folders.len() || index == self.folder {
+            return Task::none();
+        }
+        if let Some(id) = self.selected {
+            self.folder_selection.insert(self.current_list(), id);
+        }
+        self.folder = index;
+        self.selected = self.folder_selection.get(&self.current_list()).copied();
+        self.chat_top = 0;
+        self.focus = Focus::Chats;
+        self.list_dirty = true;
+        self.refresh_list();
+        self.load_more_chats()
+    }
+
+    fn cycle_folder(&mut self, step: isize) -> Task<Message> {
+        let n = self.folders.len() as isize;
+        let index = (self.folder as isize + step).rem_euclid(n) as usize;
+        self.switch_folder(index)
+    }
+
+    // ---- requests ------------------------------------------------------
+
+    fn load_more_chats(&mut self) -> Task<Message> {
+        if self.auth != Auth::Ready {
+            return Task::none();
+        }
+        let list = self.current_list();
+        let state = self.list_load.entry(list).or_default();
+        if state.loading || state.exhausted {
+            return Task::none();
+        }
+        state.loading = true;
+        Task::perform(tg::load_chats(list, CHATS_PAGE), move |result| {
+            Message::ChatsLoaded(list, result)
+        })
+    }
+
+    fn load_history(&mut self, older: bool) -> Task<Message> {
+        let Some(open) = self.open.as_mut() else {
+            return Task::none();
+        };
+        if open.loading || (older && open.exhausted) {
+            return Task::none();
+        }
+        open.loading = true;
+        let chat_id = open.id;
+        let from = if older { open.msgs.first().map_or(0, |m| m.id) } else { 0 };
+        Task::perform(tg::history(chat_id, from, 0, HISTORY_PAGE), move |result| {
+            Message::History { chat_id, newer: false, result }
+        })
+    }
+
+    /// After jumping into the past, load the messages after the newest one.
+    fn load_newer(&mut self) -> Task<Message> {
+        let Some(open) = self.open.as_mut() else {
+            return Task::none();
+        };
+        if open.loading || open.at_latest {
+            return Task::none();
+        }
+        let Some(from) = open.msgs.last().map(|m| m.id) else {
+            return Task::none();
+        };
+        open.loading = true;
+        let chat_id = open.id;
+        Task::perform(tg::history(chat_id, from, -(HISTORY_PAGE - 1), HISTORY_PAGE), move |result| {
+            Message::History { chat_id, newer: true, result }
+        })
+    }
+
+    /// Put the cursor on a message, loading the history around it if needed.
+    fn jump_to_message(&mut self, id: i64) -> Task<Message> {
+        let Some(open) = self.open.as_mut() else {
+            return Task::none();
+        };
+        self.focus = Focus::Messages;
+        if let Some(i) = open.position(id) {
+            open.cursor = i;
+            self.scroll_messages();
+            return Task::none();
+        }
+        let chat_id = open.id;
+        open.loading = true;
+        let half = HISTORY_PAGE / 2;
+        Task::perform(tg::history(chat_id, id, -half, HISTORY_PAGE), move |result| {
+            Message::Window { chat_id, target: id, result }
+        })
+    }
+
+    fn on_window(&mut self, chat_id: i64, target: i64, result: Result<Vec<Msg>, String>) -> Task<Message> {
+        let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id) else {
+            return Task::none();
+        };
+        open.loading = false;
+        let batch = match result {
+            Ok(batch) if !batch.is_empty() => batch,
+            Ok(_) => return Task::none(),
+            Err(e) => {
+                self.error(e);
+                return Task::none();
+            }
+        };
+        let ids: Vec<i64> = batch.iter().map(|m| m.id).collect();
+        // Replace what was loaded: the window is not contiguous with it.
+        open.msgs.clear();
+        open.exhausted = false;
+        open.at_latest = false;
+        open.edit(|msgs| msgs.extend(batch));
+        open.cursor = open.position(target).unwrap_or(0);
+        open.bottom = open.cursor;
+        self.scroll_messages();
+        Task::perform(tg::view_messages(chat_id, ids), Message::Done)
+    }
+
+    fn show_match(&mut self) {
+        if let Some(found) = &self.found {
+            let text = format!(
+                "/{}  match {} of {}",
+                found.query,
+                found.index + 1,
+                found.total.max(found.ids.len() as i32)
+            );
+            self.info(text);
+        }
+    }
+
+    /// `n` goes to older matches, `N` to newer ones.
+    fn next_match(&mut self, step: isize) -> Task<Message> {
+        let Some(found) = self.found.as_mut() else {
+            self.error("No previous search (/ in the message pane)");
+            return Task::none();
+        };
+        let Some(index) = found.index.checked_add_signed(step).filter(|&i| i < found.ids.len()) else {
+            self.error("No more matches");
+            return Task::none();
+        };
+        found.index = index;
+        let id = found.ids[index];
+        self.show_match();
+        self.jump_to_message(id)
+    }
+
+    fn download(&mut self, file_id: i32, kind: Kind, size: Size, priority: i32) -> Option<Task<Message>> {
+        self.media.request(file_id, kind, size).then(|| {
+            Task::perform(tg::download(file_id, priority), move |result| {
+                Message::Downloaded { file_id, result }
+            })
+        })
+    }
+
+    /// Download avatars and media that are currently on screen.
+    fn fetch_visible(&mut self) -> Task<Message> {
+        if self.auth != Auth::Ready {
+            return Task::none();
+        }
+        let mut wanted: Vec<(i32, Kind, Size, i32)> = self
+            .list
+            .iter()
+            .skip(self.chat_top)
+            .take(view::chat_rows(self.size))
+            .filter_map(|id| self.chats.get(id)?.avatar)
+            .map(|file| (file, Kind::Image, Size::ZERO, media::PRIORITY_AVATAR))
+            .collect();
+
+        if let Some(open) = &self.open
+            && !open.msgs.is_empty()
+        {
+            let (width, height) = self.viewport();
+            let top = view::top_for_bottom(&open.msgs, open.bottom, width, height);
+            for msg in &open.msgs[top..=open.bottom] {
+                let sizes = view::media_sizes(&msg.media, width);
+                for (media, size) in msg.media.iter().zip(sizes) {
+                    if let Some(file) = media.inline_file() {
+                        wanted.push((file, Kind::of(media), size, media::PRIORITY_INLINE));
+                    }
+                }
+            }
+        }
+        if let Some(Media::Photo { full, .. }) = self.viewer_media() {
+            wanted.push((full.id, Kind::Image, Size::ZERO, media::PRIORITY_VIEWER));
+        }
+
+        let visible: HashSet<i32> = wanted.iter().map(|w| w.0).collect();
+        self.media.retain_visible(&visible);
+        self.animating = wanted.iter().any(|w| matches!(w.1, Kind::Tgs | Kind::Webm));
+
+        Task::batch(
+            wanted
+                .into_iter()
+                .filter_map(|(file, kind, size, priority)| self.download(file, kind, size, priority)),
+        )
+    }
+
+    fn open_chat(&mut self, id: i64) -> Task<Message> {
+        self.focus = Focus::Messages;
+        let mut tasks = Vec::new();
+        if let Some(prev) = self.open.take() {
+            if prev.id == id {
+                self.open = Some(prev);
+                return Task::none();
+            }
+            tasks.push(Task::perform(tg::close_chat(prev.id), Message::Done));
+        }
+        self.open = Some(OpenChat::new(id));
+        self.close_viewer();
+        self.compose = Compose::New;
+        self.input.clear();
+        self.found = None;
+        tasks.push(Task::perform(tg::open_chat(id), Message::Done));
+        tasks.push(Task::perform(tg::message_count(id), move |result| Message::Count {
+            chat_id: id,
+            result,
+        }));
+        tasks.push(self.load_history(false));
+        Task::batch(tasks)
+    }
+
+    fn send(&mut self) -> Task<Message> {
+        let Some(open) = &self.open else {
+            return Task::none();
+        };
+        let text = self.input.as_str().trim();
+        if text.is_empty() {
+            return Task::none();
+        }
+        let (chat_id, text) = (open.id, text.to_owned());
+        self.input.clear();
+        let compose = std::mem::replace(&mut self.compose, Compose::New);
+        match compose {
+            Compose::New => Task::perform(tg::send_text(chat_id, text, SendOptions::default()), Message::Done),
+            Compose::Reply(id) => {
+                let options = SendOptions {
+                    reply_to: Some(id),
+                    ..SendOptions::default()
+                };
+                Task::perform(tg::send_text(chat_id, text, options), Message::Done)
+            }
+            Compose::Edit(id) => {
+                self.mode = Mode::Normal;
+                Task::perform(tg::edit_text(chat_id, id, text), Message::Done)
+            }
+        }
+    }
+
+    fn submit_auth(&mut self) -> Task<Message> {
+        let value = self.input.as_str().trim().to_owned();
+        if value.is_empty() {
+            return Task::none();
+        }
+        self.status = None;
+        match self.auth {
+            Auth::Phone => Task::perform(tg::set_phone(value), Message::Done),
+            Auth::Code => Task::perform(tg::check_code(value), Message::Done),
+            Auth::Password { .. } => Task::perform(tg::check_password(value), Message::Done),
+            _ => Task::none(),
+        }
+    }
+
+    // ---- media playback ------------------------------------------------
+
+    fn play_download(file_id: i32) -> Task<Message> {
+        Task::perform(tg::download(file_id, media::PRIORITY_VIEWER), move |result| {
+            Message::PlayFile { file_id, result }
+        })
+    }
+
+    fn on_play_file(&mut self, file_id: i32, result: Result<String, String>) -> Task<Message> {
+        let path = match result {
+            Ok(path) => path,
+            Err(e) => {
+                self.error(e);
+                return Task::none();
+            }
+        };
+        if let Some(voice) = self.voice.as_mut().filter(|v| v.file_id == file_id) {
+            match Audio::open(&path, self.speed) {
+                Ok(audio) => voice.audio = Some(audio),
+                Err(e) => {
+                    self.voice = None;
+                    self.error(e);
+                }
+            }
+        }
+        Task::none()
+    }
+
+    /// Enter / click on a media item: view photos and videos, play voice.
+    fn activate_media(&mut self, msg_id: i64, item: usize) -> Task<Message> {
+        let Some(media) = self.open.as_ref().and_then(|o| o.media(Viewer { msg_id, item })) else {
+            return Task::none();
+        };
+        match media {
+            Media::Voice { file, .. } => {
+                let file = *file;
+                self.toggle_voice(msg_id, file)
+            }
+            media if media.viewable() => self.open_viewer(Viewer { msg_id, item }),
+            _ => Task::none(),
+        }
+    }
+
+    fn toggle_voice(&mut self, msg_id: i64, file_id: i32) -> Task<Message> {
+        if let Some(voice) = self.voice.as_mut().filter(|v| v.msg_id == msg_id) {
+            if let Some(audio) = voice.audio.as_mut() {
+                audio.toggle_pause();
+            }
+            return Task::none();
+        }
+        self.voice = Some(VoicePlayback {
+            msg_id,
+            file_id,
+            audio: None,
+        });
+        Self::play_download(file_id)
+    }
+
+    fn open_viewer(&mut self, viewer: Viewer) -> Task<Message> {
+        self.viewer = Some(viewer);
+        let video_file = match self.viewer_media() {
+            Some(Media::Video { video, .. }) => Some(video.id),
+            _ => None,
+        };
+        if let Some(open) = self.open.as_mut()
+            && let Some(i) = open.position(viewer.msg_id)
+        {
+            open.cursor = i;
+        }
+        self.scroll_messages();
+        match video_file {
+            Some(file_id) if self.video.as_ref().is_some_and(|v| v.file_id == file_id) => Task::none(),
+            Some(file_id) => {
+                // A video brings its own sound; don't talk over it.
+                self.voice = None;
+                self.video = Some(VideoPlayback {
+                    file_id,
+                    movie: None,
+                    speed_pending: false,
+                });
+                let speed = self.speed;
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || player::open_video(file_id, speed).map(Shared::new))
+                            .await
+                            .map_err(|e| e.to_string())?
+                    },
+                    move |result| Message::VideoReady { file_id, result },
+                )
+            }
+            None => {
+                self.video = None;
+                Task::none()
+            }
+        }
+    }
+
+    fn close_viewer(&mut self) {
+        self.viewer = None;
+        self.video = None;
+    }
+
+    fn poll_players(&mut self) {
+        let speed = self.speed;
+        if let Some(playback) = self.video.as_mut().filter(|p| p.speed_pending)
+            && let Some(video) = playback.video_mut()
+        {
+            playback.speed_pending = video.set_speed(speed).is_err();
+        }
+        if let Some(recorder) = self.recorder.as_mut()
+            && let Err(e) = recorder.poll()
+        {
+            self.stop_recording(false);
+            self.error(e);
+        }
+        if let Some(audio) = self.voice.as_mut().and_then(|v| v.audio.as_mut()) {
+            match audio.poll() {
+                Ok(()) if audio.finished() => self.voice = None,
+                Ok(()) => {}
+                Err(e) => {
+                    self.voice = None;
+                    self.error(e);
+                }
+            }
+        }
+    }
+
+    fn toggle_pause(&mut self) -> Task<Message> {
+        if let Some(video) = self.video.as_mut().and_then(VideoPlayback::video_mut) {
+            video.set_paused(!video.paused());
+        } else if let Some(audio) = self.voice.as_mut().and_then(|v| v.audio.as_mut()) {
+            audio.toggle_pause();
+        } else if let Some(msg) = self.open.as_ref().and_then(OpenChat::current)
+            && let Some(item) = msg.media.iter().position(|m| matches!(m, Media::Voice { .. }))
+        {
+            return self.activate_media(msg.id, item);
+        }
+        Task::none()
+    }
+
+    fn seek(&mut self, delta: f64) {
+        if let Some(video) = self.video.as_mut().and_then(VideoPlayback::video_mut) {
+            let target = (video.position().as_secs_f64() + delta)
+                .clamp(0.0, video.duration().as_secs_f64());
+            let _ = video.seek(Duration::from_secs_f64(target), false);
+        } else if let Some(audio) = self.voice.as_mut().and_then(|v| v.audio.as_mut()) {
+            audio.seek_by(delta);
+        }
+    }
+
+    fn set_speed(&mut self, speed: f64) {
+        self.speed = speed;
+        if let Some(playback) = self.video.as_mut()
+            && let Some(video) = playback.video_mut()
+        {
+            playback.speed_pending = video.set_speed(speed).is_err();
+        }
+        if let Some(audio) = self.voice.as_mut().and_then(|v| v.audio.as_mut()) {
+            audio.set_speed(speed);
+        }
+        self.info(format!("Speed {}", player::fmt_speed(speed)));
+    }
+
+    // ---- keyboard ------------------------------------------------------
+
+    fn on_key(&mut self, key: &Key, physical: Physical, mods: Modifiers, text: Option<&str>) -> Task<Message> {
+        match self.mode {
+            Mode::Insert => self.key_insert(key, physical, mods, text),
+            Mode::Command | Mode::Search => self.key_cmdline(key, physical, mods, text),
+            Mode::Record => match normalize(key, physical, mods) {
+                Some(NKey::Char('q') | NKey::Enter) => self.finish_recording(),
+                Some(NKey::Esc) => {
+                    self.stop_recording(false);
+                    self.info("Recording discarded");
+                    Task::none()
+                }
+                _ => Task::none(),
+            },
+            Mode::Normal => {
+                let Some(key) = normalize(key, physical, mods) else {
+                    return Task::none();
+                };
+                if self.confirm.is_some() {
+                    return self.key_confirm(key);
+                }
+                if self.viewer.is_some() {
+                    return self.key_viewer(key);
+                }
+                match self.pending.feed(key) {
+                    Some(action) => self.act(action),
+                    None => Task::none(),
+                }
+            }
+        }
+    }
+
+    fn key_confirm(&mut self, key: NKey) -> Task<Message> {
+        let Some(Confirm::Delete { chat_id, ids }) = self.confirm.take() else {
+            return Task::none();
+        };
+        let revoke = match key {
+            NKey::Char('y') => true,
+            NKey::Char('m') => false,
+            _ => {
+                self.info("Cancelled");
+                return Task::none();
+            }
+        };
+        self.info(if revoke { "Deleted for everyone" } else { "Deleted for me" });
+        Task::perform(tg::delete(chat_id, ids, revoke), Message::Done)
+    }
+
+    fn key_viewer(&mut self, key: NKey) -> Task<Message> {
+        let (Some(open), Some(viewer)) = (&self.open, self.viewer) else {
+            return Task::none();
+        };
+        let next = match key {
+            NKey::Char('j' | 'n') | NKey::Down => open.viewable_near(viewer, 1),
+            NKey::Char('k' | 'p') | NKey::Up => open.viewable_near(viewer, -1),
+            NKey::Char('h') | NKey::Left => {
+                self.seek(-SEEK_SHORT);
+                None
+            }
+            NKey::Char('l') | NKey::Right => {
+                self.seek(SEEK_SHORT);
+                None
+            }
+            NKey::Char('H') => {
+                self.seek(-SEEK_LONG);
+                None
+            }
+            NKey::Char('L') => {
+                self.seek(SEEK_LONG);
+                None
+            }
+            NKey::Space => return self.toggle_pause(),
+            NKey::Char(']' | '+') => {
+                self.set_speed(player::faster(self.speed));
+                None
+            }
+            NKey::Char('[' | '-') => {
+                self.set_speed(player::slower(self.speed));
+                None
+            }
+            NKey::Char('=') => {
+                self.set_speed(1.0);
+                None
+            }
+            NKey::Esc | NKey::Enter | NKey::Char('q' | 'o') => {
+                self.close_viewer();
+                None
+            }
+            _ => None,
+        };
+        match next {
+            Some(next) => self.open_viewer(next),
+            None => Task::none(),
+        }
+    }
+
+    fn key_insert(&mut self, key: &Key, physical: Physical, mods: Modifiers, text: Option<&str>) -> Task<Message> {
+        if self.auth == Auth::Ready
+            && mods.shift()
+            && matches!(key, Key::Named(Named::Enter))
+        {
+            self.input.insert("\n");
+            return Task::none();
+        }
+        match edit(&mut self.input, key, physical, mods, text) {
+            Edit::Submit if self.auth == Auth::Ready => self.send(),
+            Edit::Submit => self.submit_auth(),
+            Edit::Cancel => {
+                self.mode = Mode::Normal;
+                Task::none()
+            }
+            Edit::Paste => self.read_clipboard(PasteTarget::Input(None)),
+            Edit::Changed | Edit::Ignored => Task::none(),
+        }
+    }
+
+    fn key_cmdline(&mut self, key: &Key, physical: Physical, mods: Modifiers, text: Option<&str>) -> Task<Message> {
+        let search = self.mode == Mode::Search;
+        let was_empty = self.cmdline.is_empty();
+        let mut result = edit(&mut self.cmdline, key, physical, mods, text);
+        // Like Vim: backspace on an empty command line leaves it.
+        if was_empty && matches!(key, Key::Named(Named::Backspace)) {
+            result = Edit::Cancel;
+        }
+        match result {
+            Edit::Submit => {
+                let line = self.cmdline.take();
+                self.mode = Mode::Normal;
+                if search && self.search_messages {
+                    self.search_chat(line)
+                } else if search {
+                    self.focus = Focus::Chats;
+                    Task::none()
+                } else {
+                    self.run_command(&line)
+                }
+            }
+            Edit::Cancel => {
+                self.cmdline.clear();
+                self.mode = Mode::Normal;
+                if search && !self.search_messages {
+                    self.set_filter(String::new());
+                }
+                Task::none()
+            }
+            Edit::Changed if search && !self.search_messages => {
+                self.set_filter(self.cmdline.as_str().to_owned());
+                Task::none()
+            }
+            Edit::Paste => self.read_clipboard(PasteTarget::Cmdline),
+            Edit::Changed | Edit::Ignored => Task::none(),
+        }
+    }
+
+    fn search_chat(&mut self, query: String) -> Task<Message> {
+        let query = query.trim().to_owned();
+        let Some(chat_id) = self.open.as_ref().map(|o| o.id) else {
+            return Task::none();
+        };
+        if query.is_empty() {
+            return self.next_match(1);
+        }
+        self.info(format!("Searching for {query}…"));
+        Task::perform(tg::search(chat_id, query.clone()), move |result| Message::Found {
+            chat_id,
+            query: query.clone(),
+            result,
+        })
+    }
+
+    fn jump_to_date(&mut self, arg: &str) -> Task<Message> {
+        let Some(chat_id) = self.open.as_ref().map(|o| o.id) else {
+            self.error("Open a chat first (Enter)");
+            return Task::none();
+        };
+        let Some(date) = parse_date(arg) else {
+            self.error(format!("Bad date: {arg} (try 01.05.2024, 2024-05-01, 01.05, yesterday)"));
+            return Task::none();
+        };
+        // The last message of that day, so the whole day is right above it.
+        let end_of_day = date
+            .succ_opt()
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .and_then(|d| d.and_local_timezone(chrono::Local).earliest())
+            .map_or(i32::MAX, |d| (d.timestamp() - 1).min(i64::from(i32::MAX)) as i32);
+        self.info(format!("Jumping to {}", date.format("%d.%m.%Y")));
+        Task::perform(tg::message_at(chat_id, end_of_day), move |result| Message::DateFound {
+            chat_id,
+            result,
+        })
+    }
+
+    fn read_clipboard(&mut self, target: PasteTarget) -> Task<Message> {
+        self.paste = target;
+        iced::clipboard::read().map(Message::Paste)
+    }
+
+    fn on_paste(&mut self, text: Option<String>) {
+        let Some(text) = text.filter(|t| !t.is_empty()) else {
+            self.error("Clipboard is empty");
+            return;
+        };
+        let text = text.replace("\r\n", "\n");
+        match self.paste {
+            PasteTarget::Cmdline => {
+                self.cmdline.insert(&text.replace('\n', " "));
+                if self.mode == Mode::Search {
+                    self.set_filter(self.cmdline.as_str().to_owned());
+                }
+            }
+            PasteTarget::Input(position) => {
+                if self.auth == Auth::Ready && self.open.is_none() {
+                    self.error("Open a chat first (Enter)");
+                    return;
+                }
+                match position {
+                    Some(true) => self.input.home(),
+                    Some(false) => self.input.end(),
+                    None => {}
+                }
+                self.input.insert(&text);
+                self.scroll_messages();
+            }
+        }
+    }
+
+    fn run_command(&mut self, line: &str) -> Task<Message> {
+        let line = line.trim();
+        let (cmd, arg) = match line.split_once(' ') {
+            Some((cmd, arg)) => (cmd, Some(arg.trim())),
+            None => (line, None),
+        };
+        match (cmd, arg) {
+            ("", _) => {}
+            ("q" | "q!" | "qa" | "qa!" | "quit" | "wq" | "x", _) => return self.handle(Message::Quit),
+            ("h" | "help", _) => self.info(HELP),
+            ("noh" | "nohl" | "nohlsearch", _) => self.set_filter(String::new()),
+            ("theme" | "colorscheme" | "colo", None) => {
+                let names: Vec<String> = Theme::ALL.iter().map(Theme::to_string).collect();
+                self.info(names.join(", "));
+            }
+            ("theme" | "colorscheme" | "colo", Some(name)) => match find_theme(name) {
+                Some(theme) => self.theme = theme,
+                None => self.error(format!("Unknown theme: {name}")),
+            },
+            ("f" | "folder", None) => {
+                let names: Vec<&str> = self.folders.iter().map(|f| f.name.as_str()).collect();
+                self.info(names.join(", "));
+            }
+            ("f" | "folder", Some(name)) => {
+                let wanted = normalize_name(name);
+                let found = self
+                    .folders
+                    .iter()
+                    .position(|f| normalize_name(&f.name).contains(&wanted));
+                match found {
+                    Some(index) => return self.switch_folder(index),
+                    None => self.error(format!("No folder matches: {name}")),
+                }
+            }
+            ("d" | "date", Some(value)) => return self.jump_to_date(value),
+            ("s" | "search", Some(query)) => {
+                self.search_messages = true;
+                return self.search_chat(query.to_owned());
+            }
+            ("speed", Some(value)) => match value.trim_end_matches('x').parse::<f64>() {
+                Ok(speed) if (0.25..=5.0).contains(&speed) => self.set_speed(speed),
+                _ => self.error("Speed must be between 0.25 and 5"),
+            },
+            (n, None) if n.parse::<usize>().is_ok() => {
+                let line = n.parse::<usize>().unwrap_or(1).max(1) - 1;
+                return self.jump(line);
+            }
+            (other, _) => self.error(format!("Not an editor command: {other}")),
+        }
+        Task::none()
+    }
+
+    /// The message under the cursor, when the message pane has focus.
+    fn focused_message(&self) -> Option<&Msg> {
+        match self.focus {
+            Focus::Messages => self.open.as_ref()?.current(),
+            Focus::Chats => None,
+        }
+    }
+
+    fn act(&mut self, action: Action) -> Task<Message> {
+        self.status = None;
+        match action {
+            Action::Down(n) => self.step(n as isize),
+            Action::Up(n) => self.step(-(n as isize)),
+            Action::Top => self.jump(0),
+            Action::Bottom => match self.open.as_mut() {
+                // Back from the past: reload the newest messages.
+                Some(open) if self.focus == Focus::Messages && !open.at_latest => {
+                    open.msgs.clear();
+                    open.at_latest = true;
+                    open.exhausted = false;
+                    open.loading = false;
+                    self.load_history(false)
+                }
+                _ => self.jump(usize::MAX),
+            },
+            Action::HalfDown => self.step(self.half_page() as isize),
+            Action::HalfUp => self.step(-(self.half_page() as isize)),
+            Action::NextFolder => self.cycle_folder(1),
+            Action::PrevFolder => self.cycle_folder(-1),
+            Action::Folder(index) => self.switch_folder(index),
+            Action::FocusChats => {
+                self.focus = Focus::Chats;
+                Task::none()
+            }
+            Action::FocusMessages => {
+                if self.open.is_some() {
+                    self.focus = Focus::Messages;
+                }
+                Task::none()
+            }
+            Action::ToggleFocus => {
+                self.focus = match self.focus {
+                    Focus::Messages => Focus::Chats,
+                    Focus::Chats if self.open.is_some() => Focus::Messages,
+                    Focus::Chats => Focus::Chats,
+                };
+                Task::none()
+            }
+            Action::Open => match (self.focus, self.selected) {
+                (Focus::Chats, Some(id)) if self.forward.is_some() => self.forward_to(id),
+                (Focus::Chats, Some(id)) if self.auth == Auth::Ready => self.open_chat(id),
+                (Focus::Messages, _) => {
+                    let target = self.focused_message().and_then(|m| {
+                        let item = m.media.iter().position(|x| x.viewable() || matches!(x, Media::Voice { .. }))?;
+                        Some((m.id, item))
+                    });
+                    match target {
+                        Some((msg_id, item)) => self.activate_media(msg_id, item),
+                        None => Task::none(),
+                    }
+                }
+                _ => Task::none(),
+            },
+            Action::Insert => {
+                if self.auth != Auth::Ready || self.open.is_some() {
+                    self.mode = Mode::Insert;
+                } else {
+                    self.error("Open a chat first (Enter)");
+                }
+                Task::none()
+            }
+            Action::Command => {
+                self.cmdline.clear();
+                self.mode = Mode::Command;
+                Task::none()
+            }
+            Action::Search => {
+                if self.auth == Auth::Ready {
+                    self.cmdline.clear();
+                    self.mode = Mode::Search;
+                    self.search_messages = self.focus == Focus::Messages && self.open.is_some();
+                }
+                Task::none()
+            }
+            Action::SearchNext => self.next_match(1),
+            Action::SearchPrev => self.next_match(-1),
+            Action::Delete => {
+                let target = self.focused_message().map(|m| m.members.clone());
+                match (target, self.open.as_ref().map(|o| o.id)) {
+                    (Some(ids), Some(chat_id)) => {
+                        self.confirm = Some(Confirm::Delete { chat_id, ids });
+                    }
+                    _ => self.error("Select a message first (l)"),
+                }
+                Task::none()
+            }
+            Action::Yank => self.yank(),
+            Action::Paste { before } => self.read_clipboard(PasteTarget::Input(Some(before))),
+            Action::Record => {
+                self.start_recording();
+                Task::none()
+            }
+            Action::PlayPause => self.toggle_pause(),
+            Action::Faster => {
+                self.set_speed(player::faster(self.speed));
+                Task::none()
+            }
+            Action::Slower => {
+                self.set_speed(player::slower(self.speed));
+                Task::none()
+            }
+            Action::NormalSpeed => {
+                self.set_speed(1.0);
+                Task::none()
+            }
+            Action::SeekBack => {
+                self.seek(-SEEK_SHORT);
+                Task::none()
+            }
+            Action::SeekForward => {
+                self.seek(SEEK_SHORT);
+                Task::none()
+            }
+            Action::Reply => {
+                match self.focused_message().map(|m| m.id) {
+                    Some(id) => {
+                        if matches!(self.compose, Compose::Edit(_)) {
+                            self.input.clear();
+                        }
+                        self.compose = Compose::Reply(id);
+                        self.mode = Mode::Insert;
+                        self.scroll_messages();
+                    }
+                    None => self.error("Select a message first (l)"),
+                }
+                Task::none()
+            }
+            Action::Edit => {
+                let target = self.focused_message().map(|m| (m.id, m.outgoing && m.media.is_empty(), m.text.clone()));
+                match target {
+                    Some((id, true, text)) => {
+                        self.compose = Compose::Edit(id);
+                        self.input.clear();
+                        self.input.insert(&text);
+                        self.mode = Mode::Insert;
+                        self.scroll_messages();
+                    }
+                    Some(_) => self.error("Only your own text messages can be edited"),
+                    None => self.error("Select a message first (l)"),
+                }
+                Task::none()
+            }
+            Action::Forward => {
+                let source = self.open.as_ref().map(|o| o.id);
+                match (self.focused_message().map(|m| m.members.clone()), source) {
+                    (Some(ids), Some(chat)) => {
+                        self.forward = Some((chat, ids));
+                        self.focus = Focus::Chats;
+                        self.info("Forward: pick a chat and press Enter (Esc cancels)");
+                    }
+                    _ => self.error("Select a message first (l)"),
+                }
+                Task::none()
+            }
+            Action::Cancel => {
+                self.pending.clear();
+                if self.forward.take().is_some() {
+                    self.info("Forward cancelled");
+                }
+                if matches!(self.compose, Compose::Edit(_)) {
+                    self.input.clear();
+                }
+                self.compose = Compose::New;
+                if !self.filter.is_empty() {
+                    self.set_filter(String::new());
+                }
+                self.scroll_messages();
+                Task::none()
+            }
+        }
+    }
+
+    fn forward_to(&mut self, chat_id: i64) -> Task<Message> {
+        let Some((from, ids)) = self.forward.take() else {
+            return Task::none();
+        };
+        let title = self.chats.get(&chat_id).map_or("chat", |c| c.title.as_str());
+        self.info(format!("Forwarded to {title}"));
+        Task::perform(tg::forward(chat_id, from, ids), Message::Done)
+    }
+
+    fn start_recording(&mut self) {
+        if self.auth != Auth::Ready || self.open.is_none() {
+            self.error("Open a chat first (Enter)");
+            return;
+        }
+        self.voice = None;
+        match Recorder::start(config::dirs().data_dir().join("voice")) {
+            Ok(recorder) => {
+                self.recorder = Some(recorder);
+                self.mode = Mode::Record;
+            }
+            Err(e) => self.error(e),
+        }
+    }
+
+    /// Drop the recorder; `keep` is false to discard the file.
+    fn stop_recording(&mut self, keep: bool) -> Option<Recorder> {
+        self.mode = Mode::Normal;
+        let recorder = self.recorder.take()?;
+        if keep {
+            return Some(recorder);
+        }
+        recorder.cancel();
+        None
+    }
+
+    fn finish_recording(&mut self) -> Task<Message> {
+        let chat_id = self.open.as_ref().map(|o| o.id);
+        let (Some(recorder), Some(chat_id)) = (self.stop_recording(true), chat_id) else {
+            return Task::none();
+        };
+        self.info("Sending voice message…");
+        Task::perform(stop_and_send(chat_id, recorder), Message::Done)
+    }
+
+    fn yank(&mut self) -> Task<Message> {
+        let text = match self.focus {
+            Focus::Messages => self.focused_message().map(|m| m.text.clone()),
+            Focus::Chats => self.selected.and_then(|id| self.chats.get(&id)).map(|c| c.title.clone()),
+        };
+        match text.filter(|t| !t.is_empty()) {
+            Some(text) => {
+                self.info("Copied to clipboard");
+                iced::clipboard::write(text)
+            }
+            None => {
+                self.error("Nothing to copy");
+                Task::none()
+            }
+        }
+    }
+
+    // ---- mouse ---------------------------------------------------------
+
+    fn select_message(&mut self, id: i64) {
+        if let Some(open) = self.open.as_mut()
+            && let Some(i) = open.position(id)
+        {
+            open.cursor = i;
+            self.focus = Focus::Messages;
+            self.scroll_messages();
+        }
+    }
+
+    fn on_scroll(&mut self, pane: Pane, delta: ScrollDelta) -> Task<Message> {
+        let lines = match delta {
+            ScrollDelta::Lines { y, .. } => y,
+            ScrollDelta::Pixels { y, .. } => {
+                self.scroll_pixels += y;
+                let lines = (self.scroll_pixels / SCROLL_PIXELS).trunc();
+                self.scroll_pixels -= lines * SCROLL_PIXELS;
+                lines
+            }
+        };
+        // Wheel up (positive) moves towards the top of the list.
+        let steps = -(lines.round() as isize);
+        if steps == 0 {
+            return Task::none();
+        }
+        match pane {
+            Pane::Folders => self.cycle_folder(steps.signum()),
+            Pane::Chats => {
+                self.focus = Focus::Chats;
+                self.step(steps * 3)
+            }
+            Pane::Messages if self.open.is_some() => {
+                self.focus = Focus::Messages;
+                self.step(steps)
+            }
+            Pane::Messages => Task::none(),
+        }
+    }
+
+    // ---- movement ------------------------------------------------------
+
+    fn half_page(&self) -> usize {
+        match self.focus {
+            Focus::Chats => (view::chat_rows(self.size) / 2).max(1),
+            Focus::Messages => 5,
+        }
+    }
+
+    fn current(&self) -> usize {
+        match (self.focus, &self.open) {
+            (Focus::Messages, Some(open)) => open.cursor,
+            _ => self.selected_index().unwrap_or(0),
+        }
+    }
+
+    fn step(&mut self, delta: isize) -> Task<Message> {
+        let target = self.current().saturating_add_signed(delta);
+        self.jump(target)
+    }
+
+    /// Move the cursor of the focused pane to `index` (clamped).
+    fn jump(&mut self, index: usize) -> Task<Message> {
+        match (self.focus, self.open.as_mut()) {
+            (Focus::Messages, Some(open)) => {
+                if open.msgs.is_empty() {
+                    return Task::none();
+                }
+                open.cursor = index.min(open.msgs.len() - 1);
+                let near_top = open.cursor < PREFETCH;
+                let near_bottom = open.cursor + PREFETCH >= open.msgs.len();
+                self.scroll_messages();
+                if near_top {
+                    return self.load_history(true);
+                }
+                if near_bottom {
+                    return self.load_newer();
+                }
+            }
+            _ => {
+                if self.list.is_empty() {
+                    return Task::none();
+                }
+                let index = index.min(self.list.len() - 1);
+                self.selected = Some(self.list[index]);
+                self.scroll_chats();
+                if index + PREFETCH >= self.list.len() {
+                    return self.load_more_chats();
+                }
+            }
+        }
+        Task::none()
+    }
+
+    fn scroll_chats(&mut self) {
+        let rows = view::chat_rows(self.size);
+        let index = self.selected_index().unwrap_or(0);
+        if index < self.chat_top {
+            self.chat_top = index;
+        } else if index >= self.chat_top + rows {
+            self.chat_top = index + 1 - rows;
+        }
+        self.chat_top = self.chat_top.min(self.list.len().saturating_sub(rows));
+    }
+
+    fn scroll_messages(&mut self) {
+        let (width, height) = self.viewport();
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        if open.msgs.is_empty() {
+            return;
+        }
+        let last = open.msgs.len() - 1;
+        open.cursor = open.cursor.min(last);
+        open.bottom = open.bottom.min(last);
+        if open.cursor > open.bottom {
+            open.bottom = open.cursor;
+        } else if open.cursor < view::top_for_bottom(&open.msgs, open.bottom, width, height) {
+            open.bottom = view::bottom_for_top(&open.msgs, open.cursor, width, height);
+        }
+    }
+}
+
+/// Finalizing the OGG file waits for the pipeline, so do it off the UI thread.
+async fn stop_and_send(chat_id: i64, recorder: Recorder) -> Result<(), String> {
+    let recording = tokio::task::spawn_blocking(move || recorder.stop())
+        .await
+        .map_err(|e| e.to_string())??;
+    tg::send_voice(chat_id, recording, SendOptions::default()).await
+}
+
+enum Edit {
+    Submit,
+    Cancel,
+    Paste,
+    Changed,
+    Ignored,
+}
+
+/// Readline-style editing shared by Insert, Command and Search modes.
+fn edit(input: &mut Input, key: &Key, physical: Physical, mods: Modifiers, text: Option<&str>) -> Edit {
+    if let Key::Named(named) = key {
+        match named {
+            Named::Escape => return Edit::Cancel,
+            Named::Enter => return Edit::Submit,
+            Named::Backspace => input.backspace(),
+            Named::Delete => input.delete(),
+            Named::ArrowLeft => input.left(),
+            Named::ArrowRight => input.right(),
+            Named::Home => input.home(),
+            Named::End => input.end(),
+            _ => return insert_text(input, mods, text),
+        }
+        return Edit::Changed;
+    }
+
+    if mods.control() {
+        match key.to_latin(physical) {
+            Some('[') => return Edit::Cancel,
+            // Ctrl-V and Ctrl-Shift-V, like a terminal.
+            Some('v' | 'V') => return Edit::Paste,
+            Some('w') => input.delete_word(),
+            Some('u') => input.delete_to_start(),
+            Some('h') => input.backspace(),
+            Some('a') => input.home(),
+            Some('e') => input.end(),
+            _ => return Edit::Ignored,
+        }
+        return Edit::Changed;
+    }
+
+    insert_text(input, mods, text)
+}
+
+fn insert_text(input: &mut Input, mods: Modifiers, text: Option<&str>) -> Edit {
+    match text {
+        Some(t) if !mods.alt() && !mods.logo() && !t.is_empty() && !t.chars().any(char::is_control) => {
+            input.insert(t);
+            Edit::Changed
+        }
+        _ => Edit::Ignored,
+    }
+}
+
+/// Dates for `:date`: 01.05.2024, 01.05.24, 01.05 (this year), 2024-05-01,
+/// today, yesterday.
+fn parse_date(arg: &str) -> Option<chrono::NaiveDate> {
+    use chrono::{Datelike, NaiveDate};
+    let arg = arg.trim();
+    let today = chrono::Local::now().date_naive();
+    match arg.to_lowercase().as_str() {
+        "today" | "сегодня" => return Some(today),
+        "yesterday" | "вчера" => return today.pred_opt(),
+        _ => {}
+    }
+    for format in ["%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y"] {
+        if let Ok(date) = NaiveDate::parse_from_str(arg, format) {
+            // `%Y` also accepts "24"; treat two digits as this century.
+            if date.year() < 100 {
+                return date.with_year(date.year() + 2000);
+            }
+            return Some(date);
+        }
+    }
+    let (day, month) = arg.split_once('.')?;
+    NaiveDate::from_ymd_opt(today.year(), month.parse().ok()?, day.parse().ok()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    #[test]
+    fn dates() {
+        assert_eq!(parse_date("01.05.2024"), NaiveDate::from_ymd_opt(2024, 5, 1));
+        assert_eq!(parse_date("2024-05-01"), NaiveDate::from_ymd_opt(2024, 5, 1));
+        assert_eq!(parse_date("01.05.24"), NaiveDate::from_ymd_opt(2024, 5, 1));
+        assert!(parse_date("01.05").is_some());
+        assert!(parse_date("yesterday").is_some());
+        assert_eq!(parse_date("nonsense"), None);
+    }
+}

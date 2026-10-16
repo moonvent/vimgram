@@ -1,0 +1,3 @@
+[env]
+# Prebuilt TDLib 1.8.61 (matches tdlib-rs 1.4), fetched by scripts/fetch-tdlib.sh.
+LOCAL_TDLIB_PATH = { value = "vendor/tdlib", relative = true }
