@@ -388,6 +388,7 @@ fn badge<'a>(count: impl ToString) -> Element<'a, Message> {
 }
 
 fn folder_strip(app: &App) -> Element<'_, Message> {
+    let focused = app.focus == Focus::Folders;
     let items = app.folders.iter().enumerate().map(|(i, folder)| {
         let selected = i == app.folder;
         let unread = app.folder_unread.get(&folder.key).copied().unwrap_or(0);
@@ -421,7 +422,7 @@ fn folder_strip(app: &App) -> Element<'_, Message> {
                 .width(Length::Fill)
                 .height(FOLDER_ROW_H)
                 .clip(true)
-                .style(move |t: &Theme| selection_style(t, selected, true)),
+                .style(move |t: &Theme| selection_style(t, selected, focused)),
         )
         .on_press(Message::ClickFolder(i))
         .interaction(Interaction::Pointer)

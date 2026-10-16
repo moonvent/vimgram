@@ -7,6 +7,9 @@ pub struct Config {
     pub api_hash: String,
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Folder to start in, by name (e.g. "Личка"); the main list otherwise.
+    #[serde(default)]
+    pub folder: Option<String>,
     /// Show an icon in the tray (waybar's `tray` module).
     #[serde(default = "yes")]
     pub tray: bool,

@@ -162,6 +162,7 @@ pub enum Auth {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
+    Folders,
     Chats,
     Messages,
 }
@@ -490,6 +491,8 @@ pub struct App {
     file_owner: HashMap<i32, (i64, i64)>,
     /// Files to send with the next message (pasted or picked).
     pub attachments: Vec<PathBuf>,
+    /// A folder was picked (by the user or `folder` in the config).
+    folder_chosen: bool,
     /// The emoji panel, while open.
     pub emoji: Option<Picker>,
     pub recent_emoji: Vec<String>,
@@ -514,6 +517,13 @@ pub fn find_theme(name: &str) -> Option<Theme> {
         .iter()
         .find(|t| normalize_name(&t.to_string()) == wanted)
         .cloned()
+}
+
+/// Folder by name, ignoring case, spaces and punctuation ("личка" finds
+/// "Личка").
+pub fn find_folder(folders: &[Folder], name: &str) -> Option<usize> {
+    let wanted = normalize_name(name);
+    folders.iter().position(|f| normalize_name(&f.name) == wanted)
 }
 
 fn normalize_name(s: &str) -> String {
@@ -580,6 +590,7 @@ impl App {
             tray_unread: 0,
             file_owner: HashMap::new(),
             attachments: Vec::new(),
+            folder_chosen: false,
             emoji: None,
             recent_emoji: emoji::load_recent(),
         };
@@ -1274,6 +1285,14 @@ impl App {
                     .position(|f| f.key == current)
                     .unwrap_or(0);
                 self.list_dirty = true;
+                // Start in the configured folder (`folder = "…"`).
+                if !self.folder_chosen
+                    && let Some(i) = self.cfg.folder.as_deref().and_then(|name| find_folder(&self.folders, name))
+                {
+                    self.folder_chosen = true;
+                    self.folder = i;
+                    return self.load_more_chats();
+                }
             }
             Update::User(u) => {
                 self.users.insert(u.user.id, User::from(&u.user));
@@ -1572,9 +1591,13 @@ impl App {
             self.folder_selection.insert(self.current_list(), id);
         }
         self.folder = index;
+        self.folder_chosen = true;
         self.selected = self.folder_selection.get(&self.current_list()).copied();
         self.chat_top = 0;
-        self.focus = Focus::Chats;
+        // Moving through the folder pane keeps it focused.
+        if self.focus != Focus::Folders {
+            self.focus = Focus::Chats;
+        }
         self.list_dirty = true;
         self.refresh_list();
         self.load_more_chats()
@@ -2792,7 +2815,7 @@ impl App {
     fn focused_message(&self) -> Option<&Msg> {
         match self.focus {
             Focus::Messages => self.open.as_ref()?.current(),
-            Focus::Chats => None,
+            Focus::Chats | Focus::Folders => None,
         }
     }
 
@@ -2818,22 +2841,32 @@ impl App {
             Action::NextFolder => self.cycle_folder(1),
             Action::PrevFolder => self.cycle_folder(-1),
             Action::Folder(index) => self.switch_folder(index),
+            // h / l: one pane left / right (folders, chats, messages).
             Action::FocusChats => {
-                self.focus = Focus::Chats;
+                self.focus = match self.focus {
+                    Focus::Messages => Focus::Chats,
+                    Focus::Chats | Focus::Folders => Focus::Folders,
+                };
                 Task::none()
             }
             Action::FocusMessages => {
-                if self.open.is_some() {
-                    self.focus = Focus::Messages;
-                }
+                self.focus = match self.focus {
+                    Focus::Folders => Focus::Chats,
+                    Focus::Chats | Focus::Messages if self.open.is_some() => Focus::Messages,
+                    other => other,
+                };
                 Task::none()
             }
             Action::ToggleFocus => {
                 self.focus = match self.focus {
-                    Focus::Messages => Focus::Chats,
+                    Focus::Messages | Focus::Folders => Focus::Chats,
                     Focus::Chats if self.open.is_some() => Focus::Messages,
                     Focus::Chats => Focus::Chats,
                 };
+                Task::none()
+            }
+            Action::Open if self.focus == Focus::Folders => {
+                self.focus = Focus::Chats;
                 Task::none()
             }
             Action::Open => match (self.focus, self.selected) {
@@ -3044,6 +3077,7 @@ impl App {
         let text = match self.focus {
             Focus::Messages => self.focused_message().map(|m| m.text.clone()),
             Focus::Chats => self.selected.and_then(|id| self.chats.get(&id)).map(|c| c.title.clone()),
+            Focus::Folders => self.folders.get(self.folder).map(|f| f.name.clone()),
         };
         match text.filter(|t| !t.is_empty()) {
             Some(text) => {
@@ -3112,12 +3146,14 @@ impl App {
         match self.focus {
             Focus::Chats => (view::chat_rows(self.size) / 2).max(1),
             Focus::Messages => 5,
+            Focus::Folders => 3,
         }
     }
 
     fn current(&self) -> usize {
         match (self.focus, &self.open) {
             (Focus::Messages, Some(open)) => open.cursor,
+            (Focus::Folders, _) => self.folder,
             _ => self.selected_index().unwrap_or(0),
         }
     }
@@ -3176,6 +3212,9 @@ impl App {
 
     /// Move the cursor of the focused pane to `index` (clamped).
     fn jump(&mut self, index: usize) -> Task<Message> {
+        if self.focus == Focus::Folders {
+            return self.switch_folder(index.min(self.folders.len().saturating_sub(1)));
+        }
         match (self.focus, self.open.as_mut()) {
             (Focus::Messages, Some(open)) => {
                 if open.msgs.is_empty() {
@@ -3544,5 +3583,14 @@ mod tests {
         assert!(parse_date("01.05").is_some());
         assert!(parse_date("yesterday").is_some());
         assert_eq!(parse_date("nonsense"), None);
+    }
+
+    #[test]
+    fn folders_by_loose_name() {
+        let mut folders = tg::folders(tdlib_rs::types::UpdateChatFolders::default());
+        folders.push(Folder { name: "Личка".into(), ..folders[0].clone() });
+        assert_eq!(find_folder(&folders, "личка"), Some(folders.len() - 1));
+        assert_eq!(find_folder(&folders, " ЛИЧКА "), Some(folders.len() - 1));
+        assert_eq!(find_folder(&folders, "work"), None);
     }
 }

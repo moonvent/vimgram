@@ -22,6 +22,7 @@ Create `~/.config/vimgram/config.toml` with credentials from https://my.telegram
 api_id = 123456
 api_hash = "..."
 theme = "Tokyo Night"   # optional, see :theme
+folder = "Личка"        # optional: folder to start in (by name, any case)
 tray = true             # optional: tray icon (waybar `tray` module)
 close_to_tray = true    # optional: closing the window keeps vimgram in the tray
 prefetch_mb = 50        # optional: auto-download media up to this size (see below)
@@ -40,7 +41,8 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `j` / `k`, `5j` | move down / up (with count) |
 | `gg` / `G` | top / bottom |
 | `Ctrl-d` / `Ctrl-u` | half page down / up |
-| `h` / `l`, `Tab` | focus chat list / messages |
+| `h` / `l` | focus the pane to the left / right: folders ↔ chat list ↔ messages (`j`/`k`, `gg`/`G` move through folders there, `Enter` goes to the chats) |
+| `Tab` | switch between chat list and messages |
 | `J` / `K`, `gt` / `gT`, `3gt`, `Alt-1…9` | next / previous / n-th folder |
 | `Enter`, `o` | open chat; view photo or video; play voice message |
 | `i`, `a` | insert mode (write message / login field) |
