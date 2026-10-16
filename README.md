@@ -55,6 +55,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `p` / `P` | paste the clipboard at the end / start of the message; a copied image or file becomes an attachment |
 | `q` | record a voice message; `q`/`Enter` sends, `Esc` discards |
 | `Space` | play / pause voice message or video |
+| `gv`, click on the player bar | back to the voice message playing in another chat (the bar above the chat shows it; ✕ stops) |
 | `]` `+` / `[` `-` / `=` | speed up / down (0.25x–5x) / reset to 1x; voice messages, videos and round videos each remember their own speed |
 | `H` / `L` | seek voice message −5s / +5s |
 | `Esc`, `Ctrl-[` | normal mode; cancel reply, edit, forward, filter, attachment |
@@ -77,6 +78,9 @@ starting with what you typed; the history survives restarts.
 Insert mode: `Enter` sends, `Shift+Enter` new line, `Ctrl-v` paste (text, or a copied
 image / files as attachments), `Ctrl-w` delete word, `Ctrl-u` delete to start. Two to
 ten photos and videos go as an album.
+
+When a voice or round video message ends and the very next message is one too, it plays
+next (voice messages also from another chat; round videos while their chat is open).
 
 Photo/video viewer: `j`/`k` next/previous, `h`/`l` seek ±5s, `H`/`L` ±30s, `Space` pause,
 `[` `]` `=` speed, `Esc` close.

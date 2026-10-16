@@ -136,6 +136,8 @@ pub enum Action {
     Pinned,
     /// Emoji panel (`ge`).
     Emoji,
+    /// Back to the voice message playing in another chat (`gv`).
+    JumpPlaying,
     SearchNext,
     SearchPrev,
     Cancel,
@@ -174,6 +176,7 @@ impl Pending {
             (Some('g'), NKey::Char('a')) => Some(Action::Attach),
             (Some('g'), NKey::Char('p')) => Some(Action::Pinned),
             (Some('g'), NKey::Char('e')) => Some(Action::Emoji),
+            (Some('g'), NKey::Char('v')) => Some(Action::JumpPlaying),
             (Some('y'), NKey::Char('y')) => Some(Action::Yank),
             // `cc` changes the line in Vim; here it edits the message.
             (Some('c'), NKey::Char('c')) => Some(Action::Edit),
@@ -422,6 +425,7 @@ mod tests {
         assert_eq!(feed("ddnN"), vec![Action::Delete, Action::SearchNext, Action::SearchPrev]);
         assert_eq!(feed("gagp"), vec![Action::Attach, Action::Pinned]);
         assert_eq!(feed("ge"), vec![Action::Emoji]);
+        assert_eq!(feed("gv"), vec![Action::JumpPlaying]);
         assert_eq!(feed("][="), vec![Action::Faster, Action::Slower, Action::NormalSpeed]);
     }
 

@@ -5,8 +5,8 @@ use chrono::{DateTime, Local};
 use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Column, Row, center, column, container, image, mouse_area, row, rule, scrollable, space, stack,
-    text, tooltip,
+    Column, Row, center, column, container, image, mouse_area, progress_bar, row, rule, scrollable, space,
+    stack, text, tooltip,
 };
 use iced::mouse::Interaction;
 use iced::{Alignment, Color, ContentFit, Element, Length, Size, Theme};
@@ -50,6 +50,8 @@ const HEADER_AVATAR: f32 = 32.0;
 /// Two lines of the pinned message.
 const PINNED_TEXT_H: f32 = 13.0 * 1.3 * 2.0;
 const PINNED_H: f32 = 11.0 * 1.3 + PINNED_TEXT_H + 13.0;
+/// Bar of a voice message playing in another chat.
+const PLAYER_H: f32 = 44.0;
 /// Space above the visible messages worth filling with the end of the
 /// previous (too tall) message.
 const MIN_PARTIAL: f32 = 40.0;
@@ -80,11 +82,19 @@ fn compose_height(input: &Input, banner: bool) -> f32 {
 }
 
 /// Width and height available to the message list.
-pub fn messages_viewport(size: Size, compose: &Input, banner: bool, pinned: bool, emoji: bool) -> (f32, f32) {
+pub fn messages_viewport(
+    size: Size,
+    compose: &Input,
+    banner: bool,
+    pinned: bool,
+    emoji: bool,
+    player: bool,
+) -> (f32, f32) {
     let panel = if emoji { EMOJI_W } else { 0.0 };
     let width = size.width - FOLDER_W - SIDEBAR_W - 1.0 - 2.0 * MSG_PAD_X - MSG_AVATAR - MSG_AVATAR_GAP - panel;
     let pinned = if pinned { PINNED_H + 1.0 } else { 0.0 };
-    let height = size.height - STATUS_H - HEADER_H - 2.0 - pinned - compose_height(compose, banner);
+    let player = if player { PLAYER_H + 1.0 } else { 0.0 };
+    let height = size.height - STATUS_H - HEADER_H - 2.0 - pinned - player - compose_height(compose, banner);
     (width.max(100.0), height.max(LINE_H))
 }
 
@@ -616,14 +626,76 @@ fn sender_color(t: &Theme, sender: Sender) -> Color {
     colors[id.unsigned_abs() as usize % colors.len()]
 }
 
+/// A voice message from another chat keeps playing: what it is, its
+/// progress, and a way back to it (click or `gv`).
+fn player_bar(app: &App) -> Option<Element<'_, Message>> {
+    let voice = app.playing_elsewhere()?;
+    let chat = app.chats.get(&voice.chat_id).map_or("", |c| c.title.as_str());
+    let sender = app.sender_name(voice.sender);
+    let who = if sender == chat || chat.is_empty() { sender.to_owned() } else { format!("{sender} · {chat}") };
+    let (icon, progress, time) = match &voice.audio {
+        Some(audio) => {
+            let total = audio.duration().map_or(0.0, |d| d.as_secs_f64()).max(0.001);
+            let pos = audio.position().as_secs_f64();
+            let icon = if audio.paused() { "▶" } else { "⏸" };
+            (icon, (pos / total) as f32, format!("{} / {}", fmt_secs(pos), fmt_secs(total)))
+        }
+        None => ("…", 0.0, "loading…".to_owned()),
+    };
+    let button = |label: &'static str, message: Message| {
+        mouse_area(
+            container(text(label).size(16).style(primary_text))
+                .width(28)
+                .height(28)
+                .align_x(Alignment::Center)
+                .align_y(Alignment::Center),
+        )
+        .on_press(message)
+        .interaction(Interaction::Pointer)
+    };
+    let info = column![
+        row![
+            text(format!("🎤 {who}")).size(13).wrapping(Wrapping::None).width(Length::Fill),
+            text(format!("{time}  {}  gv", player::fmt_speed(app.speed()))).size(12).style(muted_text),
+        ]
+        .spacing(8),
+        progress_bar(0.0..=1.0, progress).girth(3),
+    ]
+    .spacing(5)
+    .width(Length::Fill);
+    let bar = row![
+        button(icon, Message::PauseVoice),
+        mouse_area(info).on_press(Message::JumpPlaying).interaction(Interaction::Pointer),
+        button("✕", Message::StopVoice),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+    Some(
+        column![
+            container(bar)
+                .height(PLAYER_H)
+                .width(Length::Fill)
+                .padding([0.0, MSG_PAD_X])
+                .align_y(Alignment::Center)
+                .clip(true),
+            rule::horizontal(1),
+        ]
+        .into(),
+    )
+}
+
 fn chat_pane(app: &App) -> Element<'_, Message> {
+    let bar = player_bar(app);
     let Some(open) = &app.open else {
-        return center(
+        let hint = center(
             text("j/k — move, Enter — open chat, J/K — folders, :help — keys")
                 .size(14)
                 .style(muted_text),
-        )
-        .into();
+        );
+        return match bar {
+            Some(bar) => column![bar, hint].into(),
+            None => hint.into(),
+        };
     };
 
     let chat = app.chats.get(&open.id);
@@ -713,7 +785,11 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
         .into()
     };
 
-    let mut pane = column![header, rule::horizontal(1)];
+    let mut pane = column![];
+    if let Some(bar) = bar {
+        pane = pane.push(bar);
+    }
+    let mut pane = pane.push(header).push(rule::horizontal(1));
     if let Some(pinned) = &open.pinned {
         pane = pane.push(pinned_bar(pinned)).push(rule::horizontal(1));
     }

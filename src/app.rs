@@ -48,7 +48,7 @@ pub const TALL_ID: &str = "tall-message";
 
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l panes  J/K gt/gT Alt-N folders  \
                     Enter open/play  i insert  q record  r reply  cc/e edit  f forward  dd delete  \
-                    yy/Y copy  p/P paste  ge emoji  Space play/pause  [ ] speed  = 1x  H/L seek  \
+                    yy/Y copy  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  H/L seek  \
                     / filter chats or search messages  n/N next/prev match  ga attach  gp pinned  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
                     :folder  :theme  :autostart  :cleancache  :q";
@@ -125,6 +125,16 @@ pub enum Message {
     TallScroll(Viewport),
     Paste(Option<String>),
     Clip(Result<Clip, String>),
+    /// The message after one that finished playing, for autoplay.
+    NextMedia {
+        chat_id: i64,
+        after: i64,
+        next: Option<Msg>,
+    },
+    /// Player bar of a voice message from another chat.
+    JumpPlaying,
+    PauseVoice,
+    StopVoice,
     /// Emoji panel: open/close, pick a tab, insert an emoji.
     ToggleEmoji,
     EmojiTab(usize),
@@ -181,8 +191,9 @@ pub struct Viewer {
 }
 
 pub struct VoicePlayback {
-    chat_id: i64,
+    pub chat_id: i64,
     pub msg_id: i64,
+    pub sender: Sender,
     file_id: i32,
     /// `None` while the file downloads.
     pub audio: Option<Audio>,
@@ -190,8 +201,8 @@ pub struct VoicePlayback {
 
 pub struct VideoPlayback {
     file_id: i32,
-    /// Chat and message of a round video not yet watched to the end.
-    unwatched: Option<(i64, i64)>,
+    /// Chat and message of a round video, until it played to the end.
+    round_msg: Option<(i64, i64)>,
     /// Video or round video message: each keeps its own speed.
     kind: SpeedKind,
     /// `None` until the stream has started.
@@ -792,7 +803,14 @@ impl App {
     /// Size of the message list, which shrinks with the compose box.
     pub fn viewport(&self) -> (f32, f32) {
         let pinned = self.open.as_ref().is_some_and(|o| o.pinned.is_some());
-        view::messages_viewport(self.size, &self.input, view::has_banner(self), pinned, self.emoji.is_some())
+        view::messages_viewport(
+            self.size,
+            &self.input,
+            view::has_banner(self),
+            pinned,
+            self.emoji.is_some(),
+            self.playing_elsewhere().is_some(),
+        )
     }
 
     pub fn viewer_media(&self) -> Option<&Media> {
@@ -1077,6 +1095,19 @@ impl App {
             }
             // No wl-paste (or not Wayland): plain text through iced.
             Message::Clip(Err(_)) => iced::clipboard::read().map(Message::Paste),
+            Message::JumpPlaying => self.act(Action::JumpPlaying),
+            Message::NextMedia { chat_id, after, next } => self.play_next(chat_id, after, next),
+            Message::PauseVoice => {
+                if let Some(audio) = self.voice.as_mut().and_then(|v| v.audio.as_mut()) {
+                    audio.toggle_pause();
+                }
+                Task::none()
+            }
+            Message::StopVoice => {
+                self.voice = None;
+                self.scroll_messages();
+                Task::none()
+            }
             Message::ToggleEmoji => {
                 if self.emoji.is_some() {
                     self.close_emoji();
@@ -1747,12 +1778,17 @@ impl App {
     }
 
     fn open_chat(&mut self, id: i64) -> Task<Message> {
+        self.open_chat_at(id, None)
+    }
+
+    /// Open a chat at its latest messages, or around message `at`.
+    fn open_chat_at(&mut self, id: i64, at: Option<i64>) -> Task<Message> {
         self.focus = Focus::Messages;
         let mut tasks = Vec::new();
         if let Some(prev) = self.open.take() {
             if prev.id == id {
                 self.open = Some(prev);
-                return Task::none();
+                return at.map_or_else(Task::none, |msg| self.jump_to_message(msg));
             }
             tasks.push(Task::perform(tg::close_chat(prev.id), Message::Done));
         }
@@ -1768,8 +1804,16 @@ impl App {
         }));
         tasks.push(Self::load_pinned(id));
         self.reset_tall();
-        tasks.push(self.load_history(false));
+        tasks.push(match at {
+            Some(msg) => self.jump_to_message(msg),
+            None => self.load_history(false),
+        });
         Task::batch(tasks)
+    }
+
+    /// A voice message playing in a chat other than the open one.
+    pub fn playing_elsewhere(&self) -> Option<&VoicePlayback> {
+        self.voice.as_ref().filter(|v| self.open.as_ref().is_none_or(|o| o.id != v.chat_id))
     }
 
     fn send(&mut self) -> Task<Message> {
@@ -2008,9 +2052,15 @@ impl App {
             return Task::none();
         }
         let chat_id = self.open.as_ref().map_or(0, |o| o.id);
+        let sender = self
+            .open
+            .as_ref()
+            .and_then(|o| o.position(msg_id).map(|i| o.msgs[i].sender))
+            .unwrap_or(Sender::Chat(chat_id));
         self.voice = Some(VoicePlayback {
             chat_id,
             msg_id,
+            sender,
             file_id,
             audio: None,
         });
@@ -2025,9 +2075,9 @@ impl App {
             }
             _ => None,
         };
-        let unwatched = self
+        let round_msg = self
             .viewer_media()
-            .filter(|m| m.unlistened())
+            .filter(|m| matches!(m, Media::Video { round: true, .. }))
             .and_then(|_| Some((self.open.as_ref()?.id, viewer.msg_id)));
         if let Some(open) = self.open.as_mut()
             && let Some(i) = open.position(viewer.msg_id)
@@ -2042,7 +2092,7 @@ impl App {
                 self.voice = None;
                 self.video = Some(VideoPlayback {
                     file_id,
-                    unwatched,
+                    round_msg,
                     kind,
                     movie: None,
                     speed_pending: false,
@@ -2082,7 +2132,7 @@ impl App {
             && let Some(video) = playback.video()
             && (video.eos() || video.position() + Duration::from_millis(300) >= video.duration())
             && video.duration() > Duration::ZERO
-            && let Some(message) = playback.unwatched.take()
+            && let Some(message) = playback.round_msg.take()
         {
             finished.push(message);
         }
@@ -2107,7 +2157,85 @@ impl App {
                 }
             }
         }
-        Task::batch(finished.into_iter().map(|(chat_id, msg_id)| self.mark_listened(chat_id, msg_id)))
+        Task::batch(finished.into_iter().map(|(chat_id, msg_id)| {
+            Task::batch([self.mark_listened(chat_id, msg_id), Self::fetch_next(chat_id, msg_id)])
+        }))
+    }
+
+    /// The message right after one that finished playing.
+    fn fetch_next(chat_id: i64, after: i64) -> Task<Message> {
+        Task::perform(tg::history(chat_id, after, -1, 2), move |result| Message::NextMedia {
+            chat_id,
+            after,
+            next: result.ok().and_then(|msgs| msgs.into_iter().filter(|m| m.id > after).min_by_key(|m| m.id)),
+        })
+    }
+
+    /// Continue with the next message if it is a voice or round video
+    /// message too, unless something else started in the meantime.
+    fn play_next(&mut self, chat_id: i64, after: i64, next: Option<Msg>) -> Task<Message> {
+        let Some(next) = next.filter(|m| !m.scheduled) else {
+            return Task::none();
+        };
+        match next.media.first() {
+            Some(Media::Voice { file, .. }) if self.voice.is_none() && self.video.is_none() => {
+                let file = *file;
+                // Follow along when the finished message is under the cursor.
+                if let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id)
+                    && open.current().is_some_and(|m| m.id == after)
+                    && let Some(i) = open.position(next.id)
+                {
+                    open.cursor = i;
+                    self.scroll_messages();
+                }
+                self.voice = Some(VoicePlayback {
+                    chat_id,
+                    msg_id: next.id,
+                    sender: next.sender,
+                    file_id: file,
+                    audio: None,
+                });
+                Self::play_download(file)
+            }
+            // Round videos play in the viewer: continue only from there.
+            Some(Media::Video { round: true, .. })
+                if self.viewer.is_some_and(|v| v.msg_id == after)
+                    && self.open.as_ref().is_some_and(|o| o.id == chat_id && o.position(next.id).is_some()) =>
+            {
+                self.open_viewer(Viewer { msg_id: next.id, item: 0 })
+            }
+            // A voice message followed by a round video, in the open chat.
+            Some(Media::Video { round: true, .. })
+                if self.viewer.is_none()
+                    && self.voice.is_none()
+                    && self.open.as_ref().is_some_and(|o| o.id == chat_id && o.position(next.id).is_some()) =>
+            {
+                self.select_message(next.id);
+                self.open_viewer(Viewer { msg_id: next.id, item: 0 })
+            }
+            // A round video that ended in the viewer, followed by a voice.
+            Some(Media::Voice { file, .. })
+                if self.viewer.is_some_and(|v| v.msg_id == after) && self.voice.is_none() =>
+            {
+                let file = *file;
+                self.close_viewer();
+                if let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id)
+                    && let Some(i) = open.position(next.id)
+                {
+                    open.cursor = i;
+                    self.scroll_messages();
+                }
+                self.voice = Some(VoicePlayback {
+                    chat_id,
+                    msg_id: next.id,
+                    sender: next.sender,
+                    file_id: file,
+                    audio: None,
+                });
+                Self::play_download(file)
+            }
+            _ => Task::none(),
+        }
     }
 
     /// Played to the end: mark it listened here and, for incoming
@@ -2749,6 +2877,16 @@ impl App {
                 self.open_emoji();
                 Task::none()
             }
+            Action::JumpPlaying => match self.voice.as_ref().map(|v| (v.chat_id, v.msg_id)) {
+                Some((chat_id, msg_id)) => {
+                    self.select_chat(chat_id);
+                    self.open_chat_at(chat_id, Some(msg_id))
+                }
+                None => {
+                    self.error("Nothing is playing");
+                    Task::none()
+                }
+            },
             Action::Pinned => self.handle(Message::JumpPinned),
             Action::SearchNext => self.next_match(1),
             Action::SearchPrev => self.next_match(-1),
