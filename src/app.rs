@@ -13,6 +13,7 @@ use tdlib_rs::types::{ChatNotificationSettings, ChatPhotoInfo, ChatPosition};
 use crate::archive::{Archive, Record};
 use crate::config::{self, Config};
 use crate::clipboard::{self, Clip};
+use crate::emoji::{self, Picker};
 use crate::{autostart, export, icon, notify, tray};
 use crate::media::{self, Kind, Loaded, Shared, Store};
 use crate::player::{self, Audio, Movie};
@@ -44,7 +45,7 @@ pub const TALL_ID: &str = "tall-message";
 
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l panes  J/K gt/gT Alt-N folders  \
                     Enter open/play  i insert  q record  r reply  cc/e edit  f forward  dd delete  \
-                    yy/Y copy  p/P paste  Space play/pause  [ ] speed  = 1x  H/L seek  \
+                    yy/Y copy  p/P paste  ge emoji  Space play/pause  [ ] speed  = 1x  H/L seek  \
                     / filter chats or search messages  n/N next/prev match  ga attach  gp pinned  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
                     :folder  :theme  :autostart  :q";
@@ -120,6 +121,10 @@ pub enum Message {
     TallScroll(Viewport),
     Paste(Option<String>),
     Clip(Result<Clip, String>),
+    /// Emoji panel: open/close, pick a tab, insert an emoji.
+    ToggleEmoji,
+    EmojiTab(usize),
+    EmojiPick(&'static str),
     ClickFolder(usize),
     ClickChat(i64),
     SelectMsg(i64),
@@ -153,6 +158,7 @@ pub enum Pane {
     Folders,
     Chats,
     Messages,
+    Emoji,
 }
 
 /// What Enter in Insert mode does with the composed text.
@@ -464,6 +470,9 @@ pub struct App {
     file_owner: HashMap<i32, (i64, i64)>,
     /// Files to send with the next message (pasted or picked).
     pub attachments: Vec<PathBuf>,
+    /// The emoji panel, while open.
+    pub emoji: Option<Picker>,
+    pub recent_emoji: Vec<String>,
 }
 
 fn window_settings(size: Size) -> window::Settings {
@@ -551,6 +560,8 @@ impl App {
             tray_unread: 0,
             file_owner: HashMap::new(),
             attachments: Vec::new(),
+            emoji: None,
+            recent_emoji: emoji::load_recent(),
         };
         let window = if hidden && app.cfg.tray { Task::none() } else { app.open_window() };
         (app, Task::batch([Task::perform(tg::start(), Message::Done), window]))
@@ -772,7 +783,7 @@ impl App {
     /// Size of the message list, which shrinks with the compose box.
     pub fn viewport(&self) -> (f32, f32) {
         let pinned = self.open.as_ref().is_some_and(|o| o.pinned.is_some());
-        view::messages_viewport(self.size, &self.input, view::has_banner(self), pinned)
+        view::messages_viewport(self.size, &self.input, view::has_banner(self), pinned, self.emoji.is_some())
     }
 
     pub fn viewer_media(&self) -> Option<&Media> {
@@ -1046,6 +1057,24 @@ impl App {
             }
             // No wl-paste (or not Wayland): plain text through iced.
             Message::Clip(Err(_)) => iced::clipboard::read().map(Message::Paste),
+            Message::ToggleEmoji => {
+                if self.emoji.is_some() {
+                    self.close_emoji();
+                    Task::none()
+                } else {
+                    self.act(Action::Emoji)
+                }
+            }
+            Message::EmojiTab(tab) => {
+                if let Some(picker) = self.emoji.as_mut() {
+                    picker.set_tab(tab);
+                }
+                Task::none()
+            }
+            Message::EmojiPick(e) => {
+                self.insert_emoji(e);
+                Task::none()
+            }
             Message::TallScroll(viewport) => {
                 self.tall_offset = viewport.absolute_offset().y;
                 self.tall_max = Some((viewport.content_bounds().height - viewport.bounds().height).max(0.0));
@@ -1761,7 +1790,7 @@ impl App {
         self.attachments.extend(paths);
         self.focus = Focus::Messages;
         self.mode = Mode::Insert;
-        self.info("Enter sends the attachment (the text is its caption), Esc then Esc drops it");
+        self.info("Attached: Enter sends it, the text becomes its caption");
         self.scroll_messages();
     }
 
@@ -2036,6 +2065,9 @@ impl App {
     // ---- keyboard ------------------------------------------------------
 
     fn on_key(&mut self, key: &Key, physical: Physical, mods: Modifiers, text: Option<&str>) -> Task<Message> {
+        if self.emoji.is_some() && matches!(self.mode, Mode::Insert | Mode::Normal) {
+            return self.key_emoji(key, physical, mods, text);
+        }
         match self.mode {
             Mode::Insert => self.key_insert(key, physical, mods, text),
             Mode::Command | Mode::Search => self.key_cmdline(key, physical, mods, text),
@@ -2064,6 +2096,107 @@ impl App {
                 }
             }
         }
+    }
+
+    fn emoji_rows(&self) -> usize {
+        view::emoji_rows(self.viewport().1)
+    }
+
+    fn open_emoji(&mut self) {
+        if self.open.is_none() || self.auth != Auth::Ready {
+            self.error("Open a chat first (Enter)");
+            return;
+        }
+        self.focus = Focus::Messages;
+        self.mode = Mode::Insert;
+        self.emoji = Some(Picker::new(&self.recent_emoji));
+        self.scroll_messages();
+    }
+
+    fn close_emoji(&mut self) {
+        if self.emoji.take().is_some() {
+            emoji::save_recent(&self.recent_emoji);
+            self.scroll_messages();
+        }
+    }
+
+    fn insert_emoji(&mut self, e: &str) {
+        self.input.insert(e);
+        emoji::remember(&mut self.recent_emoji, e);
+        if self.mode == Mode::Normal {
+            self.mode = Mode::Insert;
+        }
+    }
+
+    /// Keys while the emoji panel is open: h/j/k/l move, Enter inserts,
+    /// Tab switches groups, `/` searches by name, Esc closes.
+    fn key_emoji(&mut self, key: &Key, physical: Physical, mods: Modifiers, text: Option<&str>) -> Task<Message> {
+        let rows = self.emoji_rows();
+        let items = self.emoji.as_ref().map(|p| p.items(&self.recent_emoji)).unwrap_or_default();
+        let Some(picker) = self.emoji.as_mut() else {
+            return Task::none();
+        };
+        if picker.searching {
+            match key {
+                Key::Named(Named::Escape | Named::Enter) => picker.searching = false,
+                Key::Named(Named::Backspace) => {
+                    picker.query.pop();
+                    picker.cursor = 0;
+                    picker.top = 0;
+                }
+                Key::Named(Named::ArrowDown) => picker.step(0, 1, items.len(), rows),
+                Key::Named(Named::ArrowUp) => picker.step(0, -1, items.len(), rows),
+                _ => {
+                    if let Some(t) = text.filter(|t| !mods.control() && !t.chars().any(char::is_control)) {
+                        picker.query.push_str(t);
+                        picker.cursor = 0;
+                        picker.top = 0;
+                    }
+                }
+            }
+            return Task::none();
+        }
+        if matches!(key, Key::Named(Named::Backspace)) {
+            self.input.backspace();
+            return Task::none();
+        }
+        if matches!(key, Key::Named(Named::Tab)) {
+            picker.next_tab(if mods.shift() { -1 } else { 1 });
+            return Task::none();
+        }
+        let Some(nkey) = normalize(key, physical, mods) else {
+            return Task::none();
+        };
+        let mut pick = None;
+        match nkey {
+            NKey::Esc | NKey::Ctrl('.') => {
+                self.close_emoji();
+                return Task::none();
+            }
+            NKey::Char('h') | NKey::Left => picker.step(-1, 0, items.len(), rows),
+            NKey::Char('l') | NKey::Right => picker.step(1, 0, items.len(), rows),
+            NKey::Char('j') | NKey::Down => picker.step(0, 1, items.len(), rows),
+            NKey::Char('k') | NKey::Up => picker.step(0, -1, items.len(), rows),
+            NKey::Ctrl('d') => picker.step(0, rows as isize / 2, items.len(), rows),
+            NKey::Ctrl('u') => picker.step(0, -(rows as isize) / 2, items.len(), rows),
+            NKey::Char('g') => picker.step(-(items.len() as isize), 0, items.len(), rows),
+            NKey::Char('G') => picker.step(items.len() as isize, 0, items.len(), rows),
+            NKey::Char(']') => picker.next_tab(1),
+            NKey::Char('[') => picker.next_tab(-1),
+            NKey::Char(c @ '0'..='9') => picker.set_tab((c as usize - '0' as usize + 9) % 10),
+            NKey::Char('/') => {
+                picker.searching = true;
+                picker.query.clear();
+                picker.cursor = 0;
+                picker.top = 0;
+            }
+            NKey::Enter | NKey::Space => pick = items.get(picker.cursor).copied(),
+            _ => {}
+        }
+        if let Some(e) = pick {
+            self.insert_emoji(e);
+        }
+        Task::none()
     }
 
     fn key_confirm(&mut self, key: NKey) -> Task<Message> {
@@ -2143,6 +2276,10 @@ impl App {
                 silent: true,
                 ..SendOptions::default()
             });
+        }
+        if self.auth == Auth::Ready && mods.control() && key.to_latin(physical) == Some('.') {
+            self.open_emoji();
+            return Task::none();
         }
         match edit(&mut self.input, key, physical, mods, text) {
             Edit::Submit if self.auth == Auth::Ready => self.send(),
@@ -2357,6 +2494,10 @@ impl App {
                 return Task::none();
             }
             ("autostart", arg) => return self.autostart(arg),
+            ("emoji", None) => {
+                self.open_emoji();
+                return Task::none();
+            }
             ("silent", _) => {
                 return self.send_with(SendOptions {
                     silent: true,
@@ -2476,6 +2617,10 @@ impl App {
                 Task::none()
             }
             Action::Attach => self.pick_files(),
+            Action::Emoji => {
+                self.open_emoji();
+                Task::none()
+            }
             Action::Pinned => self.handle(Message::JumpPinned),
             Action::SearchNext => self.next_match(1),
             Action::SearchPrev => self.next_match(-1),
@@ -2678,6 +2823,14 @@ impl App {
                 self.step(steps)
             }
             Pane::Messages => Task::none(),
+            Pane::Emoji => {
+                let rows = self.emoji_rows();
+                let count = self.emoji.as_ref().map_or(0, |p| p.items(&self.recent_emoji).len());
+                if let Some(picker) = self.emoji.as_mut() {
+                    picker.scroll(steps, count, rows);
+                }
+                Task::none()
+            }
         }
     }
 

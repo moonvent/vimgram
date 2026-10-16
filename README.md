@@ -50,6 +50,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `dd` | delete message: `y` for everyone, `m` only for me |
 | `ga`, `:attach [path]` | attach photos, videos or files (system file picker without a path); `Enter` sends, the text is the caption |
 | `gp` | jump to the pinned message |
+| `ge`, `Ctrl-.` in insert mode, `:emoji`, the 😀 button | emoji panel: `h`/`j`/`k`/`l` move, `Enter` inserts, `Tab`/`[`/`]`/`1`–`0` groups, `/` search by name, `Esc` closes |
 | `yy`, `Y` | copy message text (or chat title) to the clipboard |
 | `p` / `P` | paste the clipboard at the end / start of the message; a copied image or file becomes an attachment |
 | `q` | record a voice message; `q`/`Enter` sends, `Esc` discards |

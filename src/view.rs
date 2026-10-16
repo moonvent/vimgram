@@ -13,6 +13,7 @@ use iced::{Alignment, Color, ContentFit, Element, Length, Size, Theme};
 use iced_video_player::VideoPlayer;
 
 use crate::app::{App, Auth, Chat, Compose, Confirm, Focus, Message, Pane, TALL_ID, VideoPlayback};
+use crate::emoji::{self, Picker};
 use crate::media::Loaded;
 use crate::player;
 use crate::tg::{ChatKind, Media, Msg, Presence, Sender, fmt_duration};
@@ -53,6 +54,19 @@ const PINNED_H: f32 = 11.0 * 1.3 + PINNED_TEXT_H + 13.0;
 /// previous (too tall) message.
 const MIN_PARTIAL: f32 = 40.0;
 const ALBUM_GAP: f32 = 4.0;
+/// Emoji panel: grid cell, the tab bar and search line above the grid,
+/// the name line below it.
+const EMOJI_CELL: f32 = 36.0;
+const EMOJI_PAD: f32 = 8.0;
+const EMOJI_TABS_H: f32 = 34.0;
+const EMOJI_LINE_H: f32 = 22.0;
+pub const EMOJI_W: f32 = EMOJI_CELL * emoji::COLS as f32 + 2.0 * EMOJI_PAD + 1.0;
+
+/// Grid rows that fit next to a message list of this height.
+pub fn emoji_rows(height: f32) -> usize {
+    (((height - EMOJI_TABS_H - 2.0 * EMOJI_LINE_H - 2.0 * EMOJI_PAD) / EMOJI_CELL).floor() as usize).max(1)
+}
+
 /// Date separator above the first message of each day.
 const DAY_H: f32 = 30.0;
 
@@ -66,8 +80,9 @@ fn compose_height(input: &Input, banner: bool) -> f32 {
 }
 
 /// Width and height available to the message list.
-pub fn messages_viewport(size: Size, compose: &Input, banner: bool, pinned: bool) -> (f32, f32) {
-    let width = size.width - FOLDER_W - SIDEBAR_W - 2.0 - 2.0 * MSG_PAD_X - MSG_AVATAR - MSG_AVATAR_GAP;
+pub fn messages_viewport(size: Size, compose: &Input, banner: bool, pinned: bool, emoji: bool) -> (f32, f32) {
+    let panel = if emoji { EMOJI_W } else { 0.0 };
+    let width = size.width - FOLDER_W - SIDEBAR_W - 2.0 - 2.0 * MSG_PAD_X - MSG_AVATAR - MSG_AVATAR_GAP - panel;
     let pinned = if pinned { PINNED_H + 1.0 } else { 0.0 };
     let height = size.height - STATUS_H - HEADER_H - 2.0 - pinned - compose_height(compose, banner);
     (width.max(100.0), height.max(LINE_H))
@@ -554,16 +569,26 @@ fn chat_row<'a>(app: &'a App, chat: &'a Chat, selected: bool, focused: bool) -> 
     .into()
 }
 
+/// Selected row: a tint of the accent color when the pane has focus, a
+/// neutral lift otherwise. The text keeps the theme's own colors, so it
+/// stays readable either way.
 fn selection_style(t: &Theme, selected: bool, focused: bool) -> container::Style {
     if !selected {
         return container::Style::default();
     }
     let p = t.extended_palette();
-    let pair = if focused { p.primary.weak } else { p.background.weak };
-    container::Style {
-        background: Some(pair.color.into()),
-        text_color: Some(pair.text),
-        ..Default::default()
+    if focused {
+        container::Style {
+            background: Some(p.primary.base.color.scale_alpha(0.22).into()),
+            border: iced::border::rounded(6).width(1).color(p.primary.base.color.scale_alpha(0.5)),
+            ..Default::default()
+        }
+    } else {
+        container::Style {
+            background: Some(p.background.weak.color.scale_alpha(0.7).into()),
+            border: iced::border::rounded(6),
+            ..Default::default()
+        }
     }
 }
 
@@ -692,7 +717,16 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
     if let Some(pinned) = &open.pinned {
         pane = pane.push(pinned_bar(pinned)).push(rule::horizontal(1));
     }
-    pane.push(mouse_area(messages).on_scroll(|delta| Message::Scroll(Pane::Messages, delta)))
+    let messages: Element<_> = mouse_area(messages)
+        .on_scroll(|delta| Message::Scroll(Pane::Messages, delta))
+        .into();
+    let messages: Element<_> = match &app.emoji {
+        Some(picker) => row![messages, rule::vertical(1), emoji_panel(app, picker)]
+            .height(Length::Fill)
+            .into(),
+        None => messages,
+    };
+    pane.push(messages)
         .push(rule::horizontal(1))
         .push(compose(app))
         .width(Length::Fill)
@@ -709,6 +743,92 @@ fn starts_run(msgs: &[Msg], i: usize) -> bool {
         }
         None => true,
     }
+}
+
+fn emoji_panel<'a>(app: &'a App, picker: &'a Picker) -> Element<'a, Message> {
+    let tabs = Row::with_children(emoji::TABS.iter().enumerate().map(|(i, (icon, _))| {
+        let active = i == picker.tab && picker.query.is_empty();
+        mouse_area(
+            container(text(*icon).size(17))
+                .width(EMOJI_CELL * emoji::COLS as f32 / emoji::TABS.len() as f32)
+                .height(EMOJI_TABS_H - 4.0)
+                .align_x(Alignment::Center)
+                .align_y(Alignment::Center)
+                .style(move |t: &Theme| selection_style(t, active, true)),
+        )
+        .on_press(Message::EmojiTab(i))
+        .interaction(Interaction::Pointer)
+        .into()
+    }));
+
+    let search = if picker.searching {
+        format!("/{}▏", picker.query)
+    } else if !picker.query.is_empty() {
+        format!("/{}   Esc — close", picker.query)
+    } else {
+        "/ search   Tab groups   Enter insert".to_owned()
+    };
+
+    let items = picker.items(&app.recent_emoji);
+    let (_, height) = app.viewport();
+    let rows = emoji_rows(height);
+    let grid: Element<_> = if items.is_empty() {
+        text(if picker.query.is_empty() { "Nothing here yet" } else { "No emoji found" })
+            .size(13)
+            .style(muted_text)
+            .into()
+    } else {
+        Column::with_children(
+            items
+                .chunks(emoji::COLS)
+                .enumerate()
+                .skip(picker.top)
+                .take(rows)
+                .map(|(row_i, chunk)| {
+                    Row::with_children(chunk.iter().enumerate().map(|(col, e)| {
+                        let selected = row_i * emoji::COLS + col == picker.cursor;
+                        mouse_area(
+                            container(text(*e).size(22))
+                                .width(EMOJI_CELL)
+                                .height(EMOJI_CELL)
+                                .align_x(Alignment::Center)
+                                .align_y(Alignment::Center)
+                                .style(move |t: &Theme| selection_style(t, selected, true)),
+                        )
+                        .on_press(Message::EmojiPick(e))
+                        .interaction(Interaction::Pointer)
+                        .into()
+                    }))
+                    .into()
+                }),
+        )
+        .into()
+    };
+    let name = items.get(picker.cursor).map_or("", |e| emoji::name(e));
+
+    mouse_area(
+        container(
+            column![
+                tabs,
+                container(text(search).size(12).style(muted_text).wrapping(Wrapping::None))
+                    .height(EMOJI_LINE_H)
+                    .align_y(Alignment::Center)
+                    .clip(true),
+                container(grid).height(Length::Fill),
+                container(text(name).size(12).style(muted_text).wrapping(Wrapping::None))
+                    .height(EMOJI_LINE_H)
+                    .align_y(Alignment::Center)
+                    .clip(true),
+            ]
+            .spacing(0),
+        )
+        .width(EMOJI_W - 1.0)
+        .height(Length::Fill)
+        .padding(EMOJI_PAD)
+        .clip(true),
+    )
+    .on_scroll(|delta| Message::Scroll(Pane::Emoji, delta))
+    .into()
 }
 
 fn pinned_bar(pinned: &Msg) -> Element<'_, Message> {
@@ -1084,7 +1204,10 @@ fn compose_banner(app: &App) -> Option<Element<'_, Message>> {
     Some(
         row![
             text(label).size(12).wrapping(Wrapping::None).style(primary_text).width(Length::Fill),
-            text("Esc Esc — cancel").size(12).style(muted_text),
+            // From Insert mode the first Esc only leaves it.
+            text(if app.mode == Mode::Insert { "Esc ×2 — cancel" } else { "Esc — cancel" })
+                .size(12)
+                .style(muted_text),
         ]
         .height(BANNER_H)
         .align_y(Alignment::Center)
@@ -1099,7 +1222,7 @@ pub fn has_banner(app: &App) -> bool {
 fn compose(app: &App) -> Element<'_, Message> {
     let editing = app.mode == Mode::Insert;
     let content = if app.input.is_empty() && !editing {
-        text("i — write a message   q — record voice   ga — attach file")
+        text("i — write a message   q — record voice   ga — attach file   ge — emoji")
             .size(TEXT)
             .style(muted_text)
             .into()
@@ -1111,7 +1234,15 @@ fn compose(app: &App) -> Element<'_, Message> {
         body = body.push(banner);
     }
     body = body.push(content);
-    container(body)
+    let open = app.emoji.is_some();
+    let button = mouse_area(
+        container(text("😀").size(18))
+            .padding([2, 6])
+            .style(move |t: &Theme| selection_style(t, open, true)),
+    )
+    .on_press(Message::ToggleEmoji)
+    .interaction(Interaction::Pointer);
+    container(row![body, button].spacing(8).align_y(Alignment::End))
         .padding([10.0, MSG_PAD_X])
         .width(Length::Fill)
         .max_height(compose_height(&app.input, has_banner(app)))

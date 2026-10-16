@@ -3,6 +3,7 @@ mod archive;
 mod autostart;
 mod clipboard;
 mod config;
+mod emoji;
 mod export;
 mod fonts;
 mod icon;
