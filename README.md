@@ -182,13 +182,11 @@ build without checking for changes.
 
 ## Releases
 
-Pushes to `main` and pull requests are built on Linux and Windows and tested on Linux.
-Tagging a commit `vX.Y.Z` and pushing the tag publishes a GitHub release with
-the Windows zip:
-
-```sh
-git tag v0.1.0 && git push origin v0.1.0
-```
+Pushes to `main` and pull requests are built on Linux, Windows and macOS and
+tested on Linux and macOS. A push to `main` that raises `version` in
+`Cargo.toml` publishes a release once the build passes: tag `vX.Y.Z` and the
+Windows zip on [Releases](../../releases). Pushing a `vX.Y.Z` tag by hand
+does the same.
 
 ## License
 
