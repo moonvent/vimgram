@@ -101,6 +101,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `Space` | play / pause voice message or video |
 | `gv`, click on the player bar | back to the voice message playing in another chat (the bar above the chat shows it; ✕ stops) |
 | `]` `+` / `[` `-` / `=` | speed up / down (0.25x–5x) / reset to 1x; voice messages, videos and round videos each remember their own speed |
+| `}` / `{`, `:volume 70` | volume up / down by 10% (or set it); one volume for videos and voice messages, remembered |
 | `H` / `L` | seek voice message −5s / +5s |
 | `Esc`, `Ctrl-[` | normal mode; cancel reply, edit, forward, filter, attachment; with nothing to cancel asks to quit (`y`/`Enter`) |
 | `/` | chat list: filter chats; message pane: search messages (`/#tag`: only the messages with that hashtag, like clicking it) |
@@ -127,7 +128,7 @@ When a voice or round video message ends and the very next message is one too, i
 next (voice messages also from another chat; round videos while their chat is open).
 
 Photo/video viewer: `j`/`k` next/previous, `h`/`l` seek ±5s, `H`/`L` ±30s, `Space` pause,
-`[` `]` `=` speed, `Esc` close.
+`[` `]` `=` speed, `{` `}` volume, `Esc` close.
 
 Mouse: click folders, chats, messages and media; the wheel moves the cursor.
 

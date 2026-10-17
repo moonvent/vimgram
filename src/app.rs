@@ -54,7 +54,7 @@ pub const SPOILER_LINK: &str = "spoiler:";
 
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes  J/K gt/gT Alt-N folders  \
                     Enter open/play  i insert  q record  r reply  R react  cc/e edit  f forward  v visual  dd delete  \
-                    yy/Y copy  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  H/L seek  \
+                    yy/Y copy  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  { } volume  H/L seek  \
                     / filter chats or search messages  n/N next/prev match  ga attach  gp pinned  gf original/reply  gx link  ^o back  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
                     :folder  :theme  :autostart  :cleancache  :q";
@@ -524,6 +524,8 @@ pub struct App {
     pub voice: Option<VoicePlayback>,
     /// Playback speed per kind of media, remembered across restarts.
     speeds: Speeds,
+    /// Of videos and voice messages, 0.0–1.0.
+    volume: f64,
     pub media: Store,
     /// Time base for animations: frame = (now - clock) / frame time.
     pub clock: Instant,
@@ -644,6 +646,7 @@ impl App {
             video: None,
             voice: None,
             speeds: Speeds::load(),
+            volume: player::load_volume(),
             media: Store::default(),
             clock: Instant::now(),
             now: Instant::now(),
@@ -2387,7 +2390,7 @@ impl App {
             }
         };
         if let Some(voice) = self.voice.as_mut().filter(|v| v.file_id == file_id) {
-            match Audio::open(&path, self.speeds.get(SpeedKind::Voice)) {
+            match Audio::open(&path, self.speeds.get(SpeedKind::Voice), self.volume) {
                 Ok(audio) => voice.audio = Some(audio),
                 Err(e) => {
                     self.voice = None;
@@ -2466,10 +2469,10 @@ impl App {
                     movie: None,
                     speed_pending: false,
                 });
-                let speed = self.speeds.get(kind);
+                let (speed, volume) = (self.speeds.get(kind), self.volume);
                 Task::perform(
                     async move {
-                        tokio::task::spawn_blocking(move || player::open_video(file_id, speed).map(Shared::new))
+                        tokio::task::spawn_blocking(move || player::open_video(file_id, speed, volume).map(Shared::new))
                             .await
                             .map_err(|e| e.to_string())?
                     },
@@ -2663,6 +2666,19 @@ impl App {
     /// Speed of what plays now (or of voice messages).
     pub fn speed(&self) -> f64 {
         self.speeds.get(self.speed_kind())
+    }
+
+    /// One volume for videos and voice messages, kept across restarts.
+    fn set_volume(&mut self, volume: f64) {
+        self.volume = volume;
+        player::save_volume(volume);
+        if let Some(movie) = self.video.as_mut().and_then(VideoPlayback::movie_mut) {
+            movie.set_volume(volume);
+        }
+        if let Some(audio) = self.voice.as_ref().and_then(|v| v.audio.as_ref()) {
+            audio.set_volume(volume);
+        }
+        self.info(format!("Volume {}", player::fmt_volume(volume)));
     }
 
     fn set_speed(&mut self, speed: f64) {
@@ -2923,6 +2939,14 @@ impl App {
             }
             NKey::Char('=') => {
                 self.set_speed(1.0);
+                None
+            }
+            NKey::Char('}') => {
+                self.set_volume(player::louder(self.volume));
+                None
+            }
+            NKey::Char('{') => {
+                self.set_volume(player::quieter(self.volume));
                 None
             }
             NKey::Esc | NKey::Enter | NKey::Char('q' | 'o') => {
@@ -3243,6 +3267,11 @@ impl App {
                 Ok(speed) if (0.25..=5.0).contains(&speed) => self.set_speed(speed),
                 _ => self.error("Speed must be between 0.25 and 5"),
             },
+            ("volume", Some(value)) => match value.trim_end_matches('%').parse::<f64>() {
+                Ok(percent) if (0.0..=100.0).contains(&percent) => self.set_volume(percent / 100.0),
+                _ => self.error("Volume must be between 0 and 100"),
+            },
+            ("volume", None) => self.info(format!("Volume {}", player::fmt_volume(self.volume))),
             (n, None) if n.parse::<usize>().is_ok() => {
                 let line = n.parse::<usize>().unwrap_or(1).max(1) - 1;
                 return self.jump(line);
@@ -3464,6 +3493,14 @@ impl App {
             }
             Action::NormalSpeed => {
                 self.set_speed(1.0);
+                Task::none()
+            }
+            Action::Louder => {
+                self.set_volume(player::louder(self.volume));
+                Task::none()
+            }
+            Action::Quieter => {
+                self.set_volume(player::quieter(self.volume));
                 Task::none()
             }
             Action::SeekBack => {

@@ -26,6 +26,40 @@ pub fn fmt_speed(speed: f64) -> String {
     format!("{}x", (speed * 100.0).round() / 100.0)
 }
 
+/// Volume of videos and voice messages, 0.0–1.0, in steps of 10%.
+pub fn louder(volume: f64) -> f64 {
+    ((volume * 10.0).round() + 1.0).min(10.0) / 10.0
+}
+
+pub fn quieter(volume: f64) -> f64 {
+    ((volume * 10.0).round() - 1.0).max(0.0) / 10.0
+}
+
+pub fn fmt_volume(volume: f64) -> String {
+    format!("{}%", (volume * 100.0).round())
+}
+
+fn volume_path() -> std::path::PathBuf {
+    crate::config::dirs().data_dir().join("volume")
+}
+
+/// The volume last set, in percent on disk; full when never set.
+pub fn load_volume() -> f64 {
+    std::fs::read_to_string(volume_path())
+        .ok()
+        .and_then(|t| t.trim().parse::<f64>().ok())
+        .filter(|v| (0.0..=100.0).contains(v))
+        .map_or(1.0, |v| v / 100.0)
+}
+
+pub fn save_volume(volume: f64) {
+    let path = volume_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, format!("{}\n", (volume * 100.0).round()));
+}
+
 /// Media kinds that remember their own playback speed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpeedKind {
@@ -121,6 +155,10 @@ pub struct Movie {
 }
 
 impl Movie {
+    pub fn set_volume(&mut self, volume: f64) {
+        self.video.set_volume(volume);
+    }
+
     /// Jump to `to`, keeping the speed.
     pub fn seek(&mut self, to: Duration) -> Result<(), String> {
         self.seek_at(to, self.speed, gst::SeekFlags::empty())
@@ -156,28 +194,28 @@ impl Movie {
 
 /// A video with sound for the full-screen viewer, streamed while it
 /// downloads. Blocks until playback can start, so call it off the UI thread.
-pub fn open_video(file_id: i32, speed: f64) -> Result<Movie, String> {
+pub fn open_video(file_id: i32, speed: f64, volume: f64) -> Result<Movie, String> {
     gst::init().map_err(|e| e.to_string())?;
     let size = match block_on(tg::file_source(file_id))? {
-        tg::FileSource::Local(path) => return build(uri(&path)?.as_str(), None, speed),
+        tg::FileSource::Local(path) => return build(uri(&path)?.as_str(), None, speed, volume),
         tg::FileSource::Remote(size) => size,
     };
     if size > 0 {
         stream::wait_for_start(file_id)?;
-        return open_stream(Arc::new(stream::Telegram(file_id)), size, speed);
+        return open_stream(Arc::new(stream::Telegram(file_id)), size, speed, volume);
     }
     // Without a known size the appsrc cannot seek; download the whole file.
     let path = block_on(tg::download(file_id, 32))?;
-    build(uri(&path)?.as_str(), None, speed)
+    build(uri(&path)?.as_str(), None, speed, volume)
 }
 
 /// Play `size` bytes of video from `source`.
-pub fn open_stream(source: Arc<dyn stream::Source>, size: u64, speed: f64) -> Result<Movie, String> {
-    build(stream::URI, Some((source, size)), speed)
+pub fn open_stream(source: Arc<dyn stream::Source>, size: u64, speed: f64, volume: f64) -> Result<Movie, String> {
+    build(stream::URI, Some((source, size)), speed, volume)
 }
 
 /// Same pipeline as `Video::new`, plus a pitch-preserving audio filter.
-fn build(uri: &str, source: Option<(Arc<dyn stream::Source>, u64)>, speed: f64) -> Result<Movie, String> {
+fn build(uri: &str, source: Option<(Arc<dyn stream::Source>, u64)>, speed: f64, volume: f64) -> Result<Movie, String> {
     gst::init().map_err(|e| e.to_string())?;
     let description = format!(
         "playbin uri=\"{uri}\" video-sink=\"videoscale ! videoconvert ! appsink name=iced_video \
@@ -188,6 +226,8 @@ fn build(uri: &str, source: Option<(Arc<dyn stream::Source>, u64)>, speed: f64) 
         .downcast::<gst::Pipeline>()
         .map_err(|_| "video: not a pipeline".to_string())?;
     pipeline.set_property("audio-filter", scaletempo()?);
+    // Before it starts playing, so it never starts loud.
+    pipeline.set_property("volume", volume);
     let stream = source.map(|(source, size)| stream::attach(pipeline.upcast_ref(), source, size));
 
     let sink_bin: gst::Element = pipeline.property("video-sink");
@@ -220,11 +260,12 @@ pub struct Audio {
 }
 
 impl Audio {
-    pub fn open(path: &str, speed: f64) -> Result<Self, String> {
+    pub fn open(path: &str, speed: f64, volume: f64) -> Result<Self, String> {
         gst::init().map_err(|e| e.to_string())?;
         let playbin = gst::ElementFactory::make("playbin")
             .property("uri", uri(path)?.as_str())
             .property("audio-filter", scaletempo()?)
+            .property("volume", volume)
             .build()
             .map_err(|e| e.to_string())?;
         let pipeline = playbin
@@ -294,6 +335,10 @@ impl Audio {
                 gst::ClockTime::NONE,
             )
             .map_err(|e| e.to_string())
+    }
+
+    pub fn set_volume(&self, volume: f64) {
+        self.pipeline.set_property("volume", volume);
     }
 
     pub fn seek_by(&mut self, delta: f64) {
@@ -507,7 +552,7 @@ mod tests {
         };
         let size = std::fs::metadata(&path).unwrap().len();
         // Opening at another speed froze streamed videos on their first frame.
-        let mut movie = open_stream(Arc::new(stream::tests::FileSource(path)), size, 1.5).unwrap();
+        let mut movie = open_stream(Arc::new(stream::tests::FileSource(path)), size, 1.5, 1.0).unwrap();
         assert_eq!(movie.video.size(), (320, 240));
         assert!(movie.video.duration() > Duration::from_secs(2), "{:?}", movie.video.duration());
         assert!(frames_within(&movie, Duration::from_millis(400)) > 3);
@@ -531,7 +576,7 @@ mod tests {
         let Some(path) = stream::tests::sample_mp4() else {
             return;
         };
-        let mut audio = Audio::open(path.to_str().unwrap(), 2.0).unwrap();
+        let mut audio = Audio::open(path.to_str().unwrap(), 2.0, 0.5).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while audio.duration().is_none() && std::time::Instant::now() < deadline {
             audio.poll().unwrap();

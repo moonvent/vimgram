@@ -124,6 +124,8 @@ pub enum Action {
     Faster,
     Slower,
     NormalSpeed,
+    Louder,
+    Quieter,
     SeekBack,
     SeekForward,
     Reply,
@@ -224,6 +226,8 @@ impl Pending {
             (None, NKey::Char(']' | '+')) => Some(Action::Faster),
             (None, NKey::Char('[' | '-')) => Some(Action::Slower),
             (None, NKey::Char('=')) => Some(Action::NormalSpeed),
+            (None, NKey::Char('}')) => Some(Action::Louder),
+            (None, NKey::Char('{')) => Some(Action::Quieter),
             (None, NKey::Char('H')) => Some(Action::SeekBack),
             (None, NKey::Char('L')) => Some(Action::SeekForward),
             (None, NKey::Char('r')) => Some(Action::Reply),
@@ -450,6 +454,7 @@ mod tests {
         assert_eq!(p.feed(NKey::Ctrl('h')), Some(Action::FocusChats));
         assert_eq!(p.feed(NKey::Ctrl('l')), Some(Action::FocusMessages));
         assert_eq!(feed("][="), vec![Action::Faster, Action::Slower, Action::NormalSpeed]);
+        assert_eq!(feed("}{"), vec![Action::Louder, Action::Quieter]);
     }
 
     #[test]
