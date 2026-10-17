@@ -1053,6 +1053,23 @@ impl Media {
     }
 }
 
+/// A number with its thousands apart: 1234567 → "1_234_567".
+pub fn fmt_count(n: impl std::fmt::Display) -> String {
+    let text = n.to_string();
+    let (sign, digits) = text.strip_prefix('-').map_or(("", text.as_str()), |d| ("-", d));
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return text;
+    }
+    let mut out = String::from(sign);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push('_');
+        }
+        out.push(c);
+    }
+    out
+}
+
 pub fn fmt_duration(secs: i32) -> String {
     let secs = secs.max(0);
     if secs >= 3600 {
@@ -1813,6 +1830,16 @@ mod tests {
         assert_eq!(content_text(&MessageContent::MessageScreenshotTaken, false), "took a screenshot");
         let other = MessageContent::MessageChatSetMessageAutoDeleteTime(Default::default());
         assert_eq!(content_text(&other, false), "[chat set message auto delete time]");
+    }
+
+    #[test]
+    fn counts_group_thousands() {
+        assert_eq!(fmt_count(7), "7");
+        assert_eq!(fmt_count(999), "999");
+        assert_eq!(fmt_count(1000), "1_000");
+        assert_eq!(fmt_count(100000), "100_000");
+        assert_eq!(fmt_count(1234567usize), "1_234_567");
+        assert_eq!(fmt_count(-12345), "-12_345");
     }
 
     #[test]

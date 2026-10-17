@@ -62,7 +62,7 @@ pub fn html(title: &str, msgs: &[Msg], names: &HashMap<Sender, String>) -> Strin
     out.push_str(&format!(
         "<h1>{}</h1><div class=\"meta\">{} messages, exported {}</div>",
         escape(title),
-        msgs.len(),
+        crate::tg::fmt_count(msgs.len()),
         Local::now().format("%d.%m.%Y %H:%M")
     ));
     for m in msgs {

@@ -1226,7 +1226,9 @@ impl App {
             }
             Message::Exported(result) => {
                 match result {
-                    Ok((path, count)) => self.info(format!("Exported {count} messages to {}", path.display())),
+                    Ok((path, count)) => {
+                        self.info(format!("Exported {} messages to {}", tg::fmt_count(count), path.display()))
+                    }
                     Err(e) => self.error(format!("Export failed: {e}")),
                 }
                 Task::none()
@@ -2389,7 +2391,7 @@ impl App {
         self.mode = Mode::Normal;
         self.info(match paths.len() {
             1 => "Sending the file…".to_owned(),
-            n => format!("Sending {n} files…"),
+            n => format!("Sending {} files…", tg::fmt_count(n)),
         });
         Task::perform(tg::send_files(chat_id, paths, caption, options), Message::Done)
     }
@@ -3656,7 +3658,7 @@ impl App {
                     Some(chat) if !ids.is_empty() => {
                         let what = match self.visual_len() {
                             0 | 1 => "the message".to_owned(),
-                            n => format!("{n} messages"),
+                            n => format!("{} messages", tg::fmt_count(n)),
                         };
                         self.visual = None;
                         self.end_forward();
@@ -3685,7 +3687,7 @@ impl App {
                             self.info(match n {
                                 0 => "No chats marked: Enter sends to the one under the cursor".to_owned(),
                                 1 => "1 chat marked: Enter sends there, v marks more".to_owned(),
-                                n => format!("{n} chats marked: Enter sends to all of them"),
+                                n => format!("{} chats marked: Enter sends to all of them", tg::fmt_count(n)),
                             });
                         }
                     }
@@ -3817,7 +3819,7 @@ impl App {
         self.mode = Mode::Normal;
         self.info(match to.as_slice() {
             [one] => format!("Forwarded to {}", self.chats.get(one).map_or("chat", |c| c.title.as_str())),
-            many => format!("Forwarded to {} chats", many.len()),
+            many => format!("Forwarded to {} chats", tg::fmt_count(many.len())),
         });
         let options = SendOptions { reply_to: None, ..options };
         Task::batch(to.into_iter().map(|chat| {

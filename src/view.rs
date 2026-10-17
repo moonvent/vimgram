@@ -17,7 +17,7 @@ use crate::emoji::{self, Picker};
 use crate::fonts::{self, EMOJI};
 use crate::media::Loaded;
 use crate::player::{self, SpeedKind};
-use crate::tg::{ChatKind, Media, Membership, Msg, Presence, Preview, Sender, Style, fmt_duration};
+use crate::tg::{ChatKind, Media, Membership, Msg, Presence, Preview, Sender, Style, fmt_count, fmt_duration};
 use crate::vim::{Input, Mode};
 
 pub const FOLDER_W: f32 = 76.0;
@@ -652,9 +652,9 @@ fn chat_list(app: &App) -> Element<'_, Message> {
     let title = if app.forward.is_some() {
         "Forward to… (Enter, i — comment, Esc)".to_owned()
     } else if app.filter.is_empty() {
-        format!("{folder}  {}", app.list.len())
+        format!("{folder}  {}", fmt_count(app.list.len()))
     } else {
-        format!("{folder} /{}  {}", app.filter, app.list.len())
+        format!("{folder} /{}  {}", app.filter, fmt_count(app.list.len()))
     };
     let forwarding = app.forward.is_some();
     let header = container(text(title).size(13).style(move |t: &Theme| {
@@ -772,7 +772,7 @@ fn chat_row<'a>(app: &'a App, chat: &'a Chat, selected: bool, focused: bool) -> 
     ]
     .spacing(8);
     if chat.unread > 0 {
-        preview_line = preview_line.push(badge(chat.unread));
+        preview_line = preview_line.push(badge(fmt_count(chat.unread)));
     }
 
     mouse_area(
@@ -917,7 +917,7 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
         details.push(format!("only {tag} — Esc for all"));
     }
     if let Some(total) = open.total {
-        details.push(format!("{total} messages"));
+        details.push(format!("{} messages", fmt_count(total)));
     }
     if !open.at_latest {
         details.push("viewing history — G for latest".into());
@@ -1460,7 +1460,7 @@ fn reply_quote<'a>(app: &'a App, reply_to: i64) -> Element<'a, Message> {
 /// Keys that act on the message under the cursor, shown on its header.
 fn message_keys(app: &App, m: &Msg) -> String {
     if app.visual.is_some() {
-        return format!("{} selected  f forward  y copy  d delete  Esc cancel", app.visual_len());
+        return format!("{} selected  f forward  y copy  d delete  Esc cancel", fmt_count(app.visual_len()));
     }
     let channel = app.chats.get(&m.chat_id).is_some_and(|c| c.kind == ChatKind::Channel);
     let mut keys = Vec::new();
@@ -1653,7 +1653,7 @@ fn reactions_row(m: &Msg) -> Element<'_, Message> {
         let chosen = r.chosen;
         mouse_area(
             container(
-                row![text(r.kind.label()).size(14).font(EMOJI), text(r.count).size(12)]
+                row![text(r.kind.label()).size(14).font(EMOJI), text(fmt_count(r.count)).size(12)]
                     .spacing(4)
                     .align_y(Alignment::Center),
             )
@@ -1765,7 +1765,7 @@ fn attachments_label(paths: &[std::path::PathBuf]) -> String {
         .collect();
     match names.len() {
         1 => format!("📎 {}", names[0]),
-        n => format!("📎 {n} files: {}", names.join(", ")),
+        n => format!("📎 {} files: {}", fmt_count(n), names.join(", ")),
     }
 }
 
@@ -2034,11 +2034,11 @@ fn status_line(app: &App) -> Element<'_, Message> {
 
     let position = match (&app.open, app.focus) {
         (Some(open), Focus::Messages) if !open.msgs.is_empty() => {
-            format!("{}/{}", open.cursor + 1, open.msgs.len())
+            format!("{}/{}", fmt_count(open.cursor + 1), fmt_count(open.msgs.len()))
         }
         _ => app
             .selected_index()
-            .map(|i| format!("{}/{}", i + 1, app.list.len()))
+            .map(|i| format!("{}/{}", fmt_count(i + 1), fmt_count(app.list.len())))
             .unwrap_or_default(),
     };
 

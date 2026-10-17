@@ -64,7 +64,7 @@ mod imp {
             let description = match self.unread {
                 0 => "No unread chats".into(),
                 1 => "1 unread chat".into(),
-                n => format!("{n} unread chats"),
+                n => format!("{} unread chats", crate::tg::fmt_count(n)),
             };
             ksni::ToolTip {
                 title: "vimgram".into(),
