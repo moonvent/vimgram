@@ -156,13 +156,25 @@ pub async fn download(file_id: i32, priority: i32) -> Res<String> {
     }
 }
 
-/// File size in bytes, exact or expected; 0 when unknown.
-pub async fn file_size(file_id: i32) -> Res<u64> {
+/// Where a file can be read from.
+pub enum FileSource {
+    /// Complete on disk: read it directly. Files TDLib didn't download
+    /// itself (videos you sent) live outside its cache, and `read_file_part`
+    /// refuses them.
+    Local(String),
+    /// Being downloaded: its size in bytes, exact or expected; 0 when unknown.
+    Remote(u64),
+}
+
+pub async fn file_source(file_id: i32) -> Res<FileSource> {
     if file_id < 0 {
-        return Ok(0); // local: played straight from the file
+        return download(file_id, 0).await.map(FileSource::Local);
     }
     let enums::File::File(file) = functions::get_file(file_id, client()).await.map_err(err)?;
-    Ok(file.size.max(file.expected_size).max(0) as u64)
+    if file.local.is_downloading_completed && std::path::Path::new(&file.local.path).is_file() {
+        return Ok(FileSource::Local(file.local.path));
+    }
+    Ok(FileSource::Remote(file.size.max(file.expected_size).max(0) as u64))
 }
 
 /// Bytes already downloaded starting at `offset`.

@@ -123,7 +123,10 @@ pub struct Movie {
 /// downloads. Blocks until playback can start, so call it off the UI thread.
 pub fn open_video(file_id: i32, speed: f64) -> Result<Movie, String> {
     gst::init().map_err(|e| e.to_string())?;
-    let size = block_on(tg::file_size(file_id))?;
+    let size = match block_on(tg::file_source(file_id))? {
+        tg::FileSource::Local(path) => return build(uri(&path)?.as_str(), None, speed),
+        tg::FileSource::Remote(size) => size,
+    };
     if size > 0 {
         stream::wait_for_start(file_id)?;
         return open_stream(Arc::new(stream::Telegram(file_id)), size, speed);
