@@ -1581,21 +1581,52 @@ impl App {
         if msg.scheduled {
             return Task::none();
         }
-        // While looking at old history, new messages load when scrolling down.
-        let Some(open) = self.open.as_mut().filter(|o| o.id == msg.chat_id && o.at_latest) else {
+        let (width, height) = self.viewport();
+        let Some(open) = self.open.as_mut().filter(|o| o.id == msg.chat_id) else {
             return Task::none();
         };
+        let (chat_id, id, incoming) = (msg.chat_id, msg.id, !msg.outgoing);
+        // Still pending: sent from here, not from another device.
+        let sent_here = msg.sending;
+        if !open.at_latest {
+            // Sending from old history goes back to the newest messages, like
+            // other clients; other messages load when scrolling down.
+            return if sent_here { self.to_latest() } else { Task::none() };
+        }
         if let Some(total) = open.total.as_mut() {
             *total += 1;
         }
-        let (chat_id, id, incoming) = (msg.chat_id, msg.id, !msg.outgoing);
-        let follow = open.msgs.is_empty() || open.at_end();
+        let cursor_at_end = open.msgs.is_empty() || open.at_end();
+        let bottom_shown = open.bottom + 1 >= open.msgs.len();
         open.edit(|msgs| msgs.push(msg));
-        if follow {
-            open.cursor = open.msgs.len() - 1;
-            open.bottom = open.cursor;
+        let last = open.msgs.len() - 1;
+        if cursor_at_end || sent_here {
+            open.cursor = last;
+            open.bottom = last;
+            self.reset_tall();
+        } else if bottom_shown {
+            // The newest message was on screen: keep it there, and the cursor
+            // with it if it would scroll away.
+            open.bottom = last;
+            open.cursor = open.cursor.max(view::top_for_bottom(&open.msgs, last, width, height));
         }
         if incoming { self.view_messages(chat_id, vec![id]) } else { Task::none() }
+    }
+
+    /// Back to the newest messages: from old history by reloading them.
+    fn to_latest(&mut self) -> Task<Message> {
+        let Some(open) = self.open.as_mut() else {
+            return Task::none();
+        };
+        self.focus = Focus::Messages;
+        if !open.at_latest {
+            open.msgs.clear();
+            open.at_latest = true;
+            open.exhausted = false;
+            open.loading = false;
+            return self.load_history(false);
+        }
+        self.jump(usize::MAX)
     }
 
     /// The user can see the window (focused; not minimized, on another
@@ -3038,17 +3069,8 @@ impl App {
             Action::Down(n) => self.step(n as isize),
             Action::Up(n) => self.step(-(n as isize)),
             Action::Top => self.jump(0),
-            Action::Bottom => match self.open.as_mut() {
-                // Back from the past: reload the newest messages.
-                Some(open) if self.focus == Focus::Messages && !open.at_latest => {
-                    open.msgs.clear();
-                    open.at_latest = true;
-                    open.exhausted = false;
-                    open.loading = false;
-                    self.load_history(false)
-                }
-                _ => self.jump(usize::MAX),
-            },
+            Action::Bottom if self.focus == Focus::Messages => self.to_latest(),
+            Action::Bottom => self.jump(usize::MAX),
             Action::HalfDown => self.step(self.half_page() as isize),
             Action::HalfUp => self.step(-(self.half_page() as isize)),
             Action::NextFolder => self.cycle_folder(1),
