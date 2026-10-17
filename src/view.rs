@@ -813,6 +813,9 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
     if let Some(presence) = app.presence(open.id).map(fmt_presence).filter(|p| !p.is_empty()) {
         details.push(presence);
     }
+    if let Some(tag) = &open.tag {
+        details.push(format!("only {tag} — Esc for all"));
+    }
     if let Some(total) = open.total {
         details.push(format!("{total} messages"));
     }

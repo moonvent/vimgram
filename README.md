@@ -92,7 +92,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `ga`, `:attach [path]` | attach photos, videos or files (system file picker without a path); `Enter` sends, the text is the caption |
 | `gp` | jump to the pinned message |
 | `gf`, click on the reply quote or "Forwarded from" | go to the original of a forwarded message (channel posts and Saved Messages say where it is; otherwise its author's chat), or to the message replied to |
-| `gx`, `2gx`, click on a link | open the (n-th) link of the message: t.me links and @mentions open here, at the post; web and e-mail links in the browser |
+| `gx`, `2gx`, click on a link | open the (n-th) link of the message: t.me links and @mentions open here, at the post; web and e-mail links in the browser; a #hashtag shows only the chat's messages with it (`Esc` shows all again, at the message under the cursor) |
 | `Ctrl-o` | back to where `gf` or a t.me link came from |
 | `ge`, `Ctrl-.` in insert mode, `:emoji`, the 😀 button | emoji panel: `h`/`j`/`k`/`l` move, `Enter` inserts, `Tab`/`[`/`]`/`1`–`0` groups, `/` search by name, `Esc` closes |
 | `yy`, `Y` | copy message text (or chat title) to the clipboard |
@@ -103,7 +103,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `]` `+` / `[` `-` / `=` | speed up / down (0.25x–5x) / reset to 1x; voice messages, videos and round videos each remember their own speed |
 | `H` / `L` | seek voice message −5s / +5s |
 | `Esc`, `Ctrl-[` | normal mode; cancel reply, edit, forward, filter, attachment; with nothing to cancel asks to quit (`y`/`Enter`) |
-| `/` | chat list: filter chats; message pane: search messages |
+| `/` | chat list: filter chats; message pane: search messages (`/#tag`: only the messages with that hashtag, like clicking it) |
 | `n` / `N` | next (older) / previous (newer) search match |
 | `G`, the ↓ button | back to the latest messages (also after a search or date jump) |
 | `:q` | quit |

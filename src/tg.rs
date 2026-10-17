@@ -274,6 +274,26 @@ pub async fn search(chat_id: i64, query: String) -> Res<(Vec<i64>, i32)> {
     Ok((found.messages.iter().map(|m| m.id).collect(), found.total_count))
 }
 
+/// Messages with hashtag `tag` older than `from_id` (0: the newest ones),
+/// oldest first.
+pub async fn tagged(chat_id: i64, tag: String, from_id: i64, limit: i32) -> Res<Vec<Msg>> {
+    let enums::FoundChatMessages::FoundChatMessages(found) =
+        functions::search_chat_messages(chat_id, None, tag, None, from_id, 0, limit, None, client())
+            .await
+            .map_err(err)?;
+    let mut msgs: Vec<Msg> = found.messages.into_iter().filter(|m| m.id != from_id).map(Msg::from).collect();
+    msgs.reverse();
+    Ok(msgs)
+}
+
+/// `text` has hashtag `tag` (with its `#`), in any case, not as the start
+/// of a longer one.
+pub fn has_hashtag(text: &str, tag: &str) -> bool {
+    let (text, tag) = (text.to_lowercase(), tag.to_lowercase());
+    text.match_indices(&tag)
+        .any(|(i, _)| text[i + tag.len()..].chars().next().is_none_or(|c| !(c.is_alphanumeric() || c == '_')))
+}
+
 /// Total number of messages in a chat (an empty search counts everything).
 pub async fn message_count(chat_id: i64) -> Res<i32> {
     search(chat_id, String::new()).await.map(|(_, total)| total)
@@ -1014,6 +1034,8 @@ pub fn links(text: &types::FormattedText) -> Vec<Link> {
                 T::TextUrl(t) => t.url.clone(),
                 T::EmailAddress => format!("mailto:{shown}"),
                 T::Mention => format!("https://t.me/{}", shown.trim_start_matches('@')),
+                // Not a URL: opening it shows the chat's messages with it.
+                T::Hashtag => shown.to_owned(),
                 _ => return None,
             };
             Some(Link { start, end, url })
@@ -1579,5 +1601,24 @@ mod tests {
                 ("this", "https://a.b/c"),
             ]
         );
+    }
+
+    #[test]
+    fn hashtags() {
+        let text = types::FormattedText {
+            text: "идея #вимграм на завтра".into(),
+            entities: vec![types::TextEntity { offset: 5, length: 8, r#type: enums::TextEntityType::Hashtag }],
+        };
+        let found = links(&text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(&text.text[found[0].start..found[0].end], "#вимграм");
+        assert_eq!(found[0].url, "#вимграм");
+
+        assert!(has_hashtag("идея #Вимграм!", "#вимграм"));
+        assert!(has_hashtag("#todo", "#TODO"));
+        assert!(has_hashtag("a #todo_x and #todo", "#todo"));
+        assert!(!has_hashtag("#todolist", "#todo"));
+        assert!(!has_hashtag("#todo_x", "#todo"));
+        assert!(!has_hashtag("todo", "#todo"));
     }
 }

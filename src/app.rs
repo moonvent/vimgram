@@ -64,6 +64,8 @@ pub enum Message {
     Resized(Size),
     History {
         chat_id: i64,
+        /// The hashtag the page was searched for (`OpenChat::tag`).
+        tag: Option<String>,
         newer: bool,
         result: Result<Vec<Msg>, String>,
     },
@@ -75,6 +77,7 @@ pub enum Message {
     },
     Count {
         chat_id: i64,
+        tag: Option<String>,
         result: Result<i32, String>,
     },
     Found {
@@ -355,6 +358,8 @@ pub struct OpenChat {
     /// Opened by moving through the chat list (`open_on_select`): nothing
     /// is read until the message pane gets focus.
     pub preview: bool,
+    /// Only the messages with this hashtag are shown (`#tag`).
+    pub tag: Option<String>,
 }
 
 impl OpenChat {
@@ -370,7 +375,20 @@ impl OpenChat {
             total: None,
             pinned: None,
             preview: false,
+            tag: None,
         }
+    }
+
+    /// Show the messages with `tag` only (`None`: all), loaded afresh.
+    fn retag(&mut self, tag: Option<String>) {
+        self.tag = tag;
+        self.msgs.clear();
+        self.cursor = 0;
+        self.bottom = 0;
+        self.loading = false;
+        self.exhausted = false;
+        self.at_latest = true;
+        self.total = None;
     }
 
     fn at_end(&self) -> bool {
@@ -998,10 +1016,15 @@ impl App {
                 self.scroll_messages();
                 Task::none()
             }
-            Message::History { chat_id, newer, result } => self.on_history(chat_id, newer, result),
+            Message::History { chat_id, tag, newer, result } => {
+                if self.open.as_ref().is_some_and(|o| o.tag != tag) {
+                    return Task::none();
+                }
+                self.on_history(chat_id, newer, result)
+            }
             Message::Window { chat_id, target, result } => self.on_window(chat_id, target, result),
-            Message::Count { chat_id, result } => {
-                if let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id) {
+            Message::Count { chat_id, tag, result } => {
+                if let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id && o.tag == tag) {
                     open.total = result.ok();
                 }
                 Task::none()
@@ -1078,8 +1101,11 @@ impl App {
             }
             Message::Archived { chat_id, result } => {
                 match result {
-                    Ok(records) if !records.is_empty() => {
+                    Ok(mut records) if !records.is_empty() => {
                         if let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id) {
+                            if let Some(tag) = &open.tag {
+                                records.retain(|r| tg::has_hashtag(&r.text, tag));
+                            }
                             open.edit(|msgs| restore_archived(msgs, records));
                             self.scroll_messages();
                         }
@@ -1486,7 +1512,9 @@ impl App {
             Update::MessageSendSucceeded(u) => {
                 let msg = Msg::from(u.message);
                 self.archive_save(std::slice::from_ref(&msg));
-                if let Some(open) = self.open.as_mut().filter(|o| o.id == msg.chat_id) {
+                if let Some(open) = self.open.as_mut().filter(|o| o.id == msg.chat_id)
+                    && (open.tag.is_none() || open.position(u.old_message_id).is_some())
+                {
                     let follow = open.at_end();
                     open.edit(|msgs| {
                         msgs.retain(|m| m.id != u.old_message_id);
@@ -1632,6 +1660,9 @@ impl App {
         let Some(open) = self.open.as_mut().filter(|o| o.id == msg.chat_id) else {
             return Task::none();
         };
+        if open.tag.as_ref().is_some_and(|tag| !tg::has_hashtag(&msg.text, tag)) {
+            return Task::none();
+        }
         let (chat_id, id, incoming) = (msg.chat_id, msg.id, !msg.outgoing);
         // Still pending: sent from here, not from another device.
         let sent_here = msg.sending;
@@ -1860,8 +1891,13 @@ impl App {
         open.loading = true;
         let chat_id = open.id;
         let from = if older { open.msgs.first().map_or(0, |m| m.id) } else { 0 };
+        if let Some(tag) = open.tag.clone() {
+            return Task::perform(tg::tagged(chat_id, tag.clone(), from, HISTORY_PAGE), move |result| {
+                Message::History { chat_id, tag: Some(tag.clone()), newer: false, result }
+            });
+        }
         Task::perform(tg::history(chat_id, from, 0, HISTORY_PAGE), move |result| {
-            Message::History { chat_id, newer: false, result }
+            Message::History { chat_id, tag: None, newer: false, result }
         })
     }
 
@@ -1879,7 +1915,7 @@ impl App {
         open.loading = true;
         let chat_id = open.id;
         Task::perform(tg::history(chat_id, from, -(HISTORY_PAGE - 1), HISTORY_PAGE), move |result| {
-            Message::History { chat_id, newer: true, result }
+            Message::History { chat_id, tag: None, newer: true, result }
         })
     }
 
@@ -1894,16 +1930,71 @@ impl App {
             self.scroll_messages();
             return Task::none();
         }
+        // Not among the tagged messages: show it among all of them.
+        let count = open.tag.is_some().then(|| self.untag()).unwrap_or_else(Task::none);
+        let Some(open) = self.open.as_mut() else {
+            return count;
+        };
         let chat_id = open.id;
         open.loading = true;
         let half = HISTORY_PAGE / 2;
-        Task::perform(tg::history(chat_id, id, -half, HISTORY_PAGE), move |result| {
+        let window = Task::perform(tg::history(chat_id, id, -half, HISTORY_PAGE), move |result| {
             Message::Window { chat_id, target: id, result }
+        });
+        Task::batch([count, window])
+    }
+
+    /// `#tag` clicked (or `gx`, `/#tag`): the open chat shows only the
+    /// messages with it, newest at the bottom; Esc brings back the rest.
+    fn show_tag(&mut self, tag: String) -> Task<Message> {
+        let Some(open) = self.open.as_mut() else {
+            self.error("Open a chat first (Enter)");
+            return Task::none();
+        };
+        let chat_id = open.id;
+        open.retag(Some(tag.clone()));
+        self.focus = Focus::Messages;
+        self.visual = None;
+        self.found = None;
+        self.reset_tall();
+        self.info(format!("Only messages with {tag} (Esc shows all)"));
+        let count = Task::perform(tg::search(chat_id, tag.clone()), move |result| Message::Count {
+            chat_id,
+            tag: Some(tag.clone()),
+            result: result.map(|(_, total)| total),
+        });
+        Task::batch([count, self.load_history(false)])
+    }
+
+    /// Back to all messages; returns the task counting them.
+    fn untag(&mut self) -> Task<Message> {
+        let Some(open) = self.open.as_mut() else {
+            return Task::none();
+        };
+        let chat_id = open.id;
+        open.retag(None);
+        self.reset_tall();
+        Task::perform(tg::message_count(chat_id), move |result| Message::Count {
+            chat_id,
+            tag: None,
+            result,
         })
     }
 
+    /// Esc in a `#tag` view: all messages, at the one under the cursor.
+    fn leave_tag(&mut self) -> Task<Message> {
+        let at = self.open.as_ref().and_then(OpenChat::current).map(|m| m.id);
+        let count = self.untag();
+        let load = match at {
+            Some(id) => self.jump_to_message(id),
+            None => self.load_history(false),
+        };
+        self.info("All messages");
+        Task::batch([count, load])
+    }
+
     fn on_window(&mut self, chat_id: i64, target: i64, result: Result<Vec<Msg>, String>) -> Task<Message> {
-        let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id) else {
+        let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id && o.tag.is_none()) else {
             return Task::none();
         };
         open.loading = false;
@@ -2048,6 +2139,7 @@ impl App {
         tasks.push(Task::perform(tg::open_chat(id), Message::Done));
         tasks.push(Task::perform(tg::message_count(id), move |result| Message::Count {
             chat_id: id,
+            tag: None,
             result,
         }));
         tasks.push(Self::load_pinned(id));
@@ -2951,6 +3043,9 @@ impl App {
         if query.is_empty() {
             return self.next_match(1);
         }
+        if query.len() > 1 && query.starts_with('#') && !query.contains(char::is_whitespace) {
+            return self.show_tag(query);
+        }
         self.info(format!("Searching for {query}…"));
         Task::perform(tg::search(chat_id, query.clone()), move |result| Message::Found {
             chat_id,
@@ -3451,6 +3546,9 @@ impl App {
                     self.set_filter(String::new());
                     cancelled = true;
                 }
+                if !cancelled && self.open.as_ref().is_some_and(|o| o.tag.is_some()) {
+                    return self.leave_tag();
+                }
                 if !cancelled {
                     self.confirm = Some(Confirm::Quit);
                 }
@@ -3463,6 +3561,9 @@ impl App {
     /// t.me links open here (at the post, `Ctrl-o` comes back); web and
     /// e-mail links in the system's browser or mail client.
     fn open_link(&mut self, url: String) -> Task<Message> {
+        if url.starts_with('#') {
+            return self.show_tag(url);
+        }
         let parsed = url::Url::parse(&url).ok();
         let host = parsed.as_ref().and_then(|u| u.host_str()).unwrap_or("");
         if ["t.me", "telegram.me", "telegram.dog"].contains(&host.trim_start_matches("www.")) {
