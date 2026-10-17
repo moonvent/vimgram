@@ -995,6 +995,32 @@ pub struct Msg {
     pub forward: Option<Forward>,
     #[serde(default)]
     pub links: Vec<Link>,
+    /// Bold, italic, spoilers… in `text`.
+    #[serde(default)]
+    pub styles: Vec<Styled>,
+    /// The photo or video is hidden under a spoiler until shown.
+    #[serde(default)]
+    pub spoiler: bool,
+}
+
+/// How a byte range of `Msg::text` is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Styled {
+    pub start: usize,
+    pub end: usize,
+    pub style: Style,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Style {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    /// Inline code and code blocks.
+    Code,
+    /// Hidden until shown.
+    Spoiler,
 }
 
 /// A link in a message's text: the byte range of `Msg::text` it covers.
@@ -1045,18 +1071,60 @@ pub fn links(text: &types::FormattedText) -> Vec<Link> {
     links
 }
 
-/// The formatted text a message shows as its text, with its links.
-pub fn content_links(content: &MessageContent, shown: &str) -> Vec<Link> {
+pub fn styles(text: &types::FormattedText) -> Vec<Styled> {
+    use enums::TextEntityType as T;
+    text.entities
+        .iter()
+        .filter_map(|e| {
+            let style = match &e.r#type {
+                T::Bold => Style::Bold,
+                // Quotes have no frame here; slanted, they still stand out.
+                T::Italic | T::BlockQuote | T::ExpandableBlockQuote => Style::Italic,
+                T::Underline => Style::Underline,
+                T::Strikethrough => Style::Strike,
+                T::Code | T::Pre | T::PreCode(_) => Style::Code,
+                T::Spoiler => Style::Spoiler,
+                _ => return None,
+            };
+            let start = byte_offset(&text.text, e.offset);
+            let end = byte_offset(&text.text, e.offset + e.length);
+            (start < end).then_some(Styled { start, end, style })
+        })
+        .collect()
+}
+
+/// The formatted text a message shows as its text, if it is shown as is
+/// (no "[photo] " label), so that entity offsets fit it.
+fn shown_formatted<'a>(content: &'a MessageContent, shown: &str) -> Option<&'a types::FormattedText> {
     let formatted = match content {
         MessageContent::MessageText(t) => &t.text,
         MessageContent::MessagePhoto(p) => &p.caption,
         MessageContent::MessageAnimation(a) => &a.caption,
         MessageContent::MessageVideo(v) => &v.caption,
         MessageContent::MessageVoiceNote(v) => &v.caption,
-        _ => return Vec::new(),
+        _ => return None,
     };
-    // Offsets only fit when the text is shown as is (no "[photo] " label).
-    if formatted.text == shown { links(formatted) } else { Vec::new() }
+    (formatted.text == shown).then_some(formatted)
+}
+
+/// The links of the text a message shows.
+pub fn content_links(content: &MessageContent, shown: &str) -> Vec<Link> {
+    shown_formatted(content, shown).map(links).unwrap_or_default()
+}
+
+/// The styles of the text a message shows.
+pub fn content_styles(content: &MessageContent, shown: &str) -> Vec<Styled> {
+    shown_formatted(content, shown).map(styles).unwrap_or_default()
+}
+
+/// A photo, video or GIF sent under a spoiler.
+pub fn media_spoiler(content: &MessageContent) -> bool {
+    match content {
+        MessageContent::MessagePhoto(p) => p.has_spoiler,
+        MessageContent::MessageVideo(v) => v.has_spoiler,
+        MessageContent::MessageAnimation(a) => a.has_spoiler,
+        _ => false,
+    }
 }
 
 
@@ -1187,6 +1255,8 @@ impl From<types::Message> for Msg {
             reactions: reactions(m.interaction_info.as_ref()),
             forward: forward_origin(m.forward_info.as_ref()),
             links: content_links(&m.content, &text),
+            styles: content_styles(&m.content, &text),
+            spoiler: media_spoiler(&m.content),
             text,
         }
     }
@@ -1228,25 +1298,51 @@ impl From<Record> for Msg {
             reactions: Vec::new(),
             forward: None,
             links: Vec::new(),
+            styles: Vec::new(),
+            spoiler: false,
         }
     }
 }
 
 impl Msg {
+    /// The text with its spoilers blanked out, for previews.
+    pub fn masked_text(&self) -> String {
+        let mut text = self.text.clone();
+        let mut spoilers: Vec<&Styled> = self.styles.iter().filter(|s| s.style == Style::Spoiler).collect();
+        // From the end, so earlier offsets stay valid.
+        spoilers.sort_by_key(|s| std::cmp::Reverse(s.start));
+        for s in spoilers {
+            if let Some(hidden) = text.get(s.start..s.end) {
+                let blank: String = hidden.chars().map(|c| if c == '\n' { c } else { '▒' }).collect();
+                text.replace_range(s.start..s.end, &blank);
+            }
+        }
+        text
+    }
+
     /// One-line description for chat previews.
     pub fn summary(&self) -> String {
+        self.describe(self.masked_text())
+    }
+
+    /// Like `summary`, spoilers included: for the archive and exports.
+    pub fn full_summary(&self) -> String {
+        self.describe(self.text.clone())
+    }
+
+    fn describe(&self, text: String) -> String {
         let Some(first) = self.media.first() else {
-            return self.text.clone();
+            return text;
         };
         let label = if self.media.len() > 1 {
             format!("🖼 Album ({})", self.media.len())
         } else {
             first.label()
         };
-        if self.text.is_empty() {
+        if text.is_empty() {
             label
         } else {
-            format!("{label}, {}", self.text)
+            format!("{label}, {text}")
         }
     }
 
@@ -1262,6 +1358,8 @@ impl Msg {
         // The other part's text is appended after a newline, its links too.
         let shift = if self.text.is_empty() { 0 } else { self.text.len() + 1 };
         self.links.extend(other.links.into_iter().map(|l| Link { start: l.start + shift, end: l.end + shift, ..l }));
+        self.styles.extend(other.styles.into_iter().map(|s| Styled { start: s.start + shift, end: s.end + shift, ..s }));
+        self.spoiler |= other.spoiler;
         // Reactions to an album are put on one of its parts.
         if self.reactions.is_empty() {
             self.reactions = other.reactions;
@@ -1601,6 +1699,37 @@ mod tests {
                 ("this", "https://a.b/c"),
             ]
         );
+    }
+
+    #[test]
+    fn styles_and_spoilers() {
+        let entity = |offset, length, r#type| types::TextEntity { offset, length, r#type };
+        let text = types::FormattedText {
+            text: "жирный и тайна".into(),
+            entities: vec![
+                entity(0, 6, enums::TextEntityType::Bold),
+                entity(9, 5, enums::TextEntityType::Spoiler),
+                entity(0, 14, enums::TextEntityType::Url),
+            ],
+        };
+        let found = styles(&text);
+        let found: Vec<(&str, Style)> = found.iter().map(|s| (&text.text[s.start..s.end], s.style)).collect();
+        assert_eq!(found, [("жирный", Style::Bold), ("тайна", Style::Spoiler)]);
+
+        let mut msg = Msg::from(Record {
+            chat_id: 1,
+            id: 1,
+            sender: Sender::User(1),
+            outgoing: false,
+            date: 0,
+            text: text.text.clone(),
+            deleted_at: None,
+            data: None,
+            files: Vec::new(),
+        });
+        msg.styles = styles(&text);
+        assert_eq!(msg.masked_text(), "жирный и ▒▒▒▒▒");
+        assert_eq!(msg.summary(), "жирный и ▒▒▒▒▒");
     }
 
     #[test]

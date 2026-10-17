@@ -9,15 +9,15 @@ use iced::widget::{
     space, span, stack, text, tooltip,
 };
 use iced::mouse::Interaction;
-use iced::{Alignment, Color, ContentFit, Element, Length, Size, Theme};
+use iced::{Alignment, Color, ContentFit, Element, Font, Length, Size, Theme, font};
 use iced_video_player::VideoPlayer;
 
-use crate::app::{App, Auth, Chat, Compose, Confirm, Focus, Message, Pane, COMPOSE_ID, TALL_ID, VideoPlayback};
+use crate::app::{App, Auth, Chat, Compose, Confirm, Focus, Message, Pane, COMPOSE_ID, SPOILER_LINK, TALL_ID, VideoPlayback};
 use crate::emoji::{self, Picker};
 use crate::fonts::{self, EMOJI};
 use crate::media::Loaded;
 use crate::player;
-use crate::tg::{ChatKind, Media, Msg, Presence, Sender, fmt_duration};
+use crate::tg::{ChatKind, Media, Msg, Presence, Sender, Style, fmt_duration};
 use crate::vim::{Input, Mode};
 
 pub const FOLDER_W: f32 = 76.0;
@@ -360,21 +360,61 @@ fn emoji_spans<'a, L>(s: &str) -> impl Iterator<Item = text::Span<'a, L>> {
         .map(|(run, emoji)| span(run.to_owned()).font_maybe(emoji.then_some(EMOJI)))
 }
 
-/// A message's text with its links underlined in the theme's color;
-/// clicking one opens it.
+/// A message's text with its formatting: links underlined in the theme's
+/// color (clicking one opens it), bold, italic, code, and spoilers as solid
+/// blocks until shown.
 fn message_text<'a>(app: &App, m: &Msg) -> Element<'a, Message> {
-    let link_color = app.theme.palette().primary;
+    let palette = app.theme.palette();
+    let hidden = app.hides(m);
+    // Every place a link or a style starts or ends cuts the text into parts
+    // shown alike.
+    let mut cuts = vec![0, m.text.len()];
+    cuts.extend(m.links.iter().flat_map(|l| [l.start, l.end]));
+    cuts.extend(m.styles.iter().flat_map(|s| [s.start, s.end]));
+    cuts.retain(|&c| m.text.is_char_boundary(c));
+    cuts.sort_unstable();
+    cuts.dedup();
     let mut spans: Vec<text::Span<'a, String>> = Vec::new();
-    let mut at = 0;
-    for link in &m.links {
-        let (Some(before), Some(shown)) = (m.text.get(at..link.start), m.text.get(link.start..link.end)) else {
-            continue; // overlapping or out of range
+    for part in cuts.windows(2) {
+        let (start, end) = (part[0], part[1]);
+        let shown = &m.text[start..end];
+        let link = m.links.iter().find(|l| l.start <= start && end <= l.end);
+        let has = |style| m.styles.iter().any(|s| s.style == style && s.start <= start && end <= s.end);
+        if hidden && has(Style::Spoiler) {
+            // Emoji keep their colors whatever the text color: blocks instead.
+            let blank: String = fonts::emoji_runs(shown)
+                .into_iter()
+                .map(|(run, emoji)| if emoji { "█".repeat(run.chars().count()) } else { run.to_owned() })
+                .collect();
+            spans.push(
+                span(blank)
+                    .color(palette.text)
+                    .background(palette.text)
+                    .link(format!("{SPOILER_LINK}{}", m.id)),
+            );
+            continue;
+        }
+        let font = Font {
+            weight: if has(Style::Bold) { font::Weight::Bold } else { font::Weight::Normal },
+            style: if has(Style::Italic) { font::Style::Italic } else { font::Style::Normal },
+            ..if has(Style::Code) { Font::MONOSPACE } else { Font::DEFAULT }
         };
-        spans.extend(emoji_spans(before));
-        spans.extend(emoji_spans(shown).map(|s| s.link(link.url.clone()).underline(true).color(link_color)));
-        at = link.end;
+        let code = has(Style::Code).then(|| palette.text.scale_alpha(0.12));
+        for piece in emoji_spans(shown) {
+            let mut piece = match piece.font {
+                Some(_) => piece,
+                None => piece.font(font),
+            };
+            piece = piece
+                .underline(link.is_some() || has(Style::Underline))
+                .strikethrough(has(Style::Strike))
+                .background_maybe(code);
+            if let Some(link) = link {
+                piece = piece.link(link.url.clone()).color(palette.primary);
+            }
+            spans.push(piece);
+        }
     }
-    spans.extend(emoji_spans(m.text.get(at..).unwrap_or("")));
     let deleted = m.deleted;
     rich_text(spans)
         .size(TEXT)
@@ -1204,13 +1244,35 @@ fn voice_view<'a>(app: &'a App, msg_id: i64, duration: i32, waveform: &'a [u8], 
     container(line).height(VOICE.height).align_y(Alignment::Center).into()
 }
 
-fn media_cell<'a>(app: &'a App, msg_id: i64, item: usize, media: &'a Media, size: Size, album: bool) -> Element<'a, Message> {
+fn media_cell<'a>(
+    app: &'a App,
+    msg_id: i64,
+    item: usize,
+    media: &'a Media,
+    size: Size,
+    album: bool,
+    hidden: bool,
+) -> Element<'a, Message> {
     let radius = match media {
         Media::Sticker { .. } => 0.0,
         Media::Video { round: true, .. } => size.width / 2.0,
         _ => 8.0,
     };
     let cell: Element<_> = match media {
+        // Under a spoiler: painted over until shown.
+        _ if hidden => container(text("Spoiler · Enter shows").size(13).style(|t: &Theme| text::Style {
+            color: Some(t.palette().background),
+        }))
+        .width(size.width)
+        .height(size.height)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .style(move |t: &Theme| container::Style {
+            background: Some(t.palette().text.scale_alpha(0.85).into()),
+            border: iced::border::rounded(radius),
+            ..Default::default()
+        })
+        .into(),
         Media::Voice { duration, waveform, listened, .. } => voice_view(app, msg_id, *duration, waveform, *listened),
         Media::Video { .. } => video_cell(app, media, size, radius),
         _ => match media.inline_file().and_then(|file| app.media.get(file)) {
@@ -1249,8 +1311,9 @@ fn media_cell<'a>(app: &'a App, msg_id: i64, item: usize, media: &'a Media, size
 
 fn media_block<'a>(app: &'a App, m: &'a Msg, width: f32) -> Element<'a, Message> {
     let sizes = media_sizes(&m.media, width);
+    let hidden = m.spoiler && app.hides(m);
     if m.media.len() == 1 {
-        return media_cell(app, m.id, 0, &m.media[0], sizes[0], false);
+        return media_cell(app, m.id, 0, &m.media[0], sizes[0], false, hidden);
     }
     let (cols, _) = album_layout(m.media.len(), width);
     let cells: Vec<Element<_>> = m
@@ -1258,7 +1321,7 @@ fn media_block<'a>(app: &'a App, m: &'a Msg, width: f32) -> Element<'a, Message>
         .iter()
         .zip(&sizes)
         .enumerate()
-        .map(|(i, (media, size))| media_cell(app, m.id, i, media, *size, true))
+        .map(|(i, (media, size))| media_cell(app, m.id, i, media, *size, true, hidden))
         .collect();
     let mut rows = Vec::new();
     let mut cells = cells.into_iter();
@@ -1308,6 +1371,9 @@ fn message_keys(app: &App, m: &Msg) -> String {
     }
     let channel = app.chats.get(&m.chat_id).is_some_and(|c| c.kind == ChatKind::Channel);
     let mut keys = Vec::new();
+    if app.hides(m) {
+        keys.push("Enter spoiler");
+    }
     if !m.links.is_empty() {
         keys.push("gx link");
     }
@@ -1849,6 +1915,8 @@ mod tests {
             reactions: Vec::new(),
             forward: None,
             links: Vec::new(),
+            styles: Vec::new(),
+            spoiler: false,
         }
     }
 

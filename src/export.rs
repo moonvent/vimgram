@@ -75,7 +75,7 @@ pub fn html(title: &str, msgs: &[Msg], names: &HashMap<Sender, String>) -> Strin
         if m.deleted {
             flags.push_str(" · deleted");
         }
-        let body = escape(&m.summary()).replace('\n', "<br/>");
+        let body = escape(&m.full_summary()).replace('\n', "<br/>");
         let style = if m.deleted { " deleted" } else { "" };
         out.push_str(&format!(
             "<div class=\"msg{style}\"><span class=\"{class}\">{}</span> \
@@ -146,6 +146,8 @@ mod tests {
             reactions: Vec::new(),
             forward: None,
             links: Vec::new(),
+            styles: Vec::new(),
+            spoiler: false,
         }
     }
 

@@ -49,6 +49,8 @@ const CACHE_DAYS: i32 = 7;
 /// Scrollable showing a message taller than the screen.
 pub const TALL_ID: &str = "tall-message";
 pub const COMPOSE_ID: &str = "compose";
+/// Link of a spoiler in a message's text: this prefix and the message id.
+pub const SPOILER_LINK: &str = "spoiler:";
 
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes  J/K gt/gT Alt-N folders  \
                     Enter open/play  i insert  q record  r reply  R react  cc/e edit  f forward  v visual  dd delete  \
@@ -533,6 +535,8 @@ pub struct App {
     pub input: Input,
     /// Length and cursor of `input` the compose box last scrolled to.
     compose_seen: (usize, usize),
+    /// Messages whose spoilers were shown (Enter or a click).
+    pub revealed: HashSet<i64>,
     pub compose: Compose,
     pub forward: Option<Forward>,
     /// Where `gf` jumped from (chat, message), newest last; `Ctrl-o` goes back.
@@ -647,6 +651,7 @@ impl App {
             recorder: None,
             input: Input::default(),
             compose_seen: (0, 0),
+            revealed: HashSet::new(),
             compose: Compose::New,
             forward: None,
             jumps: Vec::new(),
@@ -1325,6 +1330,9 @@ impl App {
             }
             Message::ClickMedia { msg_id, item } => {
                 self.select_message(msg_id);
+                if self.reveal(msg_id) {
+                    return Task::none();
+                }
                 self.activate_media(msg_id, item)
             }
             Message::Scroll(pane, delta) => self.on_scroll(pane, delta),
@@ -1537,6 +1545,8 @@ impl App {
                         msg.text = tg::content_text(&u.new_content, msg.outgoing);
                     }
                     msg.links = tg::content_links(&u.new_content, &msg.text);
+                    msg.styles = tg::content_styles(&u.new_content, &msg.text);
+                    msg.spoiler = tg::media_spoiler(&u.new_content);
                     let msg = msg.clone();
                     self.archive_save(&[msg]);
                 }
@@ -1979,6 +1989,24 @@ impl App {
             tag: None,
             result,
         })
+    }
+
+    /// The message has a spoiler not shown yet.
+    pub fn hides(&self, m: &Msg) -> bool {
+        (m.spoiler || m.styles.iter().any(|s| s.style == tg::Style::Spoiler)) && !self.revealed.contains(&m.id)
+    }
+
+    /// Show the spoilers of a message; false if it had none hidden.
+    fn reveal(&mut self, msg_id: i64) -> bool {
+        let hidden = self
+            .open
+            .as_ref()
+            .and_then(|o| o.position(msg_id).map(|i| &o.msgs[i]))
+            .is_some_and(|m| self.hides(m));
+        if hidden {
+            self.revealed.insert(msg_id);
+        }
+        hidden
     }
 
     /// Esc in a `#tag` view: all messages, at the one under the cursor.
@@ -3306,6 +3334,9 @@ impl App {
                     }
                     task
                 }
+                (Focus::Messages, _) if self.focused_message().map(|m| m.id).is_some_and(|id| self.reveal(id)) => {
+                    Task::none()
+                }
                 (Focus::Messages, _) => {
                     let target = self.focused_message().and_then(|m| {
                         let item = m.media.iter().position(|x| x.viewable() || matches!(x, Media::Voice { .. }))?;
@@ -3561,6 +3592,10 @@ impl App {
     /// t.me links open here (at the post, `Ctrl-o` comes back); web and
     /// e-mail links in the system's browser or mail client.
     fn open_link(&mut self, url: String) -> Task<Message> {
+        if let Some(id) = url.strip_prefix(SPOILER_LINK).and_then(|id| id.parse().ok()) {
+            self.reveal(id);
+            return Task::none();
+        }
         if url.starts_with('#') {
             return self.show_tag(url);
         }
@@ -4149,6 +4184,8 @@ mod tests {
             reactions: Vec::new(),
             forward: None,
             links: Vec::new(),
+            styles: Vec::new(),
+            spoiler: false,
         }
     }
 

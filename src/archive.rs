@@ -43,7 +43,7 @@ impl Record {
             sender: msg.sender,
             outgoing: msg.outgoing,
             date: msg.date,
-            text: msg.summary(),
+            text: msg.full_summary(),
             deleted_at: None,
             data: serde_json::to_string(msg).ok(),
             files: Vec::new(),
@@ -320,6 +320,8 @@ mod tests {
             reactions: Vec::new(),
             forward: None,
             links: Vec::new(),
+            styles: Vec::new(),
+            spoiler: false,
         }
     }
 
