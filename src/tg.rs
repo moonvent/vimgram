@@ -294,6 +294,22 @@ pub fn has_hashtag(text: &str, tag: &str) -> bool {
         .any(|(i, _)| text[i + tag.len()..].chars().next().is_none_or(|c| !(c.is_alphanumeric() || c == '_')))
 }
 
+/// Mute a chat for good, or unmute it, keeping its other settings.
+pub async fn set_muted(chat_id: i64, mut settings: types::ChatNotificationSettings, muted: bool) -> Res<()> {
+    settings.use_default_mute_for = false;
+    // TDLib takes anything over a year as "forever".
+    settings.mute_for = if muted { i32::MAX } else { 0 };
+    functions::set_chat_notification_settings(chat_id, settings, client()).await.map_err(err)
+}
+
+pub async fn leave(chat_id: i64) -> Res<()> {
+    functions::leave_chat(chat_id, client()).await.map_err(err)
+}
+
+pub async fn join(chat_id: i64) -> Res<()> {
+    functions::join_chat(chat_id, client()).await.map_err(err)
+}
+
 /// Total number of messages in a chat (an empty search counts everything).
 pub async fn message_count(chat_id: i64) -> Res<i32> {
     search(chat_id, String::new()).await.map(|(_, total)| total)
@@ -709,12 +725,42 @@ impl ChatKind {
         }
     }
 
+    /// The supergroup (or channel) behind a chat of this type.
+    pub fn supergroup(kind: &enums::ChatType) -> Option<i64> {
+        match kind {
+            enums::ChatType::Supergroup(s) => Some(s.supergroup_id),
+            _ => None,
+        }
+    }
+
     /// The notification settings scope chats of this kind default to.
     pub fn scope(self) -> Scope {
         match self {
             ChatKind::Private(_) => Scope::Private,
             ChatKind::Group => Scope::Group,
             ChatKind::Channel => Scope::Channel,
+        }
+    }
+}
+
+/// Where you stand in a supergroup or channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Membership {
+    /// May post: the owner, or an admin allowed to.
+    Poster,
+    Member,
+    /// Not (or no longer) in it.
+    Left,
+}
+
+impl Membership {
+    pub fn of(status: &enums::ChatMemberStatus) -> Self {
+        use enums::ChatMemberStatus as S;
+        match status {
+            S::Creator(_) => Membership::Poster,
+            S::Administrator(a) if a.rights.can_post_messages => Membership::Poster,
+            S::Left | S::Banned(_) => Membership::Left,
+            _ => Membership::Member,
         }
     }
 }

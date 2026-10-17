@@ -126,6 +126,10 @@ pub enum Action {
     NormalSpeed,
     Louder,
     Quieter,
+    /// Turn the chat's notifications off, or back on.
+    Mute,
+    /// Leave a channel or group (asks first), or join one you are not in.
+    Leave,
     SeekBack,
     SeekForward,
     Reply,
@@ -228,6 +232,8 @@ impl Pending {
             (None, NKey::Char('=')) => Some(Action::NormalSpeed),
             (None, NKey::Char('}')) => Some(Action::Louder),
             (None, NKey::Char('{')) => Some(Action::Quieter),
+            (None, NKey::Char('m')) => Some(Action::Mute),
+            (None, NKey::Char('U')) => Some(Action::Leave),
             (None, NKey::Char('H')) => Some(Action::SeekBack),
             (None, NKey::Char('L')) => Some(Action::SeekForward),
             (None, NKey::Char('r')) => Some(Action::Reply),
@@ -455,6 +461,7 @@ mod tests {
         assert_eq!(p.feed(NKey::Ctrl('l')), Some(Action::FocusMessages));
         assert_eq!(feed("][="), vec![Action::Faster, Action::Slower, Action::NormalSpeed]);
         assert_eq!(feed("}{"), vec![Action::Louder, Action::Quieter]);
+        assert_eq!(feed("mU"), vec![Action::Mute, Action::Leave]);
     }
 
     #[test]

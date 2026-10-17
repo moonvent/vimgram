@@ -17,7 +17,9 @@ use crate::emoji::{self, Picker, React};
 use crate::{autostart, export, icon, notify, tray};
 use crate::media::{self, Kind, Loaded, Shared, Store};
 use crate::player::{self, Audio, Movie, SpeedKind, Speeds};
-use crate::tg::{self, ChatKind, Folder, ListKey, Media, Msg, Presence, ReactionKind, Scope, SendOptions, Sender, User};
+use crate::tg::{
+    self, ChatKind, Folder, ListKey, Media, Membership, Msg, Presence, ReactionKind, Scope, SendOptions, Sender, User,
+};
 use crate::view;
 use crate::vim::{Action, History, Input, Mode, NKey, Pending, normalize};
 use crate::voice::Recorder;
@@ -54,7 +56,7 @@ pub const SPOILER_LINK: &str = "spoiler:";
 
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes  J/K gt/gT Alt-N folders  \
                     Enter open/play  i insert  q record  r reply  R react  cc/e edit  f forward  v visual  dd delete  \
-                    yy/Y copy  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  { } volume  H/L seek  \
+                    yy/Y copy  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  { } volume  H/L seek  m mute  U leave/join  \
                     / filter chats or search messages  n/N next/prev match  ga attach  gp pinned  gf original/reply  gx link  ^o back  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
                     :folder  :theme  :autostart  :cleancache  :q";
@@ -281,6 +283,7 @@ pub struct Found {
 #[derive(Debug, Clone)]
 pub enum Confirm {
     Delete { chat_id: i64, ids: Vec<i64> },
+    Leave { chat_id: i64, title: String },
     /// Esc with nothing left to cancel.
     Quit,
 }
@@ -317,6 +320,10 @@ pub struct Chat {
     /// Outgoing messages up to this id were read by the other side.
     pub read_outbox: i64,
     mute: Mute,
+    /// All of its notification settings, to change one keeping the rest.
+    notify: ChatNotificationSettings,
+    /// The supergroup or channel it is, for your membership.
+    supergroup: Option<i64>,
     /// Order within each chat list the chat belongs to.
     positions: HashMap<ListKey, i64>,
     /// File id of the small chat photo.
@@ -495,6 +502,8 @@ pub struct App {
     pub focus: Focus,
     pub chats: HashMap<i64, Chat>,
     pub users: HashMap<i64, User>,
+    /// Your standing in each supergroup and channel, by supergroup id.
+    memberships: HashMap<i64, Membership>,
     archive: Option<Archive>,
     /// Default mute duration per kind of chat.
     scope_mute: HashMap<Scope, i32>,
@@ -625,6 +634,7 @@ impl App {
             focus: Focus::Chats,
             chats: HashMap::new(),
             users: HashMap::new(),
+            memberships: HashMap::new(),
             archive: Archive::open(config::dirs().data_dir().join("archive.sqlite")).ok(),
             scope_mute: HashMap::new(),
             focused: true,
@@ -783,7 +793,65 @@ impl App {
             .is_some_and(|m| view::message_height(m, width) > height)
     }
 
-    fn muted(&self, chat: &Chat) -> bool {
+    pub fn membership(&self, chat: &Chat) -> Option<Membership> {
+        self.memberships.get(&chat.supergroup?).copied()
+    }
+
+    /// A channel you can only read: only its owner and some admins post.
+    pub fn read_only(&self, chat_id: i64) -> bool {
+        self.chats
+            .get(&chat_id)
+            .is_some_and(|c| c.kind == ChatKind::Channel && self.membership(c) != Some(Membership::Poster))
+    }
+
+    /// Writing in the open chat, or why not (shown as the error).
+    fn may_post(&mut self) -> bool {
+        let read_only = self.open.as_ref().is_some_and(|o| self.read_only(o.id));
+        if read_only {
+            self.error("Only the channel's admins post here (m mutes it, U unsubscribes)");
+        }
+        !read_only
+    }
+
+    /// The chat `m` and `U` act on: the one under the cursor in the list,
+    /// otherwise the open one.
+    fn chat_in_focus(&self) -> Option<&Chat> {
+        let id = match self.focus {
+            Focus::Chats | Focus::Folders => self.selected.or(self.open.as_ref().map(|o| o.id)),
+            Focus::Messages => self.open.as_ref().map(|o| o.id),
+        };
+        self.chats.get(&id?)
+    }
+
+    fn toggle_mute(&mut self) -> Task<Message> {
+        let Some(chat) = self.chat_in_focus() else {
+            self.error("Select a chat first");
+            return Task::none();
+        };
+        let (id, settings, muted) = (chat.id, chat.notify.clone(), self.muted(chat));
+        self.info(format!("{} {}", if muted { "Unmuted" } else { "Muted" }, chat.title));
+        Task::perform(tg::set_muted(id, settings, !muted), Message::Done)
+    }
+
+    fn leave_or_join(&mut self) -> Task<Message> {
+        let Some(chat) = self.chat_in_focus() else {
+            self.error("Select a chat first");
+            return Task::none();
+        };
+        let (id, title) = (chat.id, chat.title.clone());
+        if matches!(chat.kind, ChatKind::Private(_)) {
+            self.error("Only groups and channels can be left");
+            return Task::none();
+        }
+        if self.membership(chat) == Some(Membership::Left) {
+            self.info(format!("Joined {title}"));
+            return Task::perform(tg::join(id), Message::Done);
+        }
+        self.confirm = Some(Confirm::Leave { chat_id: id, title });
+        Task::none()
+    }
+
+    pub fn muted(&self, chat: &Chat) -> bool {
         let mute_for = if chat.mute.use_default {
             self.scope_mute.get(&chat.kind.scope()).copied().unwrap_or(0)
         } else {
@@ -900,10 +968,13 @@ impl App {
     /// Size of the message list, which shrinks with the compose box.
     pub fn viewport(&self) -> (f32, f32) {
         let pinned = self.open.as_ref().is_some_and(|o| o.pinned.is_some());
+        // A channel you can't post in has a one-line bar instead.
+        let read_only = self.open.as_ref().is_some_and(|o| self.read_only(o.id));
+        let empty = Input::default();
         view::messages_viewport(
             self.size,
-            &self.input,
-            view::has_banner(self),
+            if read_only { &empty } else { &self.input },
+            !read_only && view::has_banner(self),
             pinned,
             self.emoji.is_some(),
             self.playing_elsewhere().is_some(),
@@ -1421,6 +1492,8 @@ impl App {
                     unread: c.unread_count,
                     read_outbox: c.last_read_outbox_message_id,
                     mute: Mute::of(&c.notification_settings),
+                    notify: c.notification_settings.clone(),
+                    supergroup: ChatKind::supergroup(&c.r#type),
                     positions: HashMap::new(),
                     avatar: avatar_of(c.photo.as_ref()),
                 };
@@ -1468,6 +1541,7 @@ impl App {
             Update::ChatNotificationSettings(u) => {
                 if let Some(chat) = self.chats.get_mut(&u.chat_id) {
                     chat.mute = Mute::of(&u.notification_settings);
+                    chat.notify = u.notification_settings;
                 }
             }
             Update::ScopeNotificationSettings(u) => {
@@ -1512,6 +1586,9 @@ impl App {
             }
             Update::User(u) => {
                 self.users.insert(u.user.id, User::from(&u.user));
+            }
+            Update::Supergroup(u) => {
+                self.memberships.insert(u.supergroup.id, Membership::of(&u.supergroup.status));
             }
             Update::NewMessage(u) => {
                 let msg = Msg::from(u.message);
@@ -2886,6 +2963,14 @@ impl App {
     fn key_confirm(&mut self, key: NKey) -> Task<Message> {
         let (chat_id, ids) = match self.confirm.take() {
             Some(Confirm::Delete { chat_id, ids }) => (chat_id, ids),
+            Some(Confirm::Leave { chat_id, title }) if matches!(key, NKey::Char('y') | NKey::Enter) => {
+                self.info(format!("Left {title}"));
+                return Task::perform(tg::leave(chat_id), Message::Done);
+            }
+            Some(Confirm::Leave { .. }) => {
+                self.info("Staying");
+                return Task::none();
+            }
             Some(Confirm::Quit) if matches!(key, NKey::Char('y') | NKey::Enter) => return self.handle(Message::Quit),
             Some(Confirm::Quit) => {
                 self.info("Not quitting");
@@ -3383,10 +3468,10 @@ impl App {
                 _ => Task::none(),
             },
             Action::Insert => {
-                if self.auth != Auth::Ready || self.open.is_some() {
-                    self.mode = Mode::Insert;
-                } else {
+                if self.auth == Auth::Ready && self.open.is_none() {
                     self.error("Open a chat first (Enter)");
+                } else if self.auth != Auth::Ready || self.may_post() {
+                    self.mode = Mode::Insert;
                 }
                 Task::none()
             }
@@ -3403,6 +3488,7 @@ impl App {
                 }
                 Task::none()
             }
+            Action::Attach if !self.may_post() => Task::none(),
             Action::Attach => self.pick_files(),
             Action::Emoji => {
                 self.open_emoji();
@@ -3479,7 +3565,9 @@ impl App {
             Action::Yank => self.yank(),
             Action::Paste { before } => self.read_clipboard(PasteTarget::Input(Some(before))),
             Action::Record => {
-                self.start_recording();
+                if self.may_post() {
+                    self.start_recording();
+                }
                 Task::none()
             }
             Action::PlayPause => self.toggle_pause(),
@@ -3495,6 +3583,8 @@ impl App {
                 self.set_speed(1.0);
                 Task::none()
             }
+            Action::Mute => self.toggle_mute(),
+            Action::Leave => self.leave_or_join(),
             Action::Louder => {
                 self.set_volume(player::louder(self.volume));
                 Task::none()
@@ -3511,6 +3601,7 @@ impl App {
                 self.seek(SEEK_SHORT);
                 Task::none()
             }
+            Action::Reply if !self.may_post() => Task::none(),
             Action::Reply => {
                 match self.focused_message().map(|m| m.id) {
                     Some(id) => {

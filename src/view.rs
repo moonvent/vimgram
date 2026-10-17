@@ -17,7 +17,7 @@ use crate::emoji::{self, Picker};
 use crate::fonts::{self, EMOJI};
 use crate::media::Loaded;
 use crate::player;
-use crate::tg::{ChatKind, Media, Msg, Presence, Preview, Sender, Style, fmt_duration};
+use crate::tg::{ChatKind, Media, Membership, Msg, Presence, Preview, Sender, Style, fmt_duration};
 use crate::vim::{Input, Mode};
 
 pub const FOLDER_W: f32 = 76.0;
@@ -1746,7 +1746,22 @@ pub fn has_banner(app: &App) -> bool {
     app.forward.is_some() || app.compose != Compose::New || !app.attachments.is_empty()
 }
 
+/// In place of the compose line in a channel you can't post in.
+fn channel_bar(app: &App, chat: &Chat) -> Element<'static, Message> {
+    let mute = if app.muted(chat) { "m — unmute" } else { "m — mute" };
+    let leave = if app.membership(chat) == Some(Membership::Left) { "U — subscribe" } else { "U — unsubscribe" };
+    container(text(format!("Channel   {mute}   {leave}")).size(TEXT).style(muted_text))
+        .padding([10.0, MSG_PAD_X])
+        .width(Length::Fill)
+        .height(20.0 + LINE_H)
+        .align_y(Alignment::Center)
+        .into()
+}
+
 fn compose(app: &App) -> Element<'_, Message> {
+    if let Some(chat) = app.open.as_ref().filter(|o| app.read_only(o.id)).and_then(|o| app.chats.get(&o.id)) {
+        return channel_bar(app, chat);
+    }
     let editing = app.mode == Mode::Insert;
     let width = compose_text_width(app.size, app.emoji.is_some());
     let lines = compose_lines(app.input.as_str(), width).clamp(1, MAX_COMPOSE_LINES);
@@ -1922,6 +1937,7 @@ fn status_line(app: &App) -> Element<'_, Message> {
                     let what = if ids.len() > 1 { "these messages" } else { "this message" };
                     format!("Delete {what}?   y — for everyone   m — only for me   n/Esc — cancel")
                 }
+                Some(Confirm::Leave { title, .. }) => format!("Leave {title}?   y/Enter — leave   n/Esc — stay"),
                 _ => "Quit vimgram?   y/Enter — quit   n/Esc — stay".to_owned(),
             };
             text(prompt)

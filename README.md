@@ -101,6 +101,8 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `Space` | play / pause voice message or video |
 | `gv`, click on the player bar | back to the voice message playing in another chat (the bar above the chat shows it; ✕ stops) |
 | `]` `+` / `[` `-` / `=` | speed up / down (0.25x–5x) / reset to 1x; voice messages, videos and round videos each remember their own speed |
+| `m` | mute or unmute the chat (under the cursor in the list, otherwise the open one) |
+| `U` | leave the group or unsubscribe from the channel (asks first); joins one you are not in. Channels you can't post in show these two keys instead of the compose line |
 | `}` / `{`, `:volume 70` | volume up / down by 10% (or set it); one volume for videos and voice messages, remembered |
 | `H` / `L` | seek voice message −5s / +5s |
 | `Esc`, `Ctrl-[` | normal mode; cancel reply, edit, forward, filter, attachment; with nothing to cancel asks to quit (`y`/`Enter`) |
