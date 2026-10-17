@@ -2063,20 +2063,8 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || match on {
-                    None => Ok(match autostart::current() {
-                        Some(autostart::Method::Systemd) => "Autostart is on (systemd user service vimgram.service)",
-                        Some(autostart::Method::Xdg) => "Autostart is on (~/.config/autostart/vimgram.desktop)",
-                        None => "Autostart is off — :autostart on",
-                    }
-                    .to_owned()),
-                    Some(true) => autostart::enable().map(|method| match method {
-                        autostart::Method::Systemd => {
-                            "Autostart on: vimgram.service starts with the graphical session, in the tray".to_owned()
-                        }
-                        autostart::Method::Xdg => {
-                            "Autostart on: ~/.config/autostart/vimgram.desktop (starts in the tray)".to_owned()
-                        }
-                    }),
+                    None => Ok(autostart::current().map_or("Autostart is off — :autostart on", autostart::Method::status).to_owned()),
+                    Some(true) => autostart::enable().map(|method| method.enabled().to_owned()),
                     Some(false) => autostart::disable().map(|()| "Autostart off".to_owned()),
                 })
                 .await

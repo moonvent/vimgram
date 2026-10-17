@@ -1,3 +1,6 @@
+// No console window behind the app in Windows release builds.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod archive;
 mod autostart;
@@ -24,8 +27,15 @@ fn main() -> iced::Result {
     let cfg = match Config::load() {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("vimgram: failed to load config: {e}");
-            eprintln!("Expected api_id and api_hash (from https://my.telegram.org) in it.");
+            let text = format!("Failed to load config: {e}\nExpected api_id and api_hash (from https://my.telegram.org) in it.");
+            eprintln!("vimgram: {text}");
+            // Without a console nobody would see the message.
+            #[cfg(windows)]
+            let _ = rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Error)
+                .set_title("vimgram")
+                .set_description(&text)
+                .show();
             std::process::exit(1);
         }
     };

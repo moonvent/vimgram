@@ -1,5 +1,6 @@
 //! Desktop notifications through the freedesktop D-Bus interface
-//! (mako, dunst, swaync, … on Hyprland).
+//! (mako, dunst, swaync, … on Hyprland), or Windows toasts. Only on Linux
+//! are notifications of read messages taken back.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -27,6 +28,7 @@ static SHOWN: Mutex<Vec<Shown>> = Mutex::new(Vec::new());
 /// prepared when its message gets read is closed as soon as it shows.
 static READ: Mutex<Vec<(i64, i64)>> = Mutex::new(Vec::new());
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn read_up_to(chat_id: i64) -> i64 {
     let read = READ.lock().unwrap_or_else(|e| e.into_inner());
     read.iter().find(|(c, _)| *c == chat_id).map_or(0, |(_, up_to)| *up_to)
@@ -39,6 +41,7 @@ fn set_read_up_to(chat_id: i64, up_to: i64) {
         None => read.push((chat_id, up_to)),
     }
 }
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const MAX_SHOWN: usize = 500;
 
 fn shown() -> std::sync::MutexGuard<'static, Vec<Shown>> {
@@ -59,9 +62,13 @@ fn take_read(chat_id: i64, up_to: i64) -> Vec<u32> {
 pub async fn withdraw(chat_id: i64, up_to: i64) {
     set_read_up_to(chat_id, up_to);
     let ids = take_read(chat_id, up_to);
-    if ids.is_empty() {
-        return;
+    if !ids.is_empty() {
+        close(ids).await;
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn close(ids: Vec<u32>) {
     let Ok(conn) = zbus::Connection::session().await else {
         return;
     };
@@ -77,6 +84,9 @@ pub async fn withdraw(chat_id: i64, up_to: i64) {
             .await;
     }
 }
+
+#[cfg(not(target_os = "linux"))]
+async fn close(_ids: Vec<u32>) {}
 
 /// Show a notification about message `msg_id` of `chat_id`; resolves to
 /// `true` when it was clicked. `image` is the chat photo (with the app
@@ -94,7 +104,11 @@ pub async fn show(
     // starve tokio's blocking pool.
     let spawned = std::thread::Builder::new().name("notification".into()).spawn(move || {
         let mut n = notify_rust::Notification::new();
-        n.appname("vimgram").summary(&title).body(&escape(&body));
+        n.summary(&title).body(&escape(&body));
+        // On Windows the app name is a registered AppUserModelID; without
+        // one toasts go out under PowerShell's.
+        #[cfg(target_os = "linux")]
+        n.appname("vimgram");
         match &icon {
             Some(icon) => n.icon(&icon.to_string_lossy()),
             None => n.icon("mail-message-new"),
@@ -107,25 +121,30 @@ pub async fn show(
             n.action("default", "Open");
         }
         let mut clicked = false;
+        #[cfg(not(target_os = "linux"))]
+        let _ = (chat_id, msg_id);
         if let Ok(handle) = n.show() {
-            let id = handle.id();
-            // Read while the notification was being prepared.
-            if read_up_to(chat_id) >= msg_id {
-                handle.close();
-                WAITING.fetch_sub(1, Ordering::SeqCst);
-                let _ = tx.send(false);
-                return;
-            }
-            {
+            #[cfg(target_os = "linux")]
+            let id = {
+                let id = handle.id();
+                // Read while the notification was being prepared.
+                if read_up_to(chat_id) >= msg_id {
+                    handle.close();
+                    WAITING.fetch_sub(1, Ordering::SeqCst);
+                    let _ = tx.send(false);
+                    return;
+                }
                 let mut shown = shown();
                 if shown.len() >= MAX_SHOWN {
                     shown.remove(0);
                 }
                 shown.push(Shown { chat_id, msg_id, id });
-            }
+                id
+            };
             if wait {
                 handle.wait_for_action(|action| clicked = action == "default");
                 // Closed or clicked: nothing left to withdraw.
+                #[cfg(target_os = "linux")]
                 shown().retain(|s| s.id != id);
             }
         }
