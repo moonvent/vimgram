@@ -11,8 +11,9 @@ $root = Join-Path (Get-Location) "vendor\rlottie"
 if (Test-Path $root) { Remove-Item -Recurse -Force $root }
 git clone -q https://github.com/Samsung/rlottie.git "$root\src"
 git -C "$root\src" checkout -q $Rev
+# Quoted: PowerShell splits a bare -DNAME=3.5 at the dot.
 cmake -S "$root\src" -B "$root\build" -Wno-dev `
-  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DBUILD_SHARED_LIBS=ON -DLOTTIE_MODULE=OFF
+  "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" "-DBUILD_SHARED_LIBS=ON" "-DLOTTIE_MODULE=OFF"
 cmake --build "$root\build" --config Release --target rlottie --parallel
 $dir = $root -replace '\\', '/'
 @"
