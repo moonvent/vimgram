@@ -187,7 +187,7 @@ pub fn message_height(m: &Msg, width: f32) -> f32 {
     // Rows of chips, the padding above them and the column spacing.
     let rows = m.reactions.len().div_ceil(per_row);
     let reactions = if rows == 0 { 0.0 } else { rows as f32 * REACTIONS_H + 2.0 };
-    12.0 + 18.0 + reply + media_block_height(&m.media, width) + lines as f32 * LINE_H + reactions + MSG_SPACING
+    16.0 + 18.0 + reply + media_block_height(&m.media, width) + lines as f32 * LINE_H + reactions + MSG_SPACING
 }
 
 fn local_day(unix: i32) -> Option<chrono::NaiveDate> {
@@ -1390,7 +1390,7 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
 
     let highlighted = selected || app.in_visual(m.id);
     let bubble = container(body)
-        .padding([6, 10])
+        .padding(iced::Padding { top: 6.0, bottom: 10.0, left: 10.0, right: 10.0 })
         .width(Length::Fill)
         .style(move |t: &Theme| message_style(t, highlighted));
     let channel = app.chats.get(&m.chat_id).is_some_and(|c| c.kind == ChatKind::Channel);
