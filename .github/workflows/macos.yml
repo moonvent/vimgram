@@ -1,0 +1,26 @@
+name: macOS
+
+# Separate from CI while macOS support is new: no tray, autostart or
+# packaging yet, only that it builds and its tests pass.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Homebrew packages
+        run: brew install gstreamer pkgconf cmake ninja
+      - name: TDLib
+        run: ./scripts/fetch-tdlib.sh
+      - run: cargo build --release --locked
+      - run: cargo test --release --locked

@@ -38,7 +38,7 @@ ksni = "0.3.6"
 zbus = { version = "5.19", default-features = false }
 
 # Images and copied files on the clipboard.
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 arboard = "3"
 
 [profile.release]

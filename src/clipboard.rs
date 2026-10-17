@@ -1,6 +1,6 @@
 //! Reading the clipboard with all its types, so images and copied files
 //! can be pasted as attachments: `wl-paste` on Wayland, `arboard` on
-//! Windows. iced's own clipboard only does text; it remains the fallback.
+//! Windows and macOS. iced's own clipboard only does text; it remains the fallback.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
@@ -113,7 +113,7 @@ fn read_blocking() -> Result<Clip, String> {
     Ok(Clip::Text(String::from_utf8_lossy(&data).into_owned()))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn read_blocking() -> Result<Clip, String> {
     let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
     if let Ok(files) = clipboard.get().file_list() {
@@ -131,7 +131,7 @@ fn read_blocking() -> Result<Clip, String> {
     Ok(clipboard.get_text().map_or(Clip::Empty, Clip::Text))
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 fn read_blocking() -> Result<Clip, String> {
     Err("no clipboard reader on this platform".into())
 }
