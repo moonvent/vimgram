@@ -30,6 +30,9 @@ const PREFETCH: usize = 8;
 const CHATS_PAGE: i32 = 100;
 /// Redraw rate while something animates, plays or records.
 const TICK: Duration = Duration::from_millis(33);
+/// How long the chat list cursor rests on a chat before it opens
+/// (`open_on_select`), so holding j doesn't open every chat on the way.
+const PREVIEW_DELAY: Duration = Duration::from_millis(150);
 const SEEK_SHORT: f64 = 5.0;
 const SEEK_LONG: f64 = 30.0;
 /// Touchpad pixels per list step.
@@ -133,6 +136,8 @@ pub enum Message {
     },
     /// Player bar of a voice message from another chat.
     JumpPlaying,
+    /// The cursor rested on this chat (`open_on_select`).
+    PreviewChat(i64),
     PauseVoice,
     StopVoice,
     /// Emoji panel: open/close, pick a tab, insert an emoji.
@@ -319,6 +324,9 @@ pub struct OpenChat {
     /// Total number of messages in the chat.
     pub total: Option<i32>,
     pub pinned: Option<Msg>,
+    /// Opened by moving through the chat list (`open_on_select`): nothing
+    /// is read until the message pane gets focus.
+    pub preview: bool,
 }
 
 impl OpenChat {
@@ -333,6 +341,7 @@ impl OpenChat {
             at_latest: true,
             total: None,
             pinned: None,
+            preview: false,
         }
     }
 
@@ -848,8 +857,30 @@ impl App {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.handle(message);
+        let read = self.end_preview();
         // Whatever changed, make sure what is on screen gets downloaded.
-        Task::batch([task, self.fetch_visible(), self.sync_tray()])
+        Task::batch([task, read, self.fetch_visible(), self.sync_tray()])
+    }
+
+    /// A previewed chat whose messages got focus is read like an opened one.
+    fn end_preview(&mut self) -> Task<Message> {
+        match self.open.as_mut() {
+            Some(open) if open.preview && self.focus == Focus::Messages => {
+                open.preview = false;
+                self.view_visible()
+            }
+            _ => Task::none(),
+        }
+    }
+
+    /// With `open_on_select`, open the chat the cursor stopped on.
+    fn schedule_preview(&self) -> Task<Message> {
+        match self.selected {
+            Some(id) if self.cfg.open_on_select && self.open.as_ref().is_none_or(|o| o.id != id) => {
+                Task::perform(tokio::time::sleep(PREVIEW_DELAY), move |()| Message::PreviewChat(id))
+            }
+            _ => Task::none(),
+        }
     }
 
     /// Unread chats (not muted, not archived) for the tray icon.
@@ -1207,6 +1238,18 @@ impl App {
                 self.activate_media(msg_id, item)
             }
             Message::Scroll(pane, delta) => self.on_scroll(pane, delta),
+            Message::PreviewChat(id) => {
+                let still_here = self.selected == Some(id) && self.focus == Focus::Chats;
+                if !still_here || self.forward.is_some() || self.auth != Auth::Ready || self.open.as_ref().is_some_and(|o| o.id == id) {
+                    return Task::none();
+                }
+                let task = self.open_chat(id);
+                self.focus = Focus::Chats;
+                if let Some(open) = self.open.as_mut() {
+                    open.preview = true;
+                }
+                task
+            }
             Message::Tick(now) => {
                 self.now = now;
                 self.poll_players()
@@ -1520,7 +1563,8 @@ impl App {
     /// Mark messages read, but only while the user is looking: a chat left
     /// open in a window in the background stays unread (and notifies).
     fn view_messages(&self, chat_id: i64, ids: Vec<i64>) -> Task<Message> {
-        if self.looking() && !ids.is_empty() {
+        let preview = self.open.as_ref().is_some_and(|o| o.id == chat_id && o.preview);
+        if self.looking() && !preview && !ids.is_empty() {
             Task::perform(tg::view_messages(chat_id, ids), Message::Done)
         } else {
             Task::none()
@@ -3411,12 +3455,13 @@ impl App {
                 let index = index.min(self.list.len() - 1);
                 self.selected = Some(self.list[index]);
                 self.scroll_chats();
+                let preview = self.schedule_preview();
                 if index + PREFETCH >= self.list.len() {
-                    return self.load_more_chats();
+                    return Task::batch([preview, self.load_more_chats()]);
                 }
+                preview
             }
         }
-        Task::none()
     }
 
     fn scroll_chats(&mut self) {

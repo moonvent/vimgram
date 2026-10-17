@@ -20,6 +20,9 @@ pub struct Config {
     /// size (MB) is downloaded right away, so it is kept if deleted.
     #[serde(default = "default_prefetch_mb")]
     pub prefetch_mb: u32,
+    /// Moving through the chat list opens the selected chat beside it.
+    #[serde(default)]
+    pub open_on_select: bool,
 }
 
 fn default_theme() -> String {

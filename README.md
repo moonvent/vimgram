@@ -26,6 +26,8 @@ folder = "Личка"        # optional: folder to start in (by name, any case)
 tray = true             # optional: tray icon (waybar `tray` module)
 close_to_tray = true    # optional: closing the window keeps vimgram in the tray
 prefetch_mb = 50        # optional: auto-download media up to this size (see below)
+open_on_select = true   # optional: moving through the chat list opens the chat beside it
+                        # (read only once you move into its messages)
 ```
 
 ```sh
