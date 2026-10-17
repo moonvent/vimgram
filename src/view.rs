@@ -76,8 +76,10 @@ pub fn emoji_rows(height: f32) -> usize {
 const DAY_H: f32 = 30.0;
 /// "Forwarded from …" line above a forwarded message.
 const FORWARD_H: f32 = 18.0;
-/// Reactions under a message: a line of chips, and a pessimistic chip width.
-const REACTIONS_H: f32 = 28.0;
+/// Reactions under a message: one chip, a line of chips with the space
+/// between lines, and a pessimistic chip width.
+const REACTION_CHIP_H: f32 = 24.0;
+const REACTIONS_H: f32 = REACTION_CHIP_H + 4.0;
 const REACTION_W: f32 = 68.0;
 /// Line between posts or between messages far apart in time.
 const BLOCK_H: f32 = 13.0;
@@ -180,7 +182,9 @@ pub fn message_height(m: &Msg, width: f32) -> f32 {
     let reply = if m.reply_to.is_some() { REPLY_H } else { 0.0 };
     let reply = reply + if m.forward.is_some() { FORWARD_H } else { 0.0 };
     let per_row = ((width - 20.0) / REACTION_W).max(1.0) as usize;
-    let reactions = m.reactions.len().div_ceil(per_row) as f32 * REACTIONS_H;
+    // Rows of chips, the padding above them and the column spacing.
+    let rows = m.reactions.len().div_ceil(per_row);
+    let reactions = if rows == 0 { 0.0 } else { rows as f32 * REACTIONS_H + 2.0 };
     12.0 + 18.0 + reply + media_block_height(&m.media, width) + lines as f32 * LINE_H + reactions + MSG_SPACING
 }
 
@@ -1352,7 +1356,9 @@ fn reactions_row(m: &Msg) -> Element<'_, Message> {
                     .spacing(4)
                     .align_y(Alignment::Center),
             )
-            .padding([2.0, 8.0])
+            .height(REACTION_CHIP_H)
+            .align_y(Alignment::Center)
+            .padding([0.0, 8.0])
             .style(move |t: &Theme| {
                 let p = t.extended_palette();
                 let (background, border) = if chosen {
