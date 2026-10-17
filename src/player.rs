@@ -348,6 +348,13 @@ impl Audio {
         self.pipeline.set_property("volume", volume);
     }
 
+    /// Go to `at`; before it can seek, start there instead.
+    pub fn seek(&mut self, at: Duration) {
+        if self.start.is_some() || self.seek_to(at).is_err() {
+            self.start = Some(at);
+        }
+    }
+
     pub fn seek_by(&mut self, delta: f64) {
         let target = (self.position().as_secs_f64() + delta).max(0.0);
         let target = match self.duration() {
@@ -662,6 +669,14 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(audio.position() >= Duration::from_millis(900), "at {:?}", audio.position());
+        // Seeking to a point (a click on the waveform, a dragged slider).
+        audio.seek(Duration::from_secs(2));
+        let soon = std::time::Instant::now() + Duration::from_millis(300);
+        while audio.position() < Duration::from_millis(1900) && std::time::Instant::now() < soon {
+            audio.poll().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(audio.position() >= Duration::from_millis(1900), "at {:?}", audio.position());
         audio.set_speed(4.0);
         audio.seek_by(1.0);
         audio.toggle_pause();

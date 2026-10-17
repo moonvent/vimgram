@@ -105,7 +105,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `m` | mute or unmute the chat (under the cursor in the list, otherwise the open one) |
 | `U` | leave the group or unsubscribe from the channel (asks first); joins one you are not in. Channels you can't post in show these two keys instead of the compose line |
 | `}` / `{`, `:volume 70` | volume up / down by 10% (or set it); one volume for videos, voice messages and music, remembered |
-| `H` / `L` | seek voice message or music −5s / +5s |
+| `H` / `L` | seek voice message or music −5s / +5s; with the mouse: click on a voice message's waveform, drag the progress of music or of a video |
 | `Esc`, `Ctrl-[` | normal mode; cancel reply, edit, forward, filter, attachment; with nothing to cancel asks to quit (`y`/`Enter`) |
 | `/` | chat list: filter chats; message pane: search messages (`/#tag`: only the messages with that hashtag, like clicking it) |
 | `n` / `N` | next (older) / previous (newer) search match |

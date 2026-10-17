@@ -6,7 +6,7 @@ use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::text::Wrapping;
 use iced::widget::{
     Column, Row, center, column, container, image, mouse_area, progress_bar, rich_text, row, rule, scrollable,
-    space, span, stack, text, tooltip,
+    slider, space, span, stack, text, tooltip,
 };
 use iced::mouse::Interaction;
 use iced::{Alignment, Color, ContentFit, Element, Font, Length, Size, Theme, font};
@@ -1290,7 +1290,59 @@ fn unlistened_dot<'a>() -> Element<'a, Message> {
     text("●").size(9).style(primary_text).into()
 }
 
-fn voice_view<'a>(app: &'a App, msg_id: i64, duration: i32, waveform: &'a [u8], listened: bool) -> Element<'a, Message> {
+/// Progress that can be dragged: of a music file (`target`), or of the
+/// video in the viewer (`None`).
+fn scrubber<'a>(app: &App, target: Option<(i64, usize)>, progress: f64, girth: f32) -> Element<'a, Message> {
+    let value = match app.scrub {
+        Some((t, fraction)) if t == target => fraction,
+        _ => progress.clamp(0.0, 1.0),
+    };
+    slider(0.0..=1.0, value, move |f| Message::Scrub(target, f))
+        .step(0.001)
+        .on_release(Message::ScrubDone)
+        .height(girth + 8.0)
+        .style(move |t: &Theme, status| {
+            let p = t.extended_palette();
+            let handle = if status == slider::Status::Active { girth + 1.0 } else { girth + 3.0 };
+            slider::Style {
+                rail: slider::Rail {
+                    backgrounds: (p.primary.base.color.into(), p.background.strong.color.into()),
+                    width: girth,
+                    border: iced::border::rounded(girth / 2.0),
+                },
+                handle: slider::Handle {
+                    shape: slider::HandleShape::Circle { radius: handle },
+                    background: p.primary.base.color.into(),
+                    border_width: 0.0,
+                    border_color: Color::TRANSPARENT,
+                },
+            }
+        })
+        .into()
+}
+
+/// Waveform bars, each a click target: playing from there.
+fn waveform_row<'a>(msg_id: i64, item: usize, played: &str, rest: &str) -> Element<'a, Message> {
+    let total = (played.chars().count() + rest.chars().count()).max(1) as f64;
+    let bars = played.chars().map(|c| (c, true)).chain(rest.chars().map(|c| (c, false)));
+    Row::with_children(bars.enumerate().map(|(i, (c, done))| {
+        let bar = text(c.to_string()).size(14).style(if done { primary_text } else { muted_text });
+        mouse_area(bar)
+            .on_press(Message::SeekVoice { msg_id, item, fraction: i as f64 / total })
+            .interaction(Interaction::Pointer)
+            .into()
+    }))
+    .into()
+}
+
+fn voice_view<'a>(
+    app: &'a App,
+    msg_id: i64,
+    item: usize,
+    duration: i32,
+    waveform: &'a [u8],
+    listened: bool,
+) -> Element<'a, Message> {
     let playback = app.voice.as_ref().filter(|v| v.msg_id == msg_id);
     let (icon, progress, time) = match playback.map(|v| v.audio.as_ref()) {
         Some(Some(audio)) => {
@@ -1305,7 +1357,7 @@ fn voice_view<'a>(app: &'a App, msg_id: i64, duration: i32, waveform: &'a [u8], 
     let (played, rest) = waveform_bars(waveform, progress);
     let mut line = row![
         text(icon).size(16).style(primary_text),
-        row![text(played).size(14).style(primary_text), text(rest).size(14).style(muted_text)],
+        waveform_row(msg_id, item, &played, &rest),
         text(time).size(12).style(muted_text),
     ]
     .spacing(10)
@@ -1321,7 +1373,14 @@ fn voice_view<'a>(app: &'a App, msg_id: i64, duration: i32, waveform: &'a [u8], 
 
 /// A music file. Album tracks share the message, so what plays is told by
 /// the file.
-fn audio_view<'a>(app: &'a App, file: i32, media: &Media, duration: i32, width: f32) -> Element<'a, Message> {
+fn audio_view<'a>(
+    app: &'a App,
+    (msg_id, item): (i64, usize),
+    file: i32,
+    media: &Media,
+    duration: i32,
+    width: f32,
+) -> Element<'a, Message> {
     let playback = app.voice.as_ref().filter(|v| v.file_id == file);
     let (icon, progress, time) = match playback.map(|v| v.audio.as_ref()) {
         Some(Some(audio)) => {
@@ -1329,7 +1388,7 @@ fn audio_view<'a>(app: &'a App, file: i32, media: &Media, duration: i32, width: 
             let pos = audio.position().as_secs_f64();
             let icon = if audio.paused() { "▶" } else { "⏸" };
             let time = format!("{} / {}  {}", fmt_secs(pos), fmt_secs(total), player::fmt_speed(app.speed()));
-            (icon, (pos / total) as f32, time)
+            (icon, pos / total, time)
         }
         Some(None) => ("…", 0.0, "loading…".to_owned()),
         None if duration > 0 => ("▶", 0.0, fmt_duration(duration)),
@@ -1338,10 +1397,10 @@ fn audio_view<'a>(app: &'a App, file: i32, media: &Media, duration: i32, width: 
     let name = media.track_name().unwrap_or_default();
     let info = column![
         text(format!("🎵 {name}")).size(14).wrapping(Wrapping::None),
-        progress_bar(0.0..=1.0, progress).girth(3),
+        scrubber(app, Some((msg_id, item)), progress, 3.0),
         text(time).size(12).style(muted_text),
     ]
-    .spacing(4)
+    .spacing(1)
     .width(Length::Fill)
     .clip(true);
     container(row![text(icon).size(18).style(primary_text), info].spacing(10).align_y(Alignment::Center))
@@ -1380,8 +1439,10 @@ fn media_cell<'a>(
             ..Default::default()
         })
         .into(),
-        Media::Voice { duration, waveform, listened, .. } => voice_view(app, msg_id, *duration, waveform, *listened),
-        Media::Audio { file, duration, .. } => audio_view(app, *file, media, *duration, size.width),
+        Media::Voice { duration, waveform, listened, .. } => {
+            voice_view(app, msg_id, item, *duration, waveform, *listened)
+        }
+        Media::Audio { file, duration, .. } => audio_view(app, (msg_id, item), *file, media, *duration, size.width),
         Media::Video { .. } => video_cell(app, media, size, radius),
         _ => match media.inline_file().and_then(|file| app.media.get(file)) {
             Some(Loaded::Image(handle)) => image(handle.clone())
@@ -1736,7 +1797,7 @@ fn media_viewer(app: &App) -> Option<Element<'_, Message>> {
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .content_fit(ContentFit::Contain),
-                video_progress(video),
+                video_progress(app, video),
             ]
             .spacing(10)
             .into(),
@@ -1761,7 +1822,7 @@ fn media_viewer(app: &App) -> Option<Element<'_, Message>> {
 }
 
 /// Under a video in the viewer: time played, progress, length.
-fn video_progress<'a>(video: &iced_video_player::Video) -> Element<'a, Message> {
+fn video_progress<'a>(app: &App, video: &iced_video_player::Video) -> Element<'a, Message> {
     let total = video.duration().as_secs_f64();
     let pos = video.position().as_secs_f64().min(total);
     let time = |secs: f64| {
@@ -1769,8 +1830,13 @@ fn video_progress<'a>(video: &iced_video_player::Video) -> Element<'a, Message> 
             color: Some(Color::from_rgb8(0xc8, 0xc8, 0xd0)),
         })
     };
-    let progress = if total > 0.0 { (pos / total) as f32 } else { 0.0 };
-    row![time(pos), progress_bar(0.0..=1.0, progress).girth(4), time(total)]
+    // While dragging, the time shown is where it goes.
+    let pos = match app.scrub {
+        Some((None, fraction)) => fraction * total,
+        _ => pos,
+    };
+    let progress = if total > 0.0 { pos / total } else { 0.0 };
+    row![time(pos), scrubber(app, None, progress, 4.0), time(total)]
         .spacing(10)
         .padding([0, 4])
         .align_y(Alignment::Center)

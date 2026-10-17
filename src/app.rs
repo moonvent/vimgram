@@ -196,6 +196,12 @@ pub enum Message {
     ClickChat(i64),
     SelectMsg(i64),
     ClickMedia { msg_id: i64, item: usize },
+    /// Click on a bar of a voice message's waveform: play from there.
+    SeekVoice { msg_id: i64, item: usize, fraction: f64 },
+    /// Dragging a progress slider: of a music file in the chat, or of the
+    /// video in the viewer (`None`). Seeks once let go.
+    Scrub(Option<(i64, usize)>, f64),
+    ScrubDone,
     Scroll(Pane, ScrollDelta),
     Tick(Instant),
     Done(Result<(), String>),
@@ -251,6 +257,8 @@ pub struct VoicePlayback {
     pub file_id: i32,
     /// Voice message or music: each keeps its own speed.
     pub kind: SpeedKind,
+    /// Where to start once downloaded; zero: where it was left, if anywhere.
+    start: Duration,
     /// `None` while the file downloads.
     pub audio: Option<Audio>,
 }
@@ -597,6 +605,8 @@ pub struct App {
     pub viewer: Option<Viewer>,
     pub video: Option<VideoPlayback>,
     pub voice: Option<VoicePlayback>,
+    /// A progress slider being dragged: what it seeks and where to.
+    pub scrub: Option<(Option<(i64, usize)>, f64)>,
     /// Where voice messages and music were left when something else
     /// started, by file: they go on from a bit earlier.
     resume: HashMap<i32, Duration>,
@@ -724,6 +734,7 @@ impl App {
             viewer: None,
             video: None,
             voice: None,
+            scrub: None,
             resume: HashMap::new(),
             speeds: Speeds::load(),
             volume: player::load_volume(),
@@ -1486,6 +1497,15 @@ impl App {
                 self.select_message(id);
                 Task::none()
             }
+            Message::SeekVoice { msg_id, item, fraction } => self.seek_media(Some((msg_id, item)), fraction),
+            Message::Scrub(target, fraction) => {
+                self.scrub = Some((target, fraction.clamp(0.0, 1.0)));
+                Task::none()
+            }
+            Message::ScrubDone => match self.scrub.take() {
+                Some((target, fraction)) => self.seek_media(target, fraction),
+                None => Task::none(),
+            },
             Message::ClickMedia { msg_id, item } => {
                 self.select_message(msg_id);
                 if self.reveal(msg_id) {
@@ -2632,8 +2652,10 @@ impl App {
         if self.voice.as_ref().is_none_or(|v| v.file_id != file_id) {
             return Task::none();
         }
-        let start = self.resume.remove(&file_id).map_or(Duration::ZERO, |at| at.saturating_sub(RESUME_BACK));
-        if start > Duration::ZERO {
+        let resumed = self.resume.remove(&file_id).map_or(Duration::ZERO, |at| at.saturating_sub(RESUME_BACK));
+        let chosen = self.voice.as_ref().map_or(Duration::ZERO, |v| v.start);
+        let start = if chosen > Duration::ZERO { chosen } else { resumed };
+        if chosen == Duration::ZERO && start > Duration::ZERO {
             self.info(format!("Going on from {}", tg::fmt_duration(start.as_secs() as i32)));
         }
         if let Some(voice) = self.voice.as_mut() {
@@ -2689,9 +2711,49 @@ impl App {
             sender,
             file_id,
             kind,
+            start: Duration::ZERO,
             audio: None,
         });
         Self::play_download(file_id)
+    }
+
+    /// Go to `fraction` of a voice message or music file (starting it if
+    /// something else plays), or of the video in the viewer (`None`).
+    fn seek_media(&mut self, target: Option<(i64, usize)>, fraction: f64) -> Task<Message> {
+        let fraction = fraction.clamp(0.0, 1.0);
+        let Some((msg_id, item)) = target else {
+            if let Some(movie) = self.video.as_mut().and_then(VideoPlayback::movie_mut) {
+                let at = movie.video.duration().mul_f64(fraction);
+                let _ = movie.seek(at);
+            }
+            return Task::none();
+        };
+        let Some(media) = self.open.as_ref().and_then(|o| o.media(Viewer { msg_id, item })) else {
+            return Task::none();
+        };
+        let Some(file) = media.audible() else {
+            return Task::none();
+        };
+        let known = match media {
+            Media::Voice { duration, .. } | Media::Audio { duration, .. } => Duration::from_secs(*duration as u64),
+            _ => Duration::ZERO,
+        };
+        let kind = audio_kind(media);
+        if let Some(voice) = self.voice.as_mut().filter(|v| v.file_id == file) {
+            match voice.audio.as_mut() {
+                Some(audio) => {
+                    let total = audio.duration().unwrap_or(known);
+                    audio.seek(total.mul_f64(fraction));
+                }
+                None => voice.start = known.mul_f64(fraction),
+            }
+            return Task::none();
+        }
+        let task = self.toggle_voice(msg_id, file, kind);
+        if let Some(voice) = self.voice.as_mut().filter(|v| v.file_id == file) {
+            voice.start = known.mul_f64(fraction);
+        }
+        task
     }
 
     /// Stop the voice message or music, remembering where it was.
