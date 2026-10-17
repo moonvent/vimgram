@@ -58,6 +58,13 @@ jobs:
       - name: TDLib
         shell: pwsh
         run: ./scripts/fetch-tdlib.ps1
+      # rlottie-sys can't build rlottie with MSVC itself; it takes this one
+      # through pkg-config.
+      - name: rlottie
+        shell: pwsh
+        run: |
+          ./scripts/build-rlottie.ps1
+          "PKG_CONFIG_PATH=$env:PKG_CONFIG_PATH;$PWD\vendor\rlottie" >> $env:GITHUB_ENV
       - run: cargo build --release --locked
       # Same layout as GStreamer's own prefix, so it finds its plugins in
       # lib\gstreamer-1.0 next to bin\ without any environment variables.
@@ -68,6 +75,7 @@ jobs:
           New-Item -ItemType Directory -Force "$dist\bin", "$dist\lib\gstreamer-1.0" | Out-Null
           Copy-Item target\release\vimgram.exe "$dist\bin"
           Copy-Item vendor\tdlib\bin\*.dll "$dist\bin"
+          Copy-Item vendor\rlottie\build\Release\rlottie.dll "$dist\bin"
           Copy-Item "$env:GSTREAMER_ROOT\bin\*.dll" "$dist\bin"
           Copy-Item "$env:GSTREAMER_ROOT\lib\gstreamer-1.0\*.dll" "$dist\lib\gstreamer-1.0"
           # Found by vimgram in fonts\ next to bin\ (fonts.rs).

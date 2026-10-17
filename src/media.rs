@@ -6,7 +6,9 @@
 //! length; they play through a GStreamer video pipeline instead.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
 use std::io::Read;
+use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -195,11 +197,11 @@ fn decode_tgs(path: &str, size: Size) -> Result<Frames, String> {
     flate2::read::GzDecoder::new(file)
         .read_to_end(&mut json)
         .map_err(|e| format!("tgs: {e}"))?;
-    let mut animation = rlottie::Animation::from_data(json, path, "")
-        .ok_or_else(|| "tgs: invalid lottie data".to_string())?;
+    let mut animation =
+        Lottie::from_data(json, path).ok_or_else(|| "tgs: invalid lottie data".to_string())?;
 
     let (w, h) = (size.width.max(1.0) as usize, size.height.max(1.0) as usize);
-    let mut surface = rlottie::Surface::new(rlottie::Size::new(w, h));
+    let mut pixels = vec![0u32; w * h];
     let total = animation.totalframe().max(1);
     let fps = animation.framerate().max(1.0);
     // Sample at most 30 fps: plenty for stickers, half the memory of 60.
@@ -208,8 +210,8 @@ fn decode_tgs(path: &str, size: Size) -> Result<Frames, String> {
         .step_by(step)
         .take(MAX_ANIMATION_FRAMES)
         .map(|frame| {
-            animation.render(frame, &mut surface);
-            Handle::from_rgba(w as u32, h as u32, bgra_premultiplied_to_rgba(surface.data_as_bytes()))
+            animation.render(frame, &mut pixels, w, h);
+            Handle::from_rgba(w as u32, h as u32, argb_premultiplied_to_rgba(&pixels))
         })
         .collect();
     Ok(Frames {
@@ -218,11 +220,61 @@ fn decode_tgs(path: &str, size: Size) -> Result<Frames, String> {
     })
 }
 
-/// rlottie renders premultiplied BGRA; iced wants straight RGBA.
-fn bgra_premultiplied_to_rgba(bgra: &[u8]) -> Vec<u8> {
-    let mut rgba = Vec::with_capacity(bgra.len());
-    for px in bgra.as_chunks::<4>().0 {
-        let (b, g, r, a) = (px[0], px[1], px[2], px[3]);
+/// The few calls of rlottie's C API that stickers need. Not the `rlottie`
+/// crate: that one only builds on unix.
+struct Lottie(NonNull<rlottie_sys::Lottie_Animation>);
+
+impl Lottie {
+    /// `key` caches the parsed animation inside rlottie.
+    fn from_data(json: Vec<u8>, key: &str) -> Option<Self> {
+        let json = CString::new(json).ok()?;
+        let key = CString::new(key).ok()?;
+        // SAFETY: all three are valid nul-terminated strings; rlottie copies them.
+        let ptr = unsafe {
+            rlottie_sys::lottie_animation_from_data(json.as_ptr(), key.as_ptr(), c"".as_ptr())
+        };
+        NonNull::new(ptr).map(Self)
+    }
+
+    fn totalframe(&self) -> usize {
+        // SAFETY: the pointer is a live animation until drop.
+        unsafe { rlottie_sys::lottie_animation_get_totalframe(self.0.as_ptr()) }
+    }
+
+    fn framerate(&self) -> f64 {
+        // SAFETY: as above.
+        unsafe { rlottie_sys::lottie_animation_get_framerate(self.0.as_ptr()) }
+    }
+
+    /// Draws `frame` into `pixels`, `width` × `height` of them.
+    fn render(&mut self, frame: usize, pixels: &mut [u32], width: usize, height: usize) {
+        assert_eq!(pixels.len(), width * height);
+        // SAFETY: `pixels` holds exactly `height` rows of `width * 4` bytes.
+        unsafe {
+            rlottie_sys::lottie_animation_render(
+                self.0.as_ptr(),
+                frame,
+                pixels.as_mut_ptr(),
+                width,
+                height,
+                width * 4,
+            );
+        }
+    }
+}
+
+impl Drop for Lottie {
+    fn drop(&mut self) {
+        // SAFETY: created by lottie_animation_from_data, destroyed only here.
+        unsafe { rlottie_sys::lottie_animation_destroy(self.0.as_ptr()) }
+    }
+}
+
+/// rlottie renders premultiplied ARGB pixels; iced wants straight RGBA.
+fn argb_premultiplied_to_rgba(pixels: &[u32]) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(pixels.len() * 4);
+    for px in pixels {
+        let [a, r, g, b] = px.to_be_bytes();
         let unmul = |c: u8| {
             if a == 0 {
                 0

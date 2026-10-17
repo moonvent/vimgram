@@ -545,6 +545,8 @@ fn window_settings(size: Size) -> window::Settings {
         size,
         icon: icon::window_icon(),
         exit_on_close_request: false,
+        // The Wayland app id; other platforms have no such field.
+        #[cfg(target_os = "linux")]
         platform_specific: window::settings::PlatformSpecific {
             application_id: "vimgram".into(),
             ..Default::default()

@@ -48,7 +48,10 @@ Building it yourself (what [CI](.github/workflows/ci.yml) does):
    (`choco install pkgconfiglite`), and `PKG_CONFIG_PATH` set to
    `<gstreamer>\lib\pkgconfig`, `<gstreamer>\bin` in `PATH`.
 3. `.\scripts\fetch-tdlib.ps1` and `.\scripts\fetch-emoji.ps1`.
-4. `cargo build --release`, then copy `vendor\tdlib\bin\*.dll` next to
+4. `.\scripts\build-rlottie.ps1` (Lottie stickers), then add `vendor\rlottie`
+   to `PKG_CONFIG_PATH`.
+5. `cargo build --release`, then copy `vendor\tdlib\bin\*.dll` and
+   `vendor\rlottie\build\Release\rlottie.dll` next to
    `target\release\vimgram.exe`.
 
 ## Linux (Fedora)
@@ -190,4 +193,4 @@ git tag v0.1.0 && git push origin v0.1.0
 ## License
 
 [MIT](LICENSE). Release builds bundle TDLib (BSL-1.0), GStreamer (LGPL-2.1+,
-linked dynamically) and Noto Color Emoji (OFL-1.1) under their own licenses.
+linked dynamically), rlottie (MIT) and Noto Color Emoji (OFL-1.1) under their own licenses.

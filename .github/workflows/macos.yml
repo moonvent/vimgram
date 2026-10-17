@@ -22,5 +22,11 @@ jobs:
         run: brew install gstreamer pkgconf cmake ninja
       - name: TDLib
         run: ./scripts/fetch-tdlib.sh
+      # rlottie-sys's own build of rlottie fails to link on macOS; it takes
+      # this one through pkg-config.
+      - name: rlottie
+        run: |
+          ./scripts/build-rlottie.sh
+          echo "PKG_CONFIG_PATH=$PWD/vendor/rlottie:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
       - run: cargo build --release --locked
       - run: cargo test --release --locked

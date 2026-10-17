@@ -4571,16 +4571,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 
 [[package]]
-name = "rlottie"
-version = "0.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74b1485b7d3d35af9d248389250ebd0ab92ee9c989f1bb607d0aae51b1c66f6a"
-dependencies = [
- "rgb",
- "rlottie-sys",
-]
-
-[[package]]
 name = "rlottie-sys"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5710,7 +5700,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vimgram"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arboard",
  "base64 0.23.1",
@@ -5730,7 +5720,7 @@ dependencies = [
  "notify-rust",
  "printpdf",
  "rfd",
- "rlottie",
+ "rlottie-sys",
  "rusqlite",
  "serde",
  "serde_json",
