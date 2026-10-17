@@ -13,11 +13,11 @@ use tdlib_rs::types::{ChatNotificationSettings, ChatPhotoInfo, ChatPosition};
 use crate::archive::{Archive, Record};
 use crate::config::{self, Config};
 use crate::clipboard::{self, Clip};
-use crate::emoji::{self, Picker};
+use crate::emoji::{self, Picker, React};
 use crate::{autostart, export, icon, notify, tray};
 use crate::media::{self, Kind, Loaded, Shared, Store};
 use crate::player::{self, Audio, Movie, SpeedKind, Speeds};
-use crate::tg::{self, ChatKind, Folder, ListKey, Media, Msg, Presence, Scope, SendOptions, Sender, User};
+use crate::tg::{self, ChatKind, Folder, ListKey, Media, Msg, Presence, ReactionKind, Scope, SendOptions, Sender, User};
 use crate::view;
 use crate::vim::{Action, History, Input, Mode, NKey, Pending, normalize};
 use crate::voice::Recorder;
@@ -47,7 +47,7 @@ const CACHE_DAYS: i32 = 7;
 pub const TALL_ID: &str = "tall-message";
 
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l panes  J/K gt/gT Alt-N folders  \
-                    Enter open/play  i insert  q record  r reply  cc/e edit  f forward  dd delete  \
+                    Enter open/play  i insert  q record  r reply  R react  cc/e edit  f forward  dd delete  \
                     yy/Y copy  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  H/L seek  \
                     / filter chats or search messages  n/N next/prev match  ga attach  gp pinned  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
@@ -138,7 +138,15 @@ pub enum Message {
     /// Emoji panel: open/close, pick a tab, insert an emoji.
     ToggleEmoji,
     EmojiTab(usize),
-    EmojiPick(&'static str),
+    EmojiPick(String),
+    /// Emoji that can be put as a reaction to the message (`R`).
+    Reactions {
+        chat_id: i64,
+        msg_id: i64,
+        result: Result<Vec<String>, String>,
+    },
+    /// A reaction under a message was clicked.
+    ToggleReaction { msg_id: i64, kind: ReactionKind },
     ClickFolder(usize),
     ClickChat(i64),
     SelectMsg(i64),
@@ -1133,10 +1141,46 @@ impl App {
                 }
                 Task::none()
             }
-            Message::EmojiPick(e) => {
-                self.insert_emoji(e);
+            Message::EmojiPick(e) => self.pick_emoji(e),
+            Message::Reactions { chat_id, msg_id, result } => {
+                match result {
+                    _ if self.open.as_ref().is_none_or(|o| o.id != chat_id) => {}
+                    Ok(mut choices) => {
+                        // Reactions already put stay removable even when no longer offered.
+                        let msg = self.open.as_ref().and_then(|o| o.position(msg_id).map(|i| &o.msgs[i]));
+                        for r in msg.into_iter().flat_map(|m| &m.reactions).filter(|r| r.chosen) {
+                            if let ReactionKind::Emoji(e) = &r.kind
+                                && !choices.contains(e)
+                            {
+                                choices.insert(0, e.clone());
+                            }
+                        }
+                        if choices.is_empty() {
+                            self.error("No reactions allowed here");
+                        } else {
+                            self.emoji = Some(Picker::reactions(React { chat_id, msg_id, choices }));
+                            self.scroll_messages();
+                        }
+                    }
+                    Err(e) => self.error(format!("Reactions: {e}")),
+                }
                 Task::none()
             }
+            Message::ToggleReaction { msg_id, kind } => match kind {
+                ReactionKind::Emoji(e) => self.toggle_reaction(msg_id, e),
+                kind => {
+                    let Some(chat_id) = self.open.as_ref().map(|o| o.id) else {
+                        return Task::none();
+                    };
+                    let chosen = self.reaction_chosen(msg_id, &kind);
+                    if chosen {
+                        Task::perform(tg::remove_reaction(chat_id, msg_id, kind), Message::Done)
+                    } else {
+                        self.error("Only emoji reactions can be put from here");
+                        Task::none()
+                    }
+                }
+            },
             Message::TallScroll(viewport) => {
                 self.tall_offset = viewport.absolute_offset().y;
                 self.tall_max = Some((viewport.content_bounds().height - viewport.bounds().height).max(0.0));
@@ -1339,6 +1383,18 @@ impl App {
                     && let Some(i) = open.position(u.message_id)
                 {
                     open.msgs[i].media.iter_mut().for_each(Media::set_listened);
+                }
+            }
+            Update::MessageInteractionInfo(u) => {
+                if let Some(open) = self.open.as_mut().filter(|o| o.id == u.chat_id)
+                    && let Some(i) = open.position(u.message_id)
+                {
+                    let reactions = tg::reactions(u.interaction_info.as_ref());
+                    let msg = &mut open.msgs[i];
+                    // Another part of an album without reactions doesn't clear them.
+                    if msg.id == u.message_id || !reactions.is_empty() {
+                        msg.reactions = reactions;
+                    }
                 }
             }
             Update::MessageEdited(u) => {
@@ -2399,10 +2455,15 @@ impl App {
     /// Tab switches groups, `/` searches by name, Esc closes.
     fn key_emoji(&mut self, key: &Key, physical: Physical, mods: Modifiers, text: Option<&str>) -> Task<Message> {
         let rows = self.emoji_rows();
-        let items = self.emoji.as_ref().map(|p| p.items(&self.recent_emoji)).unwrap_or_default();
+        let items: Vec<String> = self
+            .emoji
+            .as_ref()
+            .map(|p| p.items(&self.recent_emoji).into_iter().map(str::to_owned).collect())
+            .unwrap_or_default();
         let Some(picker) = self.emoji.as_mut() else {
             return Task::none();
         };
+        let reacting = picker.react.is_some();
         if picker.searching {
             match key {
                 Key::Named(Named::Escape | Named::Enter) => picker.searching = false,
@@ -2428,7 +2489,9 @@ impl App {
             return Task::none();
         }
         if matches!(key, Key::Named(Named::Tab)) {
-            picker.next_tab(if mods.shift() { -1 } else { 1 });
+            if !reacting {
+                picker.next_tab(if mods.shift() { -1 } else { 1 });
+            }
             return Task::none();
         }
         let Some(nkey) = normalize(key, physical, mods) else {
@@ -2448,22 +2511,58 @@ impl App {
             NKey::Ctrl('u') => picker.step(0, -(rows as isize) / 2, items.len(), rows),
             NKey::Char('g') => picker.step(-(items.len() as isize), 0, items.len(), rows),
             NKey::Char('G') => picker.step(items.len() as isize, 0, items.len(), rows),
-            NKey::Char(']') => picker.next_tab(1),
-            NKey::Char('[') => picker.next_tab(-1),
-            NKey::Char(c @ '0'..='9') => picker.set_tab((c as usize - '0' as usize + 9) % 10),
+            // Reactions have no groups: digits pick the n-th one.
+            NKey::Char(c @ '1'..='9') if reacting => pick = items.get(c as usize - '1' as usize).cloned(),
+            NKey::Char(']') if !reacting => picker.next_tab(1),
+            NKey::Char('[') if !reacting => picker.next_tab(-1),
+            NKey::Char(c @ '0'..='9') if !reacting => picker.set_tab((c as usize - '0' as usize + 9) % 10),
             NKey::Char('/') => {
                 picker.searching = true;
                 picker.query.clear();
                 picker.cursor = 0;
                 picker.top = 0;
             }
-            NKey::Enter | NKey::Space => pick = items.get(picker.cursor).copied(),
+            NKey::Enter | NKey::Space => pick = items.get(picker.cursor).cloned(),
             _ => {}
         }
-        if let Some(e) = pick {
-            self.insert_emoji(e);
+        match pick {
+            Some(e) => self.pick_emoji(e),
+            None => Task::none(),
         }
-        Task::none()
+    }
+
+    /// An emoji chosen in the panel: typed, or put as the reaction.
+    fn pick_emoji(&mut self, e: String) -> Task<Message> {
+        let Some(react) = self.emoji.as_ref().and_then(|p| p.react.clone()) else {
+            self.insert_emoji(&e);
+            return Task::none();
+        };
+        self.close_emoji();
+        if self.open.as_ref().is_none_or(|o| o.id != react.chat_id) {
+            return Task::none();
+        }
+        self.toggle_reaction(react.msg_id, e)
+    }
+
+    fn reaction_chosen(&self, msg_id: i64, kind: &ReactionKind) -> bool {
+        self.open
+            .as_ref()
+            .and_then(|o| o.position(msg_id).map(|i| &o.msgs[i]))
+            .is_some_and(|m| m.reactions.iter().any(|r| r.chosen && r.kind == *kind))
+    }
+
+    /// Put the reaction on the message, or take it back if it's already there.
+    fn toggle_reaction(&mut self, msg_id: i64, emoji: String) -> Task<Message> {
+        let Some(chat_id) = self.open.as_ref().map(|o| o.id) else {
+            return Task::none();
+        };
+        let kind = ReactionKind::Emoji(emoji.clone());
+        if self.reaction_chosen(msg_id, &kind) {
+            Task::perform(tg::remove_reaction(chat_id, msg_id, kind), Message::Done)
+        } else {
+            emoji::remember(&mut self.recent_emoji, &emoji);
+            Task::perform(tg::add_reaction(chat_id, msg_id, emoji), Message::Done)
+        }
     }
 
     fn key_confirm(&mut self, key: NKey) -> Task<Message> {
@@ -2949,6 +3048,19 @@ impl App {
                 self.open_emoji();
                 Task::none()
             }
+            Action::React => match (self.open.as_ref().map(|o| o.id), self.focused_message().map(|m| m.id)) {
+                (Some(chat_id), Some(msg_id)) => {
+                    Task::perform(tg::available_reactions(chat_id, msg_id), move |result| Message::Reactions {
+                        chat_id,
+                        msg_id,
+                        result,
+                    })
+                }
+                _ => {
+                    self.error("Select a message first (l)");
+                    Task::none()
+                }
+            },
             Action::JumpPlaying => match self.voice.as_ref().map(|v| (v.chat_id, v.msg_id)) {
                 Some((chat_id, msg_id)) => {
                     self.select_chat(chat_id);
@@ -3542,6 +3654,7 @@ mod tests {
             scheduled: false,
             deleted: false,
             local_files: Vec::new(),
+            reactions: Vec::new(),
         }
     }
 

@@ -71,6 +71,9 @@ pub fn emoji_rows(height: f32) -> usize {
 
 /// Date separator above the first message of each day.
 const DAY_H: f32 = 30.0;
+/// Reactions under a message: a line of chips, and a pessimistic chip width.
+const REACTIONS_H: f32 = 28.0;
+const REACTION_W: f32 = 68.0;
 /// Line between posts or between messages far apart in time.
 const BLOCK_H: f32 = 13.0;
 const BLOCK_GAP: i32 = 3600;
@@ -170,7 +173,9 @@ pub fn message_height(m: &Msg, width: f32) -> f32 {
             .sum()
     };
     let reply = if m.reply_to.is_some() { REPLY_H } else { 0.0 };
-    12.0 + 18.0 + reply + media_block_height(&m.media, width) + lines as f32 * LINE_H + MSG_SPACING
+    let per_row = ((width - 20.0) / REACTION_W).max(1.0) as usize;
+    let reactions = m.reactions.len().div_ceil(per_row) as f32 * REACTIONS_H;
+    12.0 + 18.0 + reply + media_block_height(&m.media, width) + lines as f32 * LINE_H + reactions + MSG_SPACING
 }
 
 fn local_day(unix: i32) -> Option<chrono::NaiveDate> {
@@ -873,10 +878,21 @@ fn emoji_panel<'a>(app: &'a App, picker: &'a Picker) -> Element<'a, Message> {
         .into()
     }));
 
+    let tabs: Element<_> = if picker.react.is_some() {
+        container(text("React to the message").size(13))
+            .height(EMOJI_TABS_H - 4.0)
+            .align_y(Alignment::Center)
+            .into()
+    } else {
+        tabs.into()
+    };
+
     let search = if picker.searching {
         format!("/{}▏", picker.query)
     } else if !picker.query.is_empty() {
         format!("/{}   Esc — close", picker.query)
+    } else if picker.react.is_some() {
+        "/ search   1–9 or Enter react".to_owned()
     } else {
         "/ search   Tab groups   Enter insert".to_owned()
     };
@@ -907,7 +923,7 @@ fn emoji_panel<'a>(app: &'a App, picker: &'a Picker) -> Element<'a, Message> {
                                 .align_y(Alignment::Center)
                                 .style(move |t: &Theme| selection_style(t, selected, true)),
                         )
-                        .on_press(Message::EmojiPick(e))
+                        .on_press(Message::EmojiPick((*e).to_owned()))
                         .interaction(Interaction::Pointer)
                         .into()
                     }))
@@ -1209,6 +1225,10 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
         }));
     }
 
+    if !m.reactions.is_empty() {
+        body = body.push(reactions_row(m));
+    }
+
     let bubble = container(body)
         .padding([6, 10])
         .width(Length::Fill)
@@ -1235,6 +1255,40 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
         tooltip::Position::FollowCursor,
     )
     .into()
+}
+
+/// Reaction chips; yours are highlighted, a click puts or takes back one.
+fn reactions_row(m: &Msg) -> Element<'_, Message> {
+    let chips = m.reactions.iter().map(|r| {
+        let chosen = r.chosen;
+        mouse_area(
+            container(
+                row![text(r.kind.label()).size(14), text(r.count).size(12)]
+                    .spacing(4)
+                    .align_y(Alignment::Center),
+            )
+            .padding([2.0, 8.0])
+            .style(move |t: &Theme| {
+                let p = t.extended_palette();
+                let (background, border) = if chosen {
+                    (p.primary.weak.color.scale_alpha(0.35), p.primary.base.color)
+                } else {
+                    (p.background.weak.color, Color::TRANSPARENT)
+                };
+                container::Style {
+                    background: Some(background.into()),
+                    border: iced::border::rounded(11.0).color(border).width(1.0),
+                    ..Default::default()
+                }
+            }),
+        )
+        .on_press(Message::ToggleReaction { msg_id: m.id, kind: r.kind.clone() })
+        .interaction(Interaction::Pointer)
+        .into()
+    });
+    container(Row::with_children(chips).spacing(6).wrap().vertical_spacing(4.0))
+        .padding(iced::Padding { top: 4.0, ..Default::default() })
+        .into()
 }
 
 /// Full-screen photo or video, shown instead of the panes.
@@ -1575,6 +1629,7 @@ mod tests {
             scheduled: false,
             deleted: false,
             local_files: Vec::new(),
+            reactions: Vec::new(),
         }
     }
 

@@ -143,6 +143,7 @@ mod tests {
             scheduled: false,
             deleted,
             local_files: Vec::new(),
+            reactions: Vec::new(),
         }
     }
 

@@ -20,6 +20,10 @@ pub const TABS: [(&str, Option<Group>); 10] = [
     ("🏁", Some(Group::Flags)),
 ];
 
+fn matches(e: &Emoji, query: &str) -> bool {
+    e.name().contains(query) || e.shortcodes().any(|c| c.contains(query))
+}
+
 fn base_tone(e: &&'static Emoji) -> bool {
     matches!(e.skin_tone(), None | Some(SkinTone::Default))
 }
@@ -33,6 +37,16 @@ pub struct Picker {
     /// Typing a search query (after `/`).
     pub searching: bool,
     pub query: String,
+    /// Picking a reaction to this message instead of an emoji to type.
+    pub react: Option<React>,
+}
+
+#[derive(Debug, Clone)]
+pub struct React {
+    pub chat_id: i64,
+    pub msg_id: i64,
+    /// Emoji allowed as reactions there, in Telegram's order.
+    pub choices: Vec<String>,
 }
 
 impl Picker {
@@ -43,12 +57,27 @@ impl Picker {
         }
     }
 
-    /// Emoji shown: search results, or the current tab.
-    pub fn items(&self, recent: &[String]) -> Vec<&'static str> {
+    pub fn reactions(react: React) -> Self {
+        Picker {
+            react: Some(react),
+            ..Default::default()
+        }
+    }
+
+    /// Emoji shown: search results, the current tab or the reactions.
+    pub fn items<'a>(&'a self, recent: &'a [String]) -> Vec<&'a str> {
         let query = self.query.trim().to_lowercase();
+        if let Some(react) = &self.react {
+            return react
+                .choices
+                .iter()
+                .map(String::as_str)
+                .filter(|c| query.is_empty() || emojis::get(c).is_some_and(|e| matches(e, &query)))
+                .collect();
+        }
         if !query.is_empty() {
             return emojis::iter()
-                .filter(|e| e.name().contains(&query) || e.shortcodes().any(|c| c.contains(&query)))
+                .filter(|e| matches(e, &query))
                 .map(Emoji::as_str)
                 .collect();
         }
@@ -149,6 +178,15 @@ mod tests {
         assert_eq!(picker.items(&["🔥".into(), "😀".into()]), ["🔥", "😀"]);
         picker.next_tab(-1);
         assert_eq!(picker.tab, TABS.len() - 1);
+    }
+
+    #[test]
+    fn reactions_are_searchable() {
+        let choices = vec!["👍".to_owned(), "❤".to_owned(), "🔥".to_owned()];
+        let mut picker = Picker::reactions(React { chat_id: 1, msg_id: 2, choices });
+        assert_eq!(picker.items(&[]), ["👍", "❤", "🔥"], "kept as Telegram spells them");
+        picker.query = "fire".into();
+        assert_eq!(picker.items(&[]), ["🔥"]);
     }
 
     #[test]

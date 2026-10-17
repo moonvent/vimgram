@@ -317,6 +317,7 @@ mod tests {
             scheduled: false,
             deleted: false,
             local_files: Vec::new(),
+            reactions: Vec::new(),
         }
     }
 

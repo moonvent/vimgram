@@ -127,6 +127,7 @@ pub enum Action {
     SeekBack,
     SeekForward,
     Reply,
+    React,
     Edit,
     Forward,
     Delete,
@@ -213,6 +214,7 @@ impl Pending {
             (None, NKey::Char('H')) => Some(Action::SeekBack),
             (None, NKey::Char('L')) => Some(Action::SeekForward),
             (None, NKey::Char('r')) => Some(Action::Reply),
+            (None, NKey::Char('R')) => Some(Action::React),
             (None, NKey::Char('e')) => Some(Action::Edit),
             (None, NKey::Char('f')) => Some(Action::Forward),
             (None, NKey::Char('n')) => Some(Action::SearchNext),
@@ -426,6 +428,7 @@ mod tests {
         assert_eq!(feed("gagp"), vec![Action::Attach, Action::Pinned]);
         assert_eq!(feed("ge"), vec![Action::Emoji]);
         assert_eq!(feed("gv"), vec![Action::JumpPlaying]);
+        assert_eq!(feed("rR"), vec![Action::Reply, Action::React]);
         assert_eq!(feed("][="), vec![Action::Faster, Action::Slower, Action::NormalSpeed]);
     }
 

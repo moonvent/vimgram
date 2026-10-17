@@ -47,6 +47,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `Enter`, `o` | open chat (a channel opens beside the list, focus stays there; `Enter` again goes to the posts); view photo or video; play voice message |
 | `i`, `a` | insert mode (write message / login field) |
 | `r` | reply to the message under the cursor |
+| `R` | react to the message: `h`/`j`/`k`/`l` + `Enter` or `1`–`9` picks, `/` searches, the same reaction again takes it back; clicking a reaction under a message toggles it too |
 | `cc`, `e` | edit your message |
 | `f` | forward: pick a chat, `Enter` sends |
 | `dd` | delete message: `y` for everyone, `m` only for me |

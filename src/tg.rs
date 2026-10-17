@@ -455,6 +455,39 @@ pub async fn edit_text(chat_id: i64, message_id: i64, text: String) -> Res<()> {
         .map_err(err)
 }
 
+/// Emoji the user can react with to a message, most used first. Premium-only
+/// and custom emoji reactions are left out.
+pub async fn available_reactions(chat_id: i64, message_id: i64) -> Res<Vec<String>> {
+    let enums::AvailableReactions::AvailableReactions(available) =
+        functions::get_message_available_reactions(chat_id, message_id, 8, client()).await.map_err(err)?;
+    let mut emoji: Vec<String> = Vec::new();
+    let all = available.top_reactions.iter().chain(&available.recent_reactions).chain(&available.popular_reactions);
+    for reaction in all.filter(|r| !r.needs_premium) {
+        if let enums::ReactionType::Emoji(e) = &reaction.r#type
+            && !emoji.contains(&e.emoji)
+        {
+            emoji.push(e.emoji.clone());
+        }
+    }
+    Ok(emoji)
+}
+
+pub async fn add_reaction(chat_id: i64, message_id: i64, emoji: String) -> Res<()> {
+    let kind = enums::ReactionType::Emoji(types::ReactionTypeEmoji { emoji });
+    functions::add_message_reaction(chat_id, message_id, kind, false, true, client())
+        .await
+        .map_err(err)
+}
+
+pub async fn remove_reaction(chat_id: i64, message_id: i64, kind: ReactionKind) -> Res<()> {
+    let Some(kind) = kind.to_tg() else {
+        return Err("Paid reactions can't be taken back".into());
+    };
+    functions::remove_message_reaction(chat_id, message_id, kind, client())
+        .await
+        .map_err(err)
+}
+
 pub async fn forward(to_chat: i64, from_chat: i64, ids: Vec<i64>) -> Res<()> {
     functions::forward_messages(to_chat, None, from_chat, ids, None, false, false, client())
         .await
@@ -874,6 +907,69 @@ pub struct Msg {
     /// Media files already downloaded when the message arrived: (id, path).
     #[serde(skip)]
     pub local_files: Vec<(i32, String)>,
+    #[serde(default)]
+    pub reactions: Vec<Reaction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReactionKind {
+    Emoji(String),
+    /// Custom emoji: shown as a generic sparkle, the sticker isn't loaded.
+    Custom(i64),
+    /// Telegram Stars.
+    Paid,
+}
+
+impl ReactionKind {
+    fn of(kind: &enums::ReactionType) -> Self {
+        match kind {
+            enums::ReactionType::Emoji(e) => ReactionKind::Emoji(e.emoji.clone()),
+            enums::ReactionType::CustomEmoji(c) => ReactionKind::Custom(c.custom_emoji_id),
+            enums::ReactionType::Paid => ReactionKind::Paid,
+        }
+    }
+
+    fn to_tg(&self) -> Option<enums::ReactionType> {
+        match self {
+            ReactionKind::Emoji(emoji) => Some(enums::ReactionType::Emoji(types::ReactionTypeEmoji { emoji: emoji.clone() })),
+            ReactionKind::Custom(id) => Some(enums::ReactionType::CustomEmoji(types::ReactionTypeCustomEmoji {
+                custom_emoji_id: *id,
+            })),
+            ReactionKind::Paid => None,
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            ReactionKind::Emoji(emoji) => emoji,
+            ReactionKind::Custom(_) => "✨",
+            ReactionKind::Paid => "⭐",
+        }
+    }
+}
+
+/// One reaction under a message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Reaction {
+    pub kind: ReactionKind,
+    pub count: i32,
+    /// Put by the user.
+    pub chosen: bool,
+}
+
+pub fn reactions(info: Option<&types::MessageInteractionInfo>) -> Vec<Reaction> {
+    let Some(reactions) = info.and_then(|i| i.reactions.as_ref()) else {
+        return Vec::new();
+    };
+    reactions
+        .reactions
+        .iter()
+        .map(|r| Reaction {
+            kind: ReactionKind::of(&r.r#type),
+            count: r.total_count,
+            chosen: r.is_chosen,
+        })
+        .collect()
 }
 
 impl From<types::Message> for Msg {
@@ -909,6 +1005,7 @@ impl From<types::Message> for Msg {
             scheduled: m.scheduling_state.is_some(),
             deleted: false,
             local_files,
+            reactions: reactions(m.interaction_info.as_ref()),
         }
     }
 }
@@ -946,6 +1043,7 @@ impl From<Record> for Msg {
             scheduled: false,
             deleted: true,
             local_files: Vec::new(),
+            reactions: Vec::new(),
         }
     }
 }
@@ -977,6 +1075,10 @@ impl Msg {
         self.members.extend(other.members);
         self.media.extend(other.media);
         self.edited |= other.edited;
+        // Reactions to an album are put on one of its parts.
+        if self.reactions.is_empty() {
+            self.reactions = other.reactions;
+        }
         if self.text.is_empty() {
             self.text = other.text;
         } else if !other.text.is_empty() {
