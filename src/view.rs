@@ -32,6 +32,8 @@ const TEXT: f32 = 15.0;
 const LINE_H: f32 = TEXT * 1.35;
 const MSG_PAD_X: f32 = 16.0;
 const MSG_SPACING: f32 = 2.0;
+/// Space between the newest message and the line above the compose field.
+const LIST_BOTTOM: f32 = 12.0;
 const MAX_COMPOSE_LINES: usize = 8;
 const BANNER_H: f32 = 24.0;
 const REPLY_H: f32 = 22.0;
@@ -102,7 +104,7 @@ pub fn messages_viewport(
     let width = size.width - FOLDER_W - SIDEBAR_W - 1.0 - 2.0 * MSG_PAD_X - MSG_AVATAR - MSG_AVATAR_GAP - panel;
     let pinned = if pinned { PINNED_H + 1.0 } else { 0.0 };
     let player = if player { PLAYER_H + 1.0 } else { 0.0 };
-    let height = size.height - STATUS_H - HEADER_H - 2.0 - pinned - player - compose_height(compose, banner);
+    let height = size.height - STATUS_H - HEADER_H - 2.0 - pinned - player - compose_height(compose, banner) - LIST_BOTTOM;
     (width.max(100.0), height.max(LINE_H))
 }
 
@@ -789,11 +791,13 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
         let (width, _) = app.viewport();
         let i = open.cursor;
         let item = message_view(app, &open.msgs[i], selected == Some(i), width, starts_run(&open.msgs, i));
-        scrollable(container(item).padding([0.0, MSG_PAD_X]))
+        let tall = scrollable(container(item).padding([0.0, MSG_PAD_X]))
             .id(TALL_ID)
             .on_scroll(Message::TallScroll)
             .direction(Direction::Vertical(Scrollbar::new().width(4).scroller_width(4)))
-            .height(Length::Fill)
+            .height(Length::Fill);
+        container(tall)
+            .padding(iced::Padding { bottom: LIST_BOTTOM, ..Default::default() })
             .into()
     } else {
         let (width, height) = app.viewport();
@@ -821,7 +825,12 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
         container(
             Column::with_children(children)
                 .spacing(MSG_SPACING)
-                .padding([0.0, MSG_PAD_X])
+                .padding(iced::Padding {
+                    top: 0.0,
+                    right: MSG_PAD_X,
+                    bottom: LIST_BOTTOM,
+                    left: MSG_PAD_X,
+                })
                 .height(Length::Fill),
         )
         .height(Length::Fill)
