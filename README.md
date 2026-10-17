@@ -2,21 +2,22 @@
 
 Keyboard-only, Vim-style Telegram client: Rust + [iced](https://iced.rs) + TDLib.
 
-## Setup (Fedora)
+- Vim keys in any keyboard layout, counts, `gg`/`G`, `:` commands, `/` search
+- Folders, chat list and messages side by side; `Ctrl-h`/`Ctrl-l` between them
+- Photos, albums, videos, round videos, GIFs, stickers (incl. animated), voice
+  messages with speed control, recording, reactions, replies, forwards, edits,
+  scheduled and silent messages, PDF export
+- Deleted messages stay visible: everything seen is archived locally
+- Notifications, tray icon and autostart (Linux)
 
-```sh
-sudo dnf install libcxx libcxxabi llvm-libunwind   # runtime deps of prebuilt TDLib
-sudo dnf install gstreamer1-devel gstreamer1-plugins-base-devel rlottie-devel  # media
-sudo dnf install wl-clipboard ffmpeg               # pasting images/files; odd WebM stickers
-./scripts/fetch-tdlib.sh                           # TDLib 1.8.61 -> vendor/tdlib
-./scripts/fetch-emoji.sh                           # color emoji iced can draw
-```
+Linux (Wayland, developed on Fedora + Hyprland) is the main platform; Windows
+builds come from CI and are newer (see [Roadmap](#roadmap)).
 
-iced can't draw COLRv1 color fonts, which is all Fedora ships for emoji, so
-`fetch-emoji.sh` puts Noto Color Emoji (bitmap version) into
-`~/.local/share/vimgram/fonts/`; without it emoji are blank.
+## Telegram API credentials
 
-Create `~/.config/vimgram/config.toml` with credentials from https://my.telegram.org:
+Every Telegram client needs its own `api_id` and `api_hash`: create an app at
+<https://my.telegram.org> → *API development tools*, then put them into
+`config.toml` (path below for your system):
 
 ```toml
 api_id = 123456
@@ -30,9 +31,40 @@ open_on_select = true   # optional: moving through the chat list opens the chat 
                         # (read only once you move into its messages)
 ```
 
+Never commit or share these: they identify your app to Telegram.
+
+## Windows
+
+Download `vimgram-windows-x86_64.zip` from
+[Releases](../../releases) (or the latest CI run's artifacts), unpack it anywhere,
+create `%APPDATA%\vimgram\config\config.toml` as above and run
+`vimgram\bin\vimgram.exe`. TDLib, GStreamer and the emoji font are inside.
+
+Building it yourself (what [CI](.github/workflows/ci.yml) does):
+
+1. Rust (MSVC toolchain), Visual Studio Build Tools, LLVM (for bindgen), CMake.
+2. GStreamer **MSVC** runtime + development installers from
+   <https://gstreamer.freedesktop.org/download/>, `pkg-config`
+   (`choco install pkgconfiglite`), and `PKG_CONFIG_PATH` set to
+   `<gstreamer>\lib\pkgconfig`, `<gstreamer>\bin` in `PATH`.
+3. `.\scripts\fetch-tdlib.ps1` and `.\scripts\fetch-emoji.ps1`.
+4. `cargo build --release`, then copy `vendor\tdlib\bin\*.dll` next to
+   `target\release\vimgram.exe`.
+
+## Linux (Fedora)
+
 ```sh
+sudo dnf install libcxx libcxxabi llvm-libunwind   # runtime deps of prebuilt TDLib
+sudo dnf install gstreamer1-devel gstreamer1-plugins-base-devel rlottie-devel  # media
+sudo dnf install wl-clipboard ffmpeg               # pasting images/files; odd WebM stickers
+./scripts/fetch-tdlib.sh                           # TDLib 1.8.61 -> vendor/tdlib
+./scripts/fetch-emoji.sh                           # color emoji iced can draw
 cargo run --release
 ```
+
+iced can't draw COLRv1 color fonts, which is all Fedora ships for emoji, so
+`fetch-emoji.sh` puts Noto Color Emoji (bitmap version) into
+`~/.local/share/vimgram/fonts/`; without it emoji are blank.
 
 ## Keys
 
@@ -82,8 +114,7 @@ starting with what you typed; the history survives restarts.
 
 Insert mode: `Enter` sends, `Shift+Enter` new line, `Ctrl-v` paste (text, or a copied
 image / files as attachments), `Ctrl-w` delete word, `Ctrl-u` delete to start, `↑` in an empty line edits your last
-message. Two to
-ten photos and videos go as an album.
+message. Two to ten photos and videos go as an album.
 
 When a voice or round video message ends and the very next message is one too, it plays
 next (voice messages also from another chat; round videos while their chat is open).
@@ -94,6 +125,8 @@ Photo/video viewer: `j`/`k` next/previous, `h`/`l` seek ±5s, `H`/`L` ±30s, `Sp
 Mouse: click folders, chats, messages and media; the wheel moves the cursor.
 
 A message taller than the window scrolls with `j`/`k` before the cursor moves on.
+
+## Archive, notifications, tray
 
 Every message the client sees is kept whole in `~/.local/share/vimgram/archive.sqlite`,
 and every media file it downloads is hard-linked into `~/.local/share/vimgram/media/`
@@ -107,23 +140,45 @@ New messages raise desktop notifications with the chat photo (and the app icon i
 corner) unless the chat is muted or open and focused; clicking one opens the chat. Once
 the chat is read (here or on another device) its notifications are withdrawn.
 
-Tray: left click shows / hides the window, the menu has Quit. Wayland can't hide a
+Tray (Linux): left click shows / hides the window, the menu has Quit. Wayland can't hide a
 window, so "hide" closes it and vimgram keeps running; `:q` quits. `:autostart on`
 enables a systemd user service bound to `graphical-session.target` when the session has
 one (uwsm, or a Hyprland config starting such a target), otherwise an XDG autostart
 entry; both start vimgram with `--hidden`, in the tray.
 
-Where things are:
+## Where things are
 
-| Path | What |
-|---|---|
-| `~/.local/share/vimgram/db` | TDLib database (session, chats, sticker files) |
-| `~/.local/share/vimgram/files` | media cache: photos, videos, voice messages, documents. Files unused for a week are deleted weekly (`:cleancache`) |
-| `~/.local/share/vimgram/archive.sqlite`, `media/` | archive of messages and their media (kept) |
-| `~/.cache/vimgram` | pasted images, notification images |
+| Linux | Windows | What |
+|---|---|---|
+| `~/.config/vimgram/config.toml` | `%APPDATA%\vimgram\config\config.toml` | settings |
+| `~/.local/share/vimgram/db` | `%APPDATA%\vimgram\data\db` | TDLib database (session, chats, sticker files) |
+| `~/.local/share/vimgram/files` | `%APPDATA%\vimgram\data\files` | media cache: photos, videos, voice messages, documents. Files unused for a week are deleted weekly (`:cleancache`) |
+| `~/.local/share/vimgram/archive.sqlite`, `media/` | `%APPDATA%\vimgram\data\…` | archive of messages and their media (kept) |
+| `~/.cache/vimgram` | `%LOCALAPPDATA%\vimgram\cache` | pasted images, notification images |
 
-Nothing is saved to `~/Downloads`.
+Nothing is saved to `~/Downloads`. The session in `db` is a logged-in Telegram
+account: keep it private.
+
+## Development
 
 `[profile.release]` builds incrementally: after a change `cargo run --release` rebuilds in
 seconds; without changes it starts right away. `./target/release/vimgram` runs the last
 build without checking for changes.
+
+## Roadmap
+
+- Global search: chats (yours, on the server, public) and messages across all chats
+- Windows: tray icon, notifications under vimgram's own name that are withdrawn
+  once read, an installer with a Start menu entry, a slimmer GStreamer bundle
+- Linux release builds (TDLib next to the binary, `$ORIGIN` rpath)
+- Custom emoji in reactions and messages
+
+## Releases
+
+Pushes to `main` and pull requests are built on Linux and Windows and tested on Linux.
+Tagging a commit `vX.Y.Z` and pushing the tag publishes a GitHub release with
+the Windows zip:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
