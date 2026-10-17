@@ -12,11 +12,11 @@ use iced::mouse::Interaction;
 use iced::{Alignment, Color, ContentFit, Element, Font, Length, Size, Theme, font};
 use iced_video_player::VideoPlayer;
 
-use crate::app::{App, Auth, Chat, Compose, Confirm, Focus, Message, Pane, COMPOSE_ID, SPOILER_LINK, TALL_ID, VideoPlayback};
+use crate::app::{App, Auth, Chat, Compose, Confirm, Focus, Message, Pane, COMPOSE_ID, SPOILER_LINK, TALL_ID, VideoPlayback, VoicePlayback};
 use crate::emoji::{self, Picker};
 use crate::fonts::{self, EMOJI};
 use crate::media::Loaded;
-use crate::player;
+use crate::player::{self, SpeedKind};
 use crate::tg::{ChatKind, Media, Membership, Msg, Presence, Preview, Sender, Style, fmt_duration};
 use crate::vim::{Input, Mode};
 
@@ -49,6 +49,8 @@ const ROUND_VIDEO: f32 = 220.0;
 const GIF_MAX: Size = Size::new(360.0, 300.0);
 const STICKER_MAX: Size = Size::new(170.0, 170.0);
 const VOICE: Size = Size::new(380.0, 30.0);
+/// A music file: name line, progress, time line.
+const AUDIO: Size = Size::new(380.0, 48.0);
 const VOICE_BARS: usize = 48;
 const MEDIA_GAP: f32 = 4.0;
 /// Sender avatar next to messages.
@@ -139,6 +141,7 @@ pub fn media_size(media: &Media, width: f32) -> Size {
         Media::Animation { .. } => GIF_MAX,
         Media::Sticker { .. } => STICKER_MAX,
         Media::Voice { .. } => return Size::new(VOICE.width.min(width - 20.0), VOICE.height),
+        Media::Audio { .. } => return Size::new(AUDIO.width.min(width - 20.0), AUDIO.height),
     };
     let bounds = Size::new(max.width.min(width - 20.0).max(40.0), max.height);
     let (w, h) = media.dims().map_or((1.0, 1.0), |(w, h)| (w as f32, h as f32));
@@ -160,9 +163,14 @@ fn album_layout(count: usize, width: f32) -> (usize, Size) {
     (cols, Size::new(cell, cell))
 }
 
+/// An album of music files: one track under another, not a grid.
+fn tracklist(media: &[Media]) -> bool {
+    media.len() > 1 && media.iter().all(|m| matches!(m, Media::Audio { .. }))
+}
+
 /// Size of every media item of a message, in order.
 pub fn media_sizes(media: &[Media], width: f32) -> Vec<Size> {
-    if media.len() <= 1 {
+    if media.len() <= 1 || tracklist(media) {
         media.iter().map(|m| media_size(m, width)).collect()
     } else {
         vec![album_layout(media.len(), width).1; media.len()]
@@ -173,6 +181,7 @@ fn media_block_height(media: &[Media], width: f32) -> f32 {
     match media.len() {
         0 => 0.0,
         1 => media_size(&media[0], width).height + MEDIA_GAP,
+        n if tracklist(media) => n as f32 * AUDIO.height + (n - 1) as f32 * ALBUM_GAP + MEDIA_GAP,
         n => {
             let (cols, cell) = album_layout(n, width);
             let rows = n.div_ceil(cols) as f32;
@@ -855,7 +864,7 @@ fn player_bar(app: &App) -> Option<Element<'_, Message>> {
     };
     let info = column![
         row![
-            text(format!("🎤 {who}")).size(13).wrapping(Wrapping::None).width(Length::Fill),
+            text(format!("{} {who}", playing_icon(voice))).size(13).wrapping(Wrapping::None).width(Length::Fill),
             text(format!("{time}  {}  gv", player::fmt_speed(app.speed()))).size(12).style(muted_text),
         ]
         .spacing(8),
@@ -1295,6 +1304,38 @@ fn voice_view<'a>(app: &'a App, msg_id: i64, duration: i32, waveform: &'a [u8], 
     container(line).height(VOICE.height).align_y(Alignment::Center).into()
 }
 
+/// A music file. Album tracks share the message, so what plays is told by
+/// the file.
+fn audio_view<'a>(app: &'a App, file: i32, media: &Media, duration: i32, width: f32) -> Element<'a, Message> {
+    let playback = app.voice.as_ref().filter(|v| v.file_id == file);
+    let (icon, progress, time) = match playback.map(|v| v.audio.as_ref()) {
+        Some(Some(audio)) => {
+            let total = audio.duration().map_or(f64::from(duration), |d| d.as_secs_f64()).max(0.001);
+            let pos = audio.position().as_secs_f64();
+            let icon = if audio.paused() { "▶" } else { "⏸" };
+            let time = format!("{} / {}  {}", fmt_secs(pos), fmt_secs(total), player::fmt_speed(app.speed()));
+            (icon, (pos / total) as f32, time)
+        }
+        Some(None) => ("…", 0.0, "loading…".to_owned()),
+        None if duration > 0 => ("▶", 0.0, fmt_duration(duration)),
+        None => ("▶", 0.0, String::new()),
+    };
+    let name = media.track_name().unwrap_or_default();
+    let info = column![
+        text(format!("🎵 {name}")).size(14).wrapping(Wrapping::None),
+        progress_bar(0.0..=1.0, progress).girth(3),
+        text(time).size(12).style(muted_text),
+    ]
+    .spacing(4)
+    .width(Length::Fill)
+    .clip(true);
+    container(row![text(icon).size(18).style(primary_text), info].spacing(10).align_y(Alignment::Center))
+        .width(width)
+        .height(AUDIO.height)
+        .align_y(Alignment::Center)
+        .into()
+}
+
 fn media_cell<'a>(
     app: &'a App,
     msg_id: i64,
@@ -1325,6 +1366,7 @@ fn media_cell<'a>(
         })
         .into(),
         Media::Voice { duration, waveform, listened, .. } => voice_view(app, msg_id, *duration, waveform, *listened),
+        Media::Audio { file, duration, .. } => audio_view(app, *file, media, *duration, size.width),
         Media::Video { .. } => video_cell(app, media, size, radius),
         _ => match media.inline_file().and_then(|file| app.media.get(file)) {
             Some(Loaded::Image(handle)) => image(handle.clone())
@@ -1366,7 +1408,7 @@ fn media_block<'a>(app: &'a App, m: &'a Msg, width: f32) -> Element<'a, Message>
     if m.media.len() == 1 {
         return media_cell(app, m.id, 0, &m.media[0], sizes[0], false, hidden);
     }
-    let (cols, _) = album_layout(m.media.len(), width);
+    let cols = if tracklist(&m.media) { 1 } else { album_layout(m.media.len(), width).0 };
     let cells: Vec<Element<_>> = m
         .media
         .iter()
@@ -1434,7 +1476,7 @@ fn message_keys(app: &App, m: &Msg) -> String {
         keys.push("gf reply");
     }
     match m.media.first() {
-        Some(Media::Voice { .. } | Media::Video { round: true, .. }) => keys.push("Enter play"),
+        Some(Media::Voice { .. } | Media::Audio { .. } | Media::Video { round: true, .. }) => keys.push("Enter play"),
         Some(media) if media.viewable() => keys.push("Enter open"),
         _ => {}
     }
@@ -1880,6 +1922,10 @@ fn recording_status(app: &App) -> Element<'_, Message> {
     .into()
 }
 
+fn playing_icon(voice: &VoicePlayback) -> &'static str {
+    if voice.kind == SpeedKind::Music { "🎵" } else { "🎤" }
+}
+
 /// What is playing, for the right side of the status line.
 fn playback_status(app: &App) -> Option<String> {
     let speed = player::fmt_speed(app.speed());
@@ -1891,8 +1937,9 @@ fn playback_status(app: &App) -> Option<String> {
             fmt_secs(video.duration().as_secs_f64())
         ));
     }
-    let audio = app.voice.as_ref()?.audio.as_ref()?;
-    let icon = if audio.paused() { "⏸" } else { "🎤" };
+    let voice = app.voice.as_ref()?;
+    let audio = voice.audio.as_ref()?;
+    let icon = if audio.paused() { "⏸" } else { playing_icon(voice) };
     let total = audio.duration().map_or(0.0, |d| d.as_secs_f64());
     Some(format!(
         "{icon} {} / {}  {speed}",
@@ -2109,5 +2156,14 @@ mod tests {
         assert_eq!(album_layout(2, 1000.0).0, 2);
         assert_eq!(album_layout(4, 1000.0).0, 2);
         assert_eq!(album_layout(5, 1000.0).0, 3);
+    }
+
+    #[test]
+    fn music_album_is_a_tracklist() {
+        let track = Media::Audio { file: 1, size: 0, duration: 0, title: String::new(), performer: String::new() };
+        let tracks = vec![track.clone(), track.clone(), track];
+        let sizes = media_sizes(&tracks, 1000.0);
+        assert!(sizes.iter().all(|s| s.height == AUDIO.height && s.width == AUDIO.width));
+        assert_eq!(media_block_height(&tracks, 1000.0), 3.0 * AUDIO.height + 2.0 * ALBUM_GAP + MEDIA_GAP);
     }
 }

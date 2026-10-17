@@ -391,6 +391,8 @@ pub async fn send_text(chat_id: i64, text: String, options: SendOptions) -> Res<
 pub enum FileKind {
     Photo,
     Video,
+    /// Music: plays in the message like a voice message.
+    Audio,
     Document,
 }
 
@@ -404,17 +406,20 @@ impl FileKind {
         match ext.as_str() {
             "jpg" | "jpeg" | "png" | "webp" | "heic" => FileKind::Photo,
             "mp4" | "mov" | "mkv" | "webm" | "m4v" => FileKind::Video,
+            "mp3" | "m4a" | "aac" | "flac" | "ogg" | "opus" | "wav" => FileKind::Audio,
             _ => FileKind::Document,
         }
     }
 }
 
-/// A local file as a photo, video or document, with an optional caption.
+/// A local file as a photo, video, music or document, with an optional
+/// caption.
 fn file_content(
     path: &std::path::Path,
     caption: String,
     video: Option<crate::player::VideoInfo>,
     preview: Option<crate::player::Thumbnail>,
+    audio: Option<crate::player::AudioInfo>,
 ) -> InputMessageContent {
     let file = enums::InputFile::Local(types::InputFileLocal {
         path: path.to_string_lossy().into_owned(),
@@ -457,6 +462,17 @@ fn file_content(
             self_destruct_type: None,
             has_spoiler: false,
         }),
+        FileKind::Audio => {
+            let audio = audio.unwrap_or_default();
+            InputMessageContent::InputMessageAudio(types::InputMessageAudio {
+                audio: file,
+                album_cover_thumbnail: None,
+                duration: audio.duration,
+                title: audio.title,
+                performer: audio.performer,
+                caption,
+            })
+        }
         FileKind::Document => InputMessageContent::InputMessageDocument(types::InputMessageDocument {
             document: file,
             thumbnail: None,
@@ -467,9 +483,12 @@ fn file_content(
 }
 
 /// Send local files; the caption goes with the first one. Two to ten
-/// photos and videos go as an album.
+/// photos and videos, or two to ten music files, go as an album.
 pub async fn send_files(chat_id: i64, paths: Vec<std::path::PathBuf>, caption: String, options: SendOptions) -> Res<()> {
-    let album = (2..=10).contains(&paths.len()) && paths.iter().all(|p| FileKind::of(p) != FileKind::Document);
+    let kinds: Vec<FileKind> = paths.iter().map(|p| FileKind::of(p)).collect();
+    let album = (2..=10).contains(&paths.len())
+        && (kinds.iter().all(|k| matches!(k, FileKind::Photo | FileKind::Video))
+            || kinds.iter().all(|k| *k == FileKind::Audio));
     // Videos: read length and size from the file and make a preview first.
     let probe_paths = paths.clone();
     let infos: Vec<_> = tokio::task::spawn_blocking(move || {
@@ -478,7 +497,8 @@ pub async fn send_files(chat_id: i64, paths: Vec<std::path::PathBuf>, caption: S
             .map(|p| {
                 let info = (FileKind::of(p) == FileKind::Video).then(|| crate::player::probe_video(p)).flatten();
                 let preview = info.and_then(|info| crate::player::video_thumbnail(p, info).ok());
-                (info, preview)
+                let audio = (FileKind::of(p) == FileKind::Audio).then(|| crate::player::probe_audio(p)).flatten();
+                (info, preview, audio)
             })
             .collect()
     })
@@ -488,7 +508,9 @@ pub async fn send_files(chat_id: i64, paths: Vec<std::path::PathBuf>, caption: S
     let contents: Vec<InputMessageContent> = paths
         .iter()
         .zip(infos)
-        .map(|(path, (info, preview))| file_content(path, caption.take().unwrap_or_default(), info, preview))
+        .map(|(path, (info, preview, audio))| {
+            file_content(path, caption.take().unwrap_or_default(), info, preview, audio)
+        })
         .collect();
     if album {
         return functions::send_message_album(chat_id, None, options.reply_to(), options.options(), contents, client())
@@ -915,6 +937,16 @@ pub enum Media {
         #[serde(default = "yes")]
         listened: bool,
     },
+    /// A music file: plays like a voice message.
+    Audio {
+        file: i32,
+        /// Bytes, exact or expected; 0 when unknown.
+        size: i64,
+        /// Seconds; 0 when unknown (audio sent as a file).
+        duration: i32,
+        title: String,
+        performer: String,
+    },
 }
 
 impl Media {
@@ -924,7 +956,7 @@ impl Media {
             Media::Photo { preview, .. } => Some(preview.id),
             Media::Sticker { file, .. } | Media::Animation { file } => Some(file.id),
             Media::Video { thumb, .. } => *thumb,
-            Media::Voice { .. } => None,
+            Media::Voice { .. } | Media::Audio { .. } => None,
         }
     }
 
@@ -950,6 +982,7 @@ impl Media {
                 files
             }
             Media::Voice { file, .. } => vec![(*file, 0)],
+            Media::Audio { file, size, .. } => vec![(*file, *size)],
         }
     }
 
@@ -966,19 +999,40 @@ impl Media {
                 video.id = f(video.id);
                 *thumb = thumb.map(&mut f);
             }
-            Media::Voice { file, .. } => *file = f(*file),
+            Media::Voice { file, .. } | Media::Audio { file, .. } => *file = f(*file),
         }
     }
 
-    /// Natural pixel size, for layout. Voice messages have none.
+    /// Natural pixel size, for layout. Voice messages and music have none.
     pub fn dims(&self) -> Option<(u32, u32)> {
         let file = match self {
             Media::Photo { preview, .. } => preview,
             Media::Sticker { file, .. } | Media::Animation { file } => file,
             Media::Video { video, .. } => video,
-            Media::Voice { .. } => return None,
+            Media::Voice { .. } | Media::Audio { .. } => return None,
         };
         Some((file.width, file.height))
+    }
+
+    /// Voice messages and music: played in place by Enter.
+    pub fn audible(&self) -> Option<i32> {
+        match self {
+            Media::Voice { file, .. } | Media::Audio { file, .. } => Some(*file),
+            _ => None,
+        }
+    }
+
+    /// "Performer — Title", or whichever of them there is.
+    pub fn track_name(&self) -> Option<String> {
+        let Media::Audio { title, performer, .. } = self else {
+            return None;
+        };
+        Some(match (performer.is_empty(), title.is_empty()) {
+            (false, false) => format!("{performer} — {title}"),
+            (true, false) => title.clone(),
+            (false, true) => performer.clone(),
+            (true, true) => "Unknown track".into(),
+        })
     }
 
     /// Photos and videos open in the full-screen viewer.
@@ -994,6 +1048,7 @@ impl Media {
             Media::Video { round: false, .. } => "📹 Video".into(),
             Media::Video { round: true, .. } => "📹 Video message".into(),
             Media::Voice { duration, .. } => format!("🎤 Voice message {}", fmt_duration(*duration)),
+            Media::Audio { .. } => format!("🎵 {}", self.track_name().unwrap_or_default()),
         }
     }
 }
@@ -1161,6 +1216,8 @@ fn shown_formatted<'a>(content: &'a MessageContent, shown: &str) -> Option<&'a t
         MessageContent::MessageAnimation(a) => &a.caption,
         MessageContent::MessageVideo(v) => &v.caption,
         MessageContent::MessageVoiceNote(v) => &v.caption,
+        MessageContent::MessageAudio(a) => &a.caption,
+        MessageContent::MessageDocument(d) => &d.caption,
         _ => return None,
     };
     (formatted.text == shown).then_some(formatted)
@@ -1474,6 +1531,8 @@ fn caption(content: &MessageContent) -> String {
         MessageContent::MessageAnimation(a) => a.caption.text.clone(),
         MessageContent::MessageVideo(v) => v.caption.text.clone(),
         MessageContent::MessageVoiceNote(v) => v.caption.text.clone(),
+        MessageContent::MessageAudio(a) => a.caption.text.clone(),
+        MessageContent::MessageDocument(d) => d.caption.text.clone(),
         _ => String::new(),
     }
 }
@@ -1575,6 +1634,27 @@ pub fn media(content: &MessageContent) -> Option<Media> {
                 duration: v.duration,
                 waveform: unpack_waveform(&v.waveform),
                 listened: note.is_listened,
+            })
+        }
+        MessageContent::MessageAudio(a) => {
+            let audio = &a.audio;
+            Some(Media::Audio {
+                file: audio.audio.id,
+                size: audio.audio.size.max(audio.audio.expected_size),
+                duration: audio.duration,
+                title: if audio.title.is_empty() { audio.file_name.clone() } else { audio.title.clone() },
+                performer: audio.performer.clone(),
+            })
+        }
+        // Music sent as a plain file (FLAC, WAV, …).
+        MessageContent::MessageDocument(d) if d.document.mime_type.starts_with("audio/") => {
+            let doc = &d.document;
+            Some(Media::Audio {
+                file: doc.document.id,
+                size: doc.document.size.max(doc.document.expected_size),
+                duration: 0,
+                title: doc.file_name.clone(),
+                performer: String::new(),
             })
         }
         _ => None,
@@ -1733,6 +1813,24 @@ mod tests {
         assert_eq!(content_text(&MessageContent::MessageScreenshotTaken, false), "took a screenshot");
         let other = MessageContent::MessageChatSetMessageAutoDeleteTime(Default::default());
         assert_eq!(content_text(&other, false), "[chat set message auto delete time]");
+    }
+
+    #[test]
+    fn music_tracks() {
+        let track = |title: &str, performer: &str| Media::Audio {
+            file: 3,
+            size: 9,
+            duration: 200,
+            title: title.into(),
+            performer: performer.into(),
+        };
+        assert_eq!(track("Song", "Band").track_name().unwrap(), "Band — Song");
+        assert_eq!(track("song.flac", "").track_name().unwrap(), "song.flac");
+        assert_eq!(track("", "").track_name().unwrap(), "Unknown track");
+        assert_eq!(track("Song", "Band").audible(), Some(3));
+        assert_eq!(track("Song", "Band").files(), vec![(3, 9)]);
+        assert_eq!(track("Song", "Band").dims(), None);
+        assert_eq!(FileKind::of(std::path::Path::new("a/Song.FLAC")), FileKind::Audio);
     }
 
     #[test]

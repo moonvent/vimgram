@@ -35,7 +35,7 @@ impl Kind {
     pub fn of(media: &Media) -> Self {
         match media {
             // Videos show their still thumbnail inline.
-            Media::Photo { .. } | Media::Video { .. } | Media::Voice { .. } => Kind::Image,
+            Media::Photo { .. } | Media::Video { .. } | Media::Voice { .. } | Media::Audio { .. } => Kind::Image,
             Media::Sticker { kind: StickerKind::Webp, .. } => Kind::Image,
             Media::Sticker { kind: StickerKind::Tgs, .. } => Kind::Tgs,
             Media::Sticker { kind: StickerKind::Webm, .. } => Kind::Webm,

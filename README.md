@@ -5,7 +5,7 @@ Keyboard-only, Vim-style Telegram client: Rust + [iced](https://iced.rs) + TDLib
 - Vim keys in any keyboard layout, counts, `gg`/`G`, `:` commands, `/` search
 - Folders, chat list and messages side by side; `Ctrl-h`/`Ctrl-l` between them
 - Photos, albums, videos, round videos, GIFs, stickers (incl. animated), voice
-  messages with speed control, recording, reactions, replies, forwards, edits,
+  messages and music with speed control, recording, reactions, replies, forwards, edits,
   scheduled and silent messages, PDF export
 - Deleted messages stay visible: everything seen is archived locally
 - Notifications, tray icon and autostart (Linux)
@@ -81,7 +81,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `h` / `l`, `Ctrl-h` / `Ctrl-l` | focus the pane to the left / right: folders ↔ chat list ↔ messages (`j`/`k`, `gg`/`G` move through folders there, `Enter` goes to the chats) |
 | `Tab` | switch between chat list and messages |
 | `J` / `K`, `gt` / `gT`, `3gt`, `Alt-1…9` | next / previous / n-th folder |
-| `Enter`, `o` | open chat (a channel opens beside the list, focus stays there; `Enter` again goes to the posts); view photo or video; play voice message; show a spoiler (text or media; clicking it does too) |
+| `Enter`, `o` | open chat (a channel opens beside the list, focus stays there; `Enter` again goes to the posts); view photo or video; play voice message or music; show a spoiler (text or media; clicking it does too) |
 | `i`, `a` | insert mode (write message / login field) |
 | `r` | reply to the message under the cursor |
 | `R` | react to the message: `h`/`j`/`k`/`l` + `Enter` or `1`–`9` picks, `/` searches, the same reaction again takes it back; clicking a reaction under a message toggles it too |
@@ -98,13 +98,13 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `yy`, `Y` | copy message text (or chat title) to the clipboard |
 | `p` / `P` | paste the clipboard at the end / start of the message; a copied image or file becomes an attachment |
 | `q` | record a voice message; `q`/`Enter` sends, `Esc` discards |
-| `Space` | play / pause voice message or video |
-| `gv`, click on the player bar | back to the voice message playing in another chat (the bar above the chat shows it; ✕ stops) |
-| `]` `+` / `[` `-` / `=` | speed up / down (0.25x–5x) / reset to 1x; voice messages, videos and round videos each remember their own speed |
+| `Space` | play / pause voice message, music or video |
+| `gv`, click on the player bar | back to the voice message or music playing in another chat (the bar above the chat shows it; ✕ stops) |
+| `]` `+` / `[` `-` / `=` | speed up / down (0.25x–5x) / reset to 1x; voice messages, music, videos and round videos each remember their own speed |
 | `m` | mute or unmute the chat (under the cursor in the list, otherwise the open one) |
 | `U` | leave the group or unsubscribe from the channel (asks first); joins one you are not in. Channels you can't post in show these two keys instead of the compose line |
-| `}` / `{`, `:volume 70` | volume up / down by 10% (or set it); one volume for videos and voice messages, remembered |
-| `H` / `L` | seek voice message −5s / +5s |
+| `}` / `{`, `:volume 70` | volume up / down by 10% (or set it); one volume for videos, voice messages and music, remembered |
+| `H` / `L` | seek voice message or music −5s / +5s |
 | `Esc`, `Ctrl-[` | normal mode; cancel reply, edit, forward, filter, attachment; with nothing to cancel asks to quit (`y`/`Enter`) |
 | `/` | chat list: filter chats; message pane: search messages (`/#tag`: only the messages with that hashtag, like clicking it) |
 | `n` / `N` | next (older) / previous (newer) search match |
@@ -124,10 +124,12 @@ starting with what you typed; the history survives restarts.
 
 Insert mode: `Enter` sends, `Shift+Enter` new line, `Ctrl-v` paste (text, or a copied
 image / files as attachments), `Ctrl-w` delete word, `Ctrl-u` delete to start, `↑` in an empty line edits your last
-message. Two to ten photos and videos go as an album.
+message. Two to ten photos and videos go as an album. Music files (mp3, m4a, flac, ogg, opus,
+wav) go as music, with title and artist from their tags; several of them as an album too.
 
 When a voice or round video message ends and the very next message is one too, it plays
-next (voice messages also from another chat; round videos while their chat is open).
+next (voice messages also from another chat; round videos while their chat is open). Music
+plays on the same way, track after track, but only into more music.
 
 Photo/video viewer: `j`/`k` next/previous, `h`/`l` seek ±5s, `H`/`L` ±30s, `Space` pause,
 `[` `]` `=` speed, `{` `}` volume, `Esc` close.

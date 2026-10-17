@@ -140,6 +140,8 @@ pub enum Message {
     NextMedia {
         chat_id: i64,
         after: i64,
+        /// The finished one was music: only music follows it.
+        music: bool,
         next: Option<Msg>,
     },
     /// Player bar of a voice message from another chat.
@@ -233,9 +235,16 @@ pub struct VoicePlayback {
     pub chat_id: i64,
     pub msg_id: i64,
     pub sender: Sender,
-    file_id: i32,
+    pub file_id: i32,
+    /// Voice message or music: each keeps its own speed.
+    pub kind: SpeedKind,
     /// `None` while the file downloads.
     pub audio: Option<Audio>,
+}
+
+/// What speed a voice message or music file plays at.
+fn audio_kind(media: &Media) -> SpeedKind {
+    if matches!(media, Media::Audio { .. }) { SpeedKind::Music } else { SpeedKind::Voice }
 }
 
 pub struct VideoPlayback {
@@ -1317,7 +1326,7 @@ impl App {
             // No wl-paste (or not Wayland): plain text through iced.
             Message::Clip(Err(_)) => iced::clipboard::read().map(Message::Paste),
             Message::JumpPlaying => self.act(Action::JumpPlaying),
-            Message::NextMedia { chat_id, after, next } => self.play_next(chat_id, after, next),
+            Message::NextMedia { chat_id, after, music, next } => self.play_next(chat_id, after, music, next),
             Message::PauseVoice => {
                 if let Some(audio) = self.voice.as_mut().and_then(|v| v.audio.as_mut()) {
                     audio.toggle_pause();
@@ -2467,7 +2476,7 @@ impl App {
             }
         };
         if let Some(voice) = self.voice.as_mut().filter(|v| v.file_id == file_id) {
-            match Audio::open(&path, self.speeds.get(SpeedKind::Voice), self.volume) {
+            match Audio::open(&path, self.speeds.get(voice.kind), self.volume) {
                 Ok(audio) => voice.audio = Some(audio),
                 Err(e) => {
                     self.voice = None;
@@ -2478,23 +2487,25 @@ impl App {
         Task::none()
     }
 
-    /// Enter / click on a media item: view photos and videos, play voice.
+    /// Enter / click on a media item: view photos and videos, play voice
+    /// and music.
     fn activate_media(&mut self, msg_id: i64, item: usize) -> Task<Message> {
         let Some(media) = self.open.as_ref().and_then(|o| o.media(Viewer { msg_id, item })) else {
             return Task::none();
         };
-        match media {
-            Media::Voice { file, .. } => {
-                let file = *file;
-                self.toggle_voice(msg_id, file)
+        match media.audible() {
+            Some(file) => {
+                let kind = audio_kind(media);
+                self.toggle_voice(msg_id, file, kind)
             }
-            media if media.viewable() => self.open_viewer(Viewer { msg_id, item }),
-            _ => Task::none(),
+            None if media.viewable() => self.open_viewer(Viewer { msg_id, item }),
+            None => Task::none(),
         }
     }
 
-    fn toggle_voice(&mut self, msg_id: i64, file_id: i32) -> Task<Message> {
-        if let Some(voice) = self.voice.as_mut().filter(|v| v.msg_id == msg_id) {
+    fn toggle_voice(&mut self, msg_id: i64, file_id: i32, kind: SpeedKind) -> Task<Message> {
+        // By file: the tracks of a music album are one message here.
+        if let Some(voice) = self.voice.as_mut().filter(|v| v.file_id == file_id) {
             if let Some(audio) = voice.audio.as_mut() {
                 audio.toggle_pause();
             }
@@ -2506,11 +2517,16 @@ impl App {
             .as_ref()
             .and_then(|o| o.position(msg_id).map(|i| o.msgs[i].sender))
             .unwrap_or(Sender::Chat(chat_id));
+        self.play_audio(chat_id, msg_id, sender, file_id, kind)
+    }
+
+    fn play_audio(&mut self, chat_id: i64, msg_id: i64, sender: Sender, file_id: i32, kind: SpeedKind) -> Task<Message> {
         self.voice = Some(VoicePlayback {
             chat_id,
             msg_id,
             sender,
             file_id,
+            kind,
             audio: None,
         });
         Self::play_download(file_id)
@@ -2581,9 +2597,9 @@ impl App {
             && let Some(video) = playback.video()
             && (video.eos() || video.position() + Duration::from_millis(300) >= video.duration())
             && video.duration() > Duration::ZERO
-            && let Some(message) = playback.round_msg.take()
+            && let Some((chat_id, msg_id)) = playback.round_msg.take()
         {
-            finished.push(message);
+            finished.push((chat_id, msg_id, false));
         }
         if let Some(recorder) = self.recorder.as_mut()
             && let Err(e) = recorder.poll()
@@ -2596,7 +2612,7 @@ impl App {
         {
             match audio.poll() {
                 Ok(()) if audio.finished() => {
-                    finished.push((voice.chat_id, voice.msg_id));
+                    finished.push((voice.chat_id, voice.msg_id, voice.kind == SpeedKind::Music));
                     self.voice = None;
                 }
                 Ok(()) => {}
@@ -2606,29 +2622,34 @@ impl App {
                 }
             }
         }
-        Task::batch(finished.into_iter().map(|(chat_id, msg_id)| {
-            Task::batch([self.mark_listened(chat_id, msg_id), Self::fetch_next(chat_id, msg_id)])
+        Task::batch(finished.into_iter().map(|(chat_id, msg_id, music)| {
+            Task::batch([self.mark_listened(chat_id, msg_id), Self::fetch_next(chat_id, msg_id, music)])
         }))
     }
 
     /// The message right after one that finished playing.
-    fn fetch_next(chat_id: i64, after: i64) -> Task<Message> {
+    fn fetch_next(chat_id: i64, after: i64, music: bool) -> Task<Message> {
         Task::perform(tg::history(chat_id, after, -1, 2), move |result| Message::NextMedia {
             chat_id,
             after,
+            music,
             next: result.ok().and_then(|msgs| msgs.into_iter().filter(|m| m.id > after).min_by_key(|m| m.id)),
         })
     }
 
     /// Continue with the next message if it is a voice or round video
-    /// message too, unless something else started in the meantime.
-    fn play_next(&mut self, chat_id: i64, after: i64, next: Option<Msg>) -> Task<Message> {
+    /// message too (music after music), unless something else started in
+    /// the meantime.
+    fn play_next(&mut self, chat_id: i64, after: i64, music: bool, next: Option<Msg>) -> Task<Message> {
         let Some(next) = next.filter(|m| !m.scheduled) else {
             return Task::none();
         };
+        let same_kind = next.media.first().is_some_and(|m| (audio_kind(m) == SpeedKind::Music) == music);
         match next.media.first() {
-            Some(Media::Voice { file, .. }) if self.voice.is_none() && self.video.is_none() => {
-                let file = *file;
+            Some(media @ (Media::Voice { .. } | Media::Audio { .. }))
+                if same_kind && self.voice.is_none() && self.video.is_none() =>
+            {
+                let (file, kind) = (media.audible().unwrap_or_default(), audio_kind(media));
                 // Follow along when the finished message is under the cursor.
                 if let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id)
                     && open.current().is_some_and(|m| m.id == after)
@@ -2637,25 +2658,20 @@ impl App {
                     open.cursor = i;
                     self.scroll_messages();
                 }
-                self.voice = Some(VoicePlayback {
-                    chat_id,
-                    msg_id: next.id,
-                    sender: next.sender,
-                    file_id: file,
-                    audio: None,
-                });
-                Self::play_download(file)
+                self.play_audio(chat_id, next.id, next.sender, file, kind)
             }
             // Round videos play in the viewer: continue only from there.
             Some(Media::Video { round: true, .. })
-                if self.viewer.is_some_and(|v| v.msg_id == after)
+                if !music
+                    && self.viewer.is_some_and(|v| v.msg_id == after)
                     && self.open.as_ref().is_some_and(|o| o.id == chat_id && o.position(next.id).is_some()) =>
             {
                 self.open_viewer(Viewer { msg_id: next.id, item: 0 })
             }
             // A voice message followed by a round video, in the open chat.
             Some(Media::Video { round: true, .. })
-                if self.viewer.is_none()
+                if !music
+                    && self.viewer.is_none()
                     && self.voice.is_none()
                     && self.open.as_ref().is_some_and(|o| o.id == chat_id && o.position(next.id).is_some()) =>
             {
@@ -2674,14 +2690,7 @@ impl App {
                     open.cursor = i;
                     self.scroll_messages();
                 }
-                self.voice = Some(VoicePlayback {
-                    chat_id,
-                    msg_id: next.id,
-                    sender: next.sender,
-                    file_id: file,
-                    audio: None,
-                });
-                Self::play_download(file)
+                self.play_audio(chat_id, next.id, next.sender, file, SpeedKind::Voice)
             }
             _ => Task::none(),
         }
@@ -2717,7 +2726,7 @@ impl App {
         } else if let Some(audio) = self.voice.as_mut().and_then(|v| v.audio.as_mut()) {
             audio.toggle_pause();
         } else if let Some(msg) = self.open.as_ref().and_then(OpenChat::current)
-            && let Some(item) = msg.media.iter().position(|m| matches!(m, Media::Voice { .. }))
+            && let Some(item) = msg.media.iter().position(|m| m.audible().is_some())
         {
             return self.activate_media(msg.id, item);
         }
@@ -2737,7 +2746,11 @@ impl App {
     /// The kind of media whose speed `[`/`]` change: what plays now, else
     /// voice messages.
     fn speed_kind(&self) -> SpeedKind {
-        self.video.as_ref().map_or(SpeedKind::Voice, |v| v.kind)
+        match (&self.video, &self.voice) {
+            (Some(video), _) => video.kind,
+            (None, Some(voice)) => voice.kind,
+            (None, None) => SpeedKind::Voice,
+        }
     }
 
     /// Speed of what plays now (or of voice messages).
@@ -3457,7 +3470,13 @@ impl App {
                 }
                 (Focus::Messages, _) => {
                     let target = self.focused_message().and_then(|m| {
-                        let item = m.media.iter().position(|x| x.viewable() || matches!(x, Media::Voice { .. }))?;
+                        // The track of an album that plays now, else the first.
+                        let playing = self.voice.as_ref().map(|v| v.file_id);
+                        let item = m
+                            .media
+                            .iter()
+                            .position(|x| x.audible().is_some() && x.audible() == playing)
+                            .or_else(|| m.media.iter().position(|x| x.viewable() || x.audible().is_some()))?;
                         Some((m.id, item))
                     });
                     match target {

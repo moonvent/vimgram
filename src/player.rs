@@ -67,27 +67,29 @@ pub enum SpeedKind {
     Video,
     /// Round video messages.
     Round,
+    Music,
 }
 
 impl SpeedKind {
-    const ALL: [SpeedKind; 3] = [SpeedKind::Voice, SpeedKind::Video, SpeedKind::Round];
+    const ALL: [SpeedKind; 4] = [SpeedKind::Voice, SpeedKind::Video, SpeedKind::Round, SpeedKind::Music];
 
     fn name(self) -> &'static str {
         match self {
             SpeedKind::Voice => "voice",
             SpeedKind::Video => "video",
             SpeedKind::Round => "round",
+            SpeedKind::Music => "music",
         }
     }
 }
 
 /// Last speed per kind, kept across restarts.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Speeds([f64; 3]);
+pub struct Speeds([f64; 4]);
 
 impl Default for Speeds {
     fn default() -> Self {
-        Speeds([1.0; 3])
+        Speeds([1.0; 4])
     }
 }
 
@@ -396,6 +398,37 @@ pub fn probe_video(path: &std::path::Path) -> Option<VideoInfo> {
     Some(VideoInfo { duration, width, height })
 }
 
+/// What a music file says about itself, sent along with it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AudioInfo {
+    /// Seconds.
+    pub duration: i32,
+    pub title: String,
+    pub performer: String,
+}
+
+/// Read a music file's length, title and artist (blocking, quick: only
+/// headers are parsed).
+pub fn probe_audio(path: &std::path::Path) -> Option<AudioInfo> {
+    use gstreamer_pbutils::prelude::*;
+    gst::init().ok()?;
+    let discoverer = gstreamer_pbutils::Discoverer::new(gst::ClockTime::from_seconds(15)).ok()?;
+    let uri = url::Url::from_file_path(path).ok()?;
+    let info = discoverer.discover_uri(uri.as_str()).ok()?;
+    let duration = info.duration().map_or(0, |d| (d.mseconds() as f64 / 1000.0).round() as i32);
+    // Container tags, else the audio stream's.
+    let tags = info
+        .tags()
+        .or_else(|| info.audio_streams().into_iter().next().and_then(|s| s.tags()));
+    let title = tags.as_ref().and_then(|t| t.get::<gst::tags::Title>()).map(|t| t.get().to_owned());
+    let performer = tags.as_ref().and_then(|t| t.get::<gst::tags::Artist>()).map(|t| t.get().to_owned());
+    Some(AudioInfo {
+        duration,
+        title: title.unwrap_or_default(),
+        performer: performer.unwrap_or_default(),
+    })
+}
+
 /// Longest side of a video preview: Telegram ignores bigger ones.
 const THUMBNAIL_SIDE: i32 = 320;
 
@@ -504,6 +537,9 @@ mod tests {
         let back = Speeds::parse(&speeds.to_text());
         assert_eq!(back, speeds);
         assert_eq!(back.get(SpeedKind::Video), 1.0);
+        // A file from before music had its own speed.
+        let old = Speeds::parse("voice 1.75\nvideo 1\nround 2\n");
+        assert_eq!((old.get(SpeedKind::Voice), old.get(SpeedKind::Music)), (1.75, 1.0));
         // Garbage and out-of-range values fall back to 1x.
         assert_eq!(Speeds::parse("voice 99\nvideo x\nnope 2"), Speeds::default());
     }
@@ -569,6 +605,33 @@ mod tests {
         std::thread::sleep(Duration::from_millis(400));
         let played = movie.video.position().saturating_sub(from);
         assert!(played < Duration::from_millis(330), "{played:?} in 400 ms at 0.5x");
+    }
+
+    #[test]
+    fn reads_music_tags() {
+        gst::init().unwrap();
+        let path = std::env::temp_dir().join(format!("vimgram-test-{}.ogg", std::process::id()));
+        let description = format!(
+            "audiotestsrc num-buffers=100 ! audioconvert ! taginject tags=\"title=Song,artist=Band\" ! \
+             vorbisenc ! oggmux ! filesink location={}",
+            path.display()
+        );
+        // Without the encoder plugins there is nothing to probe.
+        let Ok(pipeline) = gst::parse::launch(&description) else {
+            return;
+        };
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let done = pipeline.bus().unwrap().timed_pop_filtered(
+            gst::ClockTime::from_seconds(30),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        );
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert_eq!(done.map(|m| m.type_()), Some(gst::MessageType::Eos));
+        let info = probe_audio(&path);
+        let _ = std::fs::remove_file(&path);
+        let info = info.unwrap();
+        assert_eq!((info.title.as_str(), info.performer.as_str()), ("Song", "Band"));
+        assert_eq!(info.duration, 2);
     }
 
     #[test]
