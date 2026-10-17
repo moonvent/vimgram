@@ -636,6 +636,10 @@ fn chat_row<'a>(app: &'a App, chat: &'a Chat, selected: bool, focused: bool) -> 
     if let Some(mark) = mark_text(chat.last.as_ref().and_then(|m| delivery_mark(app, m))) {
         title_line = title_line.push(mark);
     }
+    // Marked with `v` to forward to.
+    if app.forward.is_some() && app.forward_marks.contains(&chat.id) {
+        title_line = title_line.push(text("✓").size(15).style(primary_text));
+    }
     let title_line = title_line.push(text(time).size(12).style(muted_text));
 
     let mut preview_line = row![
@@ -1279,6 +1283,9 @@ fn reply_quote<'a>(app: &'a App, reply_to: i64) -> Element<'a, Message> {
 
 /// Keys that act on the message under the cursor, shown on its header.
 fn message_keys(app: &App, m: &Msg) -> String {
+    if app.visual.is_some() {
+        return format!("{} selected  f forward  y copy  d delete  Esc cancel", app.visual_len());
+    }
     let channel = app.chats.get(&m.chat_id).is_some_and(|c| c.kind == ChatKind::Channel);
     let mut keys = Vec::new();
     if !m.links.is_empty() {
@@ -1381,10 +1388,11 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
         body = body.push(reactions_row(m));
     }
 
+    let highlighted = selected || app.in_visual(m.id);
     let bubble = container(body)
         .padding([6, 10])
         .width(Length::Fill)
-        .style(move |t: &Theme| message_style(t, selected));
+        .style(move |t: &Theme| message_style(t, highlighted));
     let channel = app.chats.get(&m.chat_id).is_some_and(|c| c.kind == ChatKind::Channel);
     let face: Element<_> = if show_avatar && !channel {
         let name = app.sender_name(sender);
@@ -1674,11 +1682,13 @@ fn playback_status(app: &App) -> Option<String> {
 
 fn status_line(app: &App) -> Element<'_, Message> {
     let mode = app.mode;
-    let badge = container(text(mode.label()).size(12))
+    let visual = app.visual.is_some() && mode == Mode::Normal;
+    let badge = container(text(if visual { "VISUAL" } else { mode.label() }).size(12))
         .padding([3, 10])
         .style(move |t: &Theme| {
             let p = t.extended_palette();
             let pair = match mode {
+                Mode::Normal if visual => p.secondary.strong,
                 Mode::Normal => p.primary.strong,
                 Mode::Insert => p.success.base,
                 Mode::Command | Mode::Search => p.warning.base,

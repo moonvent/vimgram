@@ -83,7 +83,8 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `r` | reply to the message under the cursor |
 | `R` | react to the message: `h`/`j`/`k`/`l` + `Enter` or `1`–`9` picks, `/` searches, the same reaction again takes it back; clicking a reaction under a message toggles it too |
 | `cc`, `e` | edit your message |
-| `f` | forward: pick a chat, `Enter` sends |
+| `f` | forward: pick a chat, `Enter` sends; `v` marks several chats (✓), `Enter` then sends to all of them |
+| `v` | Visual: select messages with `j`/`k`/`gg`/`G`, then `f` forward, `y` copy their text, `d` delete; `v`/`Esc` ends it |
 | `dd` | delete message: `y` for everyone, `m` only for me |
 | `ga`, `:attach [path]` | attach photos, videos or files (system file picker without a path); `Enter` sends, the text is the caption |
 | `gp` | jump to the pinned message |
