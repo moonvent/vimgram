@@ -12,7 +12,7 @@ use iced::mouse::Interaction;
 use iced::{Alignment, Color, ContentFit, Element, Length, Size, Theme};
 use iced_video_player::VideoPlayer;
 
-use crate::app::{App, Auth, Chat, Compose, Confirm, Focus, Message, Pane, TALL_ID, VideoPlayback};
+use crate::app::{App, Auth, Chat, Compose, Confirm, Focus, Message, Pane, COMPOSE_ID, TALL_ID, VideoPlayback};
 use crate::emoji::{self, Picker};
 use crate::fonts::{self, EMOJI};
 use crate::media::Loaded;
@@ -37,7 +37,10 @@ const MSG_SPACING: f32 = 2.0;
 const TO_LATEST: f32 = 40.0;
 /// Space between the newest message and the line above the compose field.
 const LIST_BOTTOM: f32 = 12.0;
-const MAX_COMPOSE_LINES: usize = 8;
+pub const MAX_COMPOSE_LINES: usize = 8;
+/// The 😀 button right of the compose line, and the space before it.
+const COMPOSE_BUTTON: f32 = 32.0;
+const COMPOSE_GAP: f32 = 8.0;
 const BANNER_H: f32 = 24.0;
 const REPLY_H: f32 = 22.0;
 const PHOTO_MAX: Size = Size::new(420.0, 380.0);
@@ -91,8 +94,21 @@ pub fn chat_rows(size: Size) -> usize {
     (((size.height - STATUS_H - HEADER_H) / CHAT_ROW_H).floor() as usize).max(1)
 }
 
-fn compose_height(input: &Input, banner: bool) -> f32 {
-    let lines = input.as_str().split('\n').count().clamp(1, MAX_COMPOSE_LINES);
+/// Width of the compose text, between the pane's padding and the 😀 button.
+pub fn compose_text_width(size: Size, emoji: bool) -> f32 {
+    let panel = if emoji { EMOJI_W } else { 0.0 };
+    size.width - FOLDER_W - SIDEBAR_W - 1.0 - 2.0 * MSG_PAD_X - COMPOSE_BUTTON - COMPOSE_GAP - panel
+}
+
+/// Lines `text` takes wrapped at `width`. An estimate from an average
+/// letter width: a wrong guess only scrolls the compose box a little.
+pub fn compose_lines(text: &str, width: f32) -> usize {
+    let per_line = (width / (TEXT * 0.55)).max(10.0) as usize;
+    text.split('\n').map(|l| display_width(l).max(1).div_ceil(per_line)).sum()
+}
+
+fn compose_height(input: &Input, width: f32, banner: bool) -> f32 {
+    let lines = compose_lines(input.as_str(), width).clamp(1, MAX_COMPOSE_LINES);
     20.0 + lines as f32 * LINE_H + if banner { BANNER_H } else { 0.0 }
 }
 
@@ -109,7 +125,8 @@ pub fn messages_viewport(
     let width = size.width - FOLDER_W - SIDEBAR_W - 1.0 - 2.0 * MSG_PAD_X - MSG_AVATAR - MSG_AVATAR_GAP - panel;
     let pinned = if pinned { PINNED_H + 1.0 } else { 0.0 };
     let player = if player { PLAYER_H + 1.0 } else { 0.0 };
-    let height = size.height - STATUS_H - HEADER_H - 2.0 - pinned - player - compose_height(compose, banner) - LIST_BOTTOM;
+    let compose = compose_height(compose, compose_text_width(size, emoji), banner);
+    let height = size.height - STATUS_H - HEADER_H - 2.0 - pinned - player - compose - LIST_BOTTOM;
     (width.max(100.0), height.max(LINE_H))
 }
 
@@ -1560,7 +1577,9 @@ pub fn has_banner(app: &App) -> bool {
 
 fn compose(app: &App) -> Element<'_, Message> {
     let editing = app.mode == Mode::Insert;
-    let content = if app.input.is_empty() && !editing {
+    let width = compose_text_width(app.size, app.emoji.is_some());
+    let lines = compose_lines(app.input.as_str(), width).clamp(1, MAX_COMPOSE_LINES);
+    let content: Element<_> = if app.input.is_empty() && !editing {
         let hint = if app.forward.is_some() {
             "i — add a comment   Enter — send"
         } else {
@@ -1571,7 +1590,13 @@ fn compose(app: &App) -> Element<'_, Message> {
             .style(muted_text)
             .into()
     } else {
-        input_text(&app.input, editing, false, "")
+        // Longer than the box: scrolled to the cursor by the app.
+        scrollable(input_text(&app.input, editing, false, ""))
+            .id(COMPOSE_ID)
+            .direction(Direction::Vertical(Scrollbar::hidden()))
+            .width(Length::Fill)
+            .height(lines as f32 * LINE_H)
+            .into()
     };
     let mut body = column![].width(Length::Fill);
     if let Some(banner) = compose_banner(app) {
@@ -1581,18 +1606,18 @@ fn compose(app: &App) -> Element<'_, Message> {
     let open = app.emoji.is_some();
     let button = mouse_area(
         container(text("😀").size(18).line_height(1.0))
-            .width(32)
-            .height(32)
+            .width(COMPOSE_BUTTON)
+            .height(COMPOSE_BUTTON)
             .align_x(Alignment::Center)
             .align_y(Alignment::Center)
             .style(move |t: &Theme| selection_style(t, open, true)),
     )
     .on_press(Message::ToggleEmoji)
     .interaction(Interaction::Pointer);
-    container(row![body, button].spacing(8).align_y(Alignment::End))
+    container(row![body, button].spacing(COMPOSE_GAP).align_y(Alignment::End))
         .padding([10.0, MSG_PAD_X])
         .width(Length::Fill)
-        .max_height(compose_height(&app.input, has_banner(app)))
+        .max_height(compose_height(&app.input, width, has_banner(app)))
         .clip(true)
         .into()
 }
@@ -1790,6 +1815,16 @@ fn status_line(app: &App) -> Element<'_, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compose_counts_wrapped_lines() {
+        let width = 10.0 * TEXT * 0.55 * 4.0; // 40 letters a line
+        assert_eq!(compose_lines("", width), 1);
+        assert_eq!(compose_lines("short\nlines", width), 2);
+        // A long line wraps; this is what hid the end of a long message.
+        assert_eq!(compose_lines(&"word ".repeat(30), width), 4);
+        assert_eq!(compose_lines(&format!("{}\nend", "x".repeat(81)), width), 4);
+    }
 
     fn msg_at(id: i64, date: i32) -> Msg {
         Msg {

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use iced::keyboard::key::{Named, Physical};
 use iced::keyboard::{self, Key, Modifiers};
 use iced::mouse::ScrollDelta;
-use iced::widget::scrollable::{AbsoluteOffset, Viewport};
+use iced::widget::scrollable::{AbsoluteOffset, RelativeOffset, Viewport};
 use iced::{Size, Subscription, Task, Theme, window};
 use tdlib_rs::enums::{AuthorizationState, Update};
 use tdlib_rs::types::{ChatNotificationSettings, ChatPhotoInfo, ChatPosition};
@@ -48,6 +48,7 @@ const CACHE_DAYS: i32 = 7;
 
 /// Scrollable showing a message taller than the screen.
 pub const TALL_ID: &str = "tall-message";
+pub const COMPOSE_ID: &str = "compose";
 
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes  J/K gt/gT Alt-N folders  \
                     Enter open/play  i insert  q record  r reply  R react  cc/e edit  f forward  v visual  dd delete  \
@@ -512,6 +513,8 @@ pub struct App {
     pub recorder: Option<Recorder>,
     /// Message being composed, or the login field before authorization.
     pub input: Input,
+    /// Length and cursor of `input` the compose box last scrolled to.
+    compose_seen: (usize, usize),
     pub compose: Compose,
     pub forward: Option<Forward>,
     /// Where `gf` jumped from (chat, message), newest last; `Ctrl-o` goes back.
@@ -625,6 +628,7 @@ impl App {
             animating: false,
             recorder: None,
             input: Input::default(),
+            compose_seen: (0, 0),
             compose: Compose::New,
             forward: None,
             jumps: Vec::new(),
@@ -895,8 +899,31 @@ impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.handle(message);
         let read = self.end_preview();
+        let follow = self.follow_compose_cursor();
         // Whatever changed, make sure what is on screen gets downloaded.
-        Task::batch([task, read, self.fetch_visible(), self.sync_tray()])
+        Task::batch([task, read, follow, self.fetch_visible(), self.sync_tray()])
+    }
+
+    /// Keep the cursor line in view when the compose text is longer than
+    /// its box.
+    fn follow_compose_cursor(&mut self) -> Task<Message> {
+        let text = self.input.as_str();
+        let (before, _) = self.input.split();
+        let seen = (text.len(), before.len());
+        if seen == self.compose_seen {
+            return Task::none();
+        }
+        self.compose_seen = seen;
+        let width = view::compose_text_width(self.size, self.emoji.is_some());
+        let total = view::compose_lines(text, width);
+        let shown = total.min(view::MAX_COMPOSE_LINES);
+        if total <= shown {
+            return Task::none();
+        }
+        // The cursor's line at the bottom of the box, or as low as it gets.
+        let line = view::compose_lines(before, width);
+        let top = line.saturating_sub(shown).min(total - shown);
+        iced::widget::operation::snap_to(COMPOSE_ID, RelativeOffset { x: 0.0, y: top as f32 / (total - shown) as f32 })
     }
 
     /// A previewed chat whose messages got focus is read like an opened one.
