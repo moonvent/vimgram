@@ -322,6 +322,7 @@ mod tests {
             links: Vec::new(),
             styles: Vec::new(),
             spoiler: false,
+            preview: None,
         }
     }
 

@@ -1547,6 +1547,7 @@ impl App {
                     msg.links = tg::content_links(&u.new_content, &msg.text);
                     msg.styles = tg::content_styles(&u.new_content, &msg.text);
                     msg.spoiler = tg::media_spoiler(&u.new_content);
+                    msg.preview = tg::link_preview(&u.new_content);
                     let msg = msg.clone();
                     self.archive_save(&[msg]);
                 }
@@ -2125,6 +2126,9 @@ impl App {
                     if let Some(file) = media.inline_file() {
                         wanted.push((file, Kind::of(media), size, media::PRIORITY_INLINE));
                     }
+                }
+                if let Some(photo) = msg.preview.as_ref().and_then(|p| p.photo) {
+                    wanted.push((photo.id, Kind::Image, Size::ZERO, media::PRIORITY_INLINE));
                 }
             }
         }
@@ -4186,6 +4190,7 @@ mod tests {
             links: Vec::new(),
             styles: Vec::new(),
             spoiler: false,
+            preview: None,
         }
     }
 

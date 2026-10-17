@@ -17,7 +17,7 @@ use crate::emoji::{self, Picker};
 use crate::fonts::{self, EMOJI};
 use crate::media::Loaded;
 use crate::player;
-use crate::tg::{ChatKind, Media, Msg, Presence, Sender, Style, fmt_duration};
+use crate::tg::{ChatKind, Media, Msg, Presence, Preview, Sender, Style, fmt_duration};
 use crate::vim::{Input, Mode};
 
 pub const FOLDER_W: f32 = 76.0;
@@ -181,6 +181,56 @@ fn media_block_height(media: &[Media], width: f32) -> f32 {
     }
 }
 
+/// Link preview card: text size, its line height, the picture beside the
+/// text, padding, and the description's line limit.
+const PREVIEW_TEXT: f32 = 13.0;
+const PREVIEW_LINE_H: f32 = PREVIEW_TEXT * 1.35;
+const PREVIEW_THUMB: f32 = 56.0;
+const PREVIEW_PAD: f32 = 8.0;
+const PREVIEW_LINES: usize = 3;
+
+/// Width of a preview card's text in a message `width` wide.
+fn preview_text_width(preview: &Preview, width: f32) -> f32 {
+    let thumb = if preview.photo.is_some() { PREVIEW_THUMB + PREVIEW_PAD } else { 0.0 };
+    width - 20.0 - 2.0 * PREVIEW_PAD - thumb
+}
+
+/// The description cut to what the card shows.
+fn preview_description(preview: &Preview, width: f32) -> String {
+    let per_line = (preview_text_width(preview, width) / (PREVIEW_TEXT * 0.6)).max(10.0) as usize;
+    let mut out = String::new();
+    let mut lines = 0;
+    for line in preview.description.lines().filter(|l| !l.trim().is_empty()) {
+        let room = (PREVIEW_LINES - lines) * per_line;
+        lines += display_width(line).max(1).div_ceil(per_line);
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        if lines > PREVIEW_LINES {
+            out.extend(line.chars().take(room.saturating_sub(1)));
+            out.push('…');
+            break;
+        }
+        out.push_str(line);
+        if lines == PREVIEW_LINES {
+            break;
+        }
+    }
+    out
+}
+
+fn preview_height(preview: &Preview, width: f32) -> f32 {
+    let per_line = (preview_text_width(preview, width) / (PREVIEW_TEXT * 0.6)).max(10.0) as usize;
+    let description: usize = preview_description(preview, width)
+        .lines()
+        .map(|l| display_width(l).max(1).div_ceil(per_line))
+        .sum();
+    let lines = usize::from(!preview.site.is_empty()) + usize::from(!preview.title.is_empty()) + description;
+    let text = lines as f32 * PREVIEW_LINE_H;
+    let thumb = if preview.photo.is_some() { PREVIEW_THUMB } else { 0.0 };
+    text.max(thumb) + 2.0 * PREVIEW_PAD + MEDIA_GAP
+}
+
 /// Emoji and CJK take about two columns of Latin text.
 fn display_width(line: &str) -> usize {
     line.chars().map(|c| if (c as u32) < 0x2e80 { 1 } else { 2 }).sum()
@@ -204,7 +254,8 @@ pub fn message_height(m: &Msg, width: f32) -> f32 {
     // Rows of chips, the padding above them and the column spacing.
     let rows = m.reactions.len().div_ceil(per_row);
     let reactions = if rows == 0 { 0.0 } else { rows as f32 * REACTIONS_H + 2.0 };
-    16.0 + 18.0 + reply + media_block_height(&m.media, width) + lines as f32 * LINE_H + reactions + MSG_SPACING
+    let preview = m.preview.as_ref().map_or(0.0, |p| preview_height(p, width));
+    16.0 + 18.0 + reply + media_block_height(&m.media, width) + lines as f32 * LINE_H + preview + reactions + MSG_SPACING
 }
 
 fn local_day(unix: i32) -> Option<chrono::NaiveDate> {
@@ -1469,6 +1520,9 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
     if !m.text.is_empty() {
         body = body.push(message_text(app, m));
     }
+    if let Some(preview) = &m.preview {
+        body = body.push(preview_card(app, preview, width));
+    }
 
     if !m.reactions.is_empty() {
         body = body.push(reactions_row(m));
@@ -1500,6 +1554,54 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
         tip,
         tooltip::Position::FollowCursor,
     )
+    .into()
+}
+
+/// Site, title, the start of the description and the picture of a link;
+/// clicking it opens the link.
+fn preview_card<'a>(app: &'a App, preview: &'a Preview, width: f32) -> Element<'a, Message> {
+    let bold = Font { weight: font::Weight::Bold, ..Font::DEFAULT };
+    let line = |s: &'a str| text(s).size(PREVIEW_TEXT).font(bold).wrapping(Wrapping::None);
+    let mut lines = column![].width(Length::Fill);
+    if !preview.site.is_empty() {
+        lines = lines.push(line(&preview.site).style(primary_text));
+    }
+    if !preview.title.is_empty() {
+        lines = lines.push(line(&preview.title));
+    }
+    let description = preview_description(preview, width);
+    if !description.is_empty() {
+        lines = lines.push(emoji_text(&description).size(PREVIEW_TEXT));
+    }
+    let mut card = row![lines].spacing(PREVIEW_PAD);
+    if let Some(photo) = preview.photo {
+        let picture: Element<_> = match app.media.image(photo.id) {
+            Some(handle) => image(handle.clone())
+                .width(PREVIEW_THUMB)
+                .height(PREVIEW_THUMB)
+                .content_fit(ContentFit::Cover)
+                .border_radius(4.0)
+                .into(),
+            None => placeholder(Size::new(PREVIEW_THUMB, PREVIEW_THUMB), "", 12.0, 4.0),
+        };
+        card = card.push(picture);
+    }
+    let card = container(card)
+        .padding(PREVIEW_PAD)
+        .width(Length::Fill)
+        .max_height(preview_height(preview, width) - MEDIA_GAP)
+        .clip(true)
+        .style(|t: &Theme| container::Style {
+            background: Some(t.palette().primary.scale_alpha(0.08).into()),
+            border: iced::border::rounded(6.0).color(t.palette().primary.scale_alpha(0.35)).width(1.0),
+            ..Default::default()
+        });
+    container(
+        mouse_area(card)
+            .on_press(Message::OpenLink(preview.url.clone()))
+            .interaction(Interaction::Pointer),
+    )
+    .padding(iced::Padding { top: MEDIA_GAP, ..Default::default() })
     .into()
 }
 
@@ -1886,6 +1988,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preview_description_fits_three_lines() {
+        let width = 20.0 + 2.0 * PREVIEW_PAD + 10.0 * PREVIEW_TEXT * 0.6 * 2.0; // 20 letters a line
+        let preview = |description: &str| Preview {
+            url: String::new(),
+            site: "Site".into(),
+            title: String::new(),
+            description: description.into(),
+            photo: None,
+        };
+        assert_eq!(preview_description(&preview("short"), width), "short");
+        assert_eq!(preview_description(&preview("a\n\nb\nc\nd"), width), "a\nb\nc");
+        let long = preview_description(&preview(&"x".repeat(100)), width);
+        assert_eq!(long.chars().count(), 60);
+        assert!(long.ends_with('…'));
+        // Site line plus three of the description.
+        assert_eq!(preview_height(&preview(&"x".repeat(100)), width), 4.0 * PREVIEW_LINE_H + 2.0 * PREVIEW_PAD + MEDIA_GAP);
+    }
+
+    #[test]
     fn compose_counts_wrapped_lines() {
         let width = 10.0 * TEXT * 0.55 * 4.0; // 40 letters a line
         assert_eq!(compose_lines("", width), 1);
@@ -1917,6 +2038,7 @@ mod tests {
             links: Vec::new(),
             styles: Vec::new(),
             spoiler: false,
+            preview: None,
         }
     }
 

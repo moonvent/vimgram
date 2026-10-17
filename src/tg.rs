@@ -1001,6 +1001,19 @@ pub struct Msg {
     /// The photo or video is hidden under a spoiler until shown.
     #[serde(default)]
     pub spoiler: bool,
+    /// What the first link in the text points to.
+    #[serde(default)]
+    pub preview: Option<Preview>,
+}
+
+/// A link preview: the page's site, title, description and picture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Preview {
+    pub url: String,
+    pub site: String,
+    pub title: String,
+    pub description: String,
+    pub photo: Option<FileRef>,
 }
 
 /// How a byte range of `Msg::text` is shown.
@@ -1115,6 +1128,38 @@ pub fn content_links(content: &MessageContent, shown: &str) -> Vec<Link> {
 /// The styles of the text a message shows.
 pub fn content_styles(content: &MessageContent, shown: &str) -> Vec<Styled> {
     shown_formatted(content, shown).map(styles).unwrap_or_default()
+}
+
+/// Preview pictures are small: the smallest size at least this large.
+const PREVIEW_PHOTO_SIDE: i32 = 160;
+
+pub fn link_preview(content: &MessageContent) -> Option<Preview> {
+    use enums::LinkPreviewType as T;
+    let MessageContent::MessageText(t) = content else {
+        return None;
+    };
+    let p = t.link_preview.as_ref()?;
+    let photo = match &p.r#type {
+        T::Photo(t) => Some(&t.photo),
+        T::Article(t) => t.photo.as_ref(),
+        T::Video(t) => t.cover.as_ref(),
+        _ => None,
+    };
+    let photo = photo.and_then(|photo| {
+        let mut sizes: Vec<&types::PhotoSize> = photo.sizes.iter().collect();
+        sizes.sort_by_key(|s| s.width.max(s.height));
+        let size = sizes.iter().find(|s| s.width.max(s.height) >= PREVIEW_PHOTO_SIDE).or(sizes.last())?;
+        Some(FileRef::new(&size.photo, size.width, size.height))
+    });
+    let preview = Preview {
+        url: p.url.clone(),
+        site: p.site_name.clone(),
+        title: p.title.clone(),
+        description: p.description.text.clone(),
+        photo,
+    };
+    (!preview.site.is_empty() || !preview.title.is_empty() || !preview.description.is_empty() || preview.photo.is_some())
+        .then_some(preview)
 }
 
 /// A photo, video or GIF sent under a spoiler.
@@ -1257,6 +1302,7 @@ impl From<types::Message> for Msg {
             links: content_links(&m.content, &text),
             styles: content_styles(&m.content, &text),
             spoiler: media_spoiler(&m.content),
+            preview: link_preview(&m.content),
             text,
         }
     }
@@ -1300,6 +1346,7 @@ impl From<Record> for Msg {
             links: Vec::new(),
             styles: Vec::new(),
             spoiler: false,
+            preview: None,
         }
     }
 }
