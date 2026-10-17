@@ -2548,6 +2548,15 @@ impl App {
             self.open_emoji();
             return Task::none();
         }
+        if self.auth == Auth::Ready
+            && matches!(key, Key::Named(Named::ArrowUp))
+            && self.input.is_empty()
+            && self.attachments.is_empty()
+            && matches!(self.compose, Compose::New)
+        {
+            self.edit_last_own();
+            return Task::none();
+        }
         match edit(&mut self.input, key, physical, mods, text) {
             Edit::Submit if self.auth == Auth::Ready => self.send(),
             Edit::Submit => self.submit_auth(),
@@ -2558,6 +2567,27 @@ impl App {
             Edit::Paste => self.read_clipboard(PasteTarget::Input(None)),
             Edit::Changed | Edit::Ignored => Task::none(),
         }
+    }
+
+    /// `↑` in an empty compose line: edit your last text message, like Telegram.
+    fn edit_last_own(&mut self) {
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        let last = open
+            .msgs
+            .iter()
+            .rposition(|m| m.outgoing && m.media.is_empty() && !m.sending && !m.scheduled && !m.deleted);
+        let Some(i) = last else {
+            self.error("No message of yours to edit here");
+            return;
+        };
+        open.cursor = i;
+        let (id, text) = (open.msgs[i].id, open.msgs[i].text.clone());
+        self.focus = Focus::Messages;
+        self.compose = Compose::Edit(id);
+        self.input.insert(&text);
+        self.scroll_messages();
     }
 
     fn key_cmdline(&mut self, key: &Key, physical: Physical, mods: Modifiers, text: Option<&str>) -> Task<Message> {

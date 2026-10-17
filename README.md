@@ -78,7 +78,8 @@ Command line: `↑`/`↓` (or `Ctrl-p`/`Ctrl-n`) recall earlier `/` searches and
 starting with what you typed; the history survives restarts.
 
 Insert mode: `Enter` sends, `Shift+Enter` new line, `Ctrl-v` paste (text, or a copied
-image / files as attachments), `Ctrl-w` delete word, `Ctrl-u` delete to start. Two to
+image / files as attachments), `Ctrl-w` delete word, `Ctrl-u` delete to start, `↑` in an empty line edits your last
+message. Two to
 ten photos and videos go as an album.
 
 When a voice or round video message ends and the very next message is one too, it plays
