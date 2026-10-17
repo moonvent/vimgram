@@ -314,6 +314,72 @@ pub fn probe_video(path: &std::path::Path) -> Option<VideoInfo> {
     Some(VideoInfo { duration, width, height })
 }
 
+/// Longest side of a video preview: Telegram ignores bigger ones.
+const THUMBNAIL_SIDE: i32 = 320;
+
+/// A JPEG preview of a video to send with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Thumbnail {
+    pub path: std::path::PathBuf,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// A frame from about a second in (blocking). Telegram shows no picture for
+/// a sent video unless the sender attaches one.
+pub fn video_thumbnail(path: &std::path::Path, info: VideoInfo) -> Result<Thumbnail, String> {
+    if info.width <= 0 || info.height <= 0 {
+        return Err("no video stream".into());
+    }
+    let scale = (THUMBNAIL_SIDE as f64 / info.width.max(info.height) as f64).min(1.0);
+    // Even sizes keep videoscale and the encoder happy.
+    let even = |v: i32| ((v as f64 * scale).round() as i32).max(2) & !1;
+    let (width, height) = (even(info.width), even(info.height));
+
+    gst::init().map_err(|e| e.to_string())?;
+    // `videoflip video-direction=auto` applies the rotation phones record.
+    let description = format!(
+        "uridecodebin uri=\"{}\" ! videoconvert ! videoflip video-direction=auto ! videoscale ! \
+         video/x-raw,format=RGBx,width={width},height={height},pixel-aspect-ratio=1/1 ! \
+         appsink name=sink sync=false max-buffers=1 drop=true",
+        uri(&path.to_string_lossy())?
+    );
+    let pipeline = gst::parse::launch(&description)
+        .map_err(|e| e.to_string())?
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| "not a pipeline".to_string())?;
+    let sink = pipeline
+        .by_name("sink")
+        .and_then(|s| s.downcast::<gstreamer_app::AppSink>().ok())
+        .ok_or("no appsink")?;
+    let result = (|| {
+        let timeout = gst::ClockTime::from_seconds(10);
+        pipeline.set_state(gst::State::Paused).map_err(|e| e.to_string())?;
+        pipeline.state(timeout).0.map_err(|e| e.to_string())?;
+        if info.duration >= 2 {
+            pipeline
+                .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, gst::ClockTime::from_seconds(1))
+                .map_err(|e| e.to_string())?;
+            pipeline.state(timeout).0.map_err(|e| e.to_string())?;
+        }
+        let sample = sink.try_pull_preroll(timeout).ok_or("no frame")?;
+        let buffer = sample.buffer().ok_or("empty frame")?.map_readable().map_err(|e| e.to_string())?;
+        // RGBx has no row padding: drop the x of every pixel.
+        let rgb: Vec<u8> = buffer.chunks_exact(4).flat_map(|px| [px[0], px[1], px[2]]).collect();
+        if rgb.len() != (width * height * 3) as usize {
+            return Err(format!("frame of {} bytes for {width}x{height}", rgb.len()));
+        }
+        let path = crate::clipboard::paste_path("jpg")?;
+        let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+        image::codecs::jpeg::JpegEncoder::new_with_quality(std::io::BufWriter::new(file), 85)
+            .encode(&rgb, width as u32, height as u32, image::ExtendedColorType::Rgb8)
+            .map_err(|e| e.to_string())?;
+        Ok(Thumbnail { path, width, height })
+    })();
+    let _ = pipeline.set_state(gst::State::Null);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +393,25 @@ mod tests {
         let info = probe_video(&sample).expect("probe");
         assert_eq!((info.width, info.height), (320, 240));
         assert_eq!(info.duration, 3);
+    }
+
+    #[test]
+    fn makes_video_thumbnails() {
+        let Some(sample) = crate::stream::tests::sample_mp4() else {
+            eprintln!("skipped: cannot encode a sample video");
+            return;
+        };
+        let info = probe_video(&sample).expect("probe");
+        let thumb = video_thumbnail(&sample, info).expect("thumbnail");
+        assert_eq!((thumb.width, thumb.height), (320, 240));
+        let decoded = image::open(&thumb.path).expect("a JPEG");
+        assert_eq!((decoded.width(), decoded.height()), (320, 240));
+        let _ = std::fs::remove_file(&thumb.path);
+        // Bigger videos are scaled down to 320 px on the long side.
+        let big = VideoInfo { width: 1920, height: 1080, ..info };
+        let thumb = video_thumbnail(&sample, big).expect("thumbnail");
+        assert_eq!((thumb.width, thumb.height), (320, 180));
+        let _ = std::fs::remove_file(&thumb.path);
     }
 
     #[test]

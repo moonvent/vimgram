@@ -52,8 +52,9 @@ fn paste_dir() -> PathBuf {
     crate::config::dirs().cache_dir().join("paste")
 }
 
-/// A new file for a pasted image.
-fn paste_path(ext: &str) -> Result<PathBuf, String> {
+/// A new file for a pasted image (or another file made for sending, like a
+/// video's preview); removed after a day.
+pub fn paste_path(ext: &str) -> Result<PathBuf, String> {
     let dir = paste_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir.join(format!("{}.{ext}", chrono::Local::now().format("pasted-%Y%m%d-%H%M%S%3f"))))
