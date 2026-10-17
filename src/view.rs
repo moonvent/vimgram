@@ -71,6 +71,8 @@ pub fn emoji_rows(height: f32) -> usize {
 
 /// Date separator above the first message of each day.
 const DAY_H: f32 = 30.0;
+/// "Forwarded from …" line above a forwarded message.
+const FORWARD_H: f32 = 18.0;
 /// Reactions under a message: a line of chips, and a pessimistic chip width.
 const REACTIONS_H: f32 = 28.0;
 const REACTION_W: f32 = 68.0;
@@ -173,6 +175,7 @@ pub fn message_height(m: &Msg, width: f32) -> f32 {
             .sum()
     };
     let reply = if m.reply_to.is_some() { REPLY_H } else { 0.0 };
+    let reply = reply + if m.forward.is_some() { FORWARD_H } else { 0.0 };
     let per_row = ((width - 20.0) / REACTION_W).max(1.0) as usize;
     let reactions = m.reactions.len().div_ceil(per_row) as f32 * REACTIONS_H;
     12.0 + 18.0 + reply + media_block_height(&m.media, width) + lines as f32 * LINE_H + reactions + MSG_SPACING
@@ -1191,6 +1194,11 @@ fn reply_quote<'a>(app: &'a App, reply_to: i64) -> Element<'a, Message> {
 fn message_keys(app: &App, m: &Msg) -> String {
     let channel = app.chats.get(&m.chat_id).is_some_and(|c| c.kind == ChatKind::Channel);
     let mut keys = Vec::new();
+    if m.forward.is_some() {
+        keys.push("gf original");
+    } else if m.reply_to.is_some() {
+        keys.push("gf reply");
+    }
     match m.media.first() {
         Some(Media::Voice { .. } | Media::Video { round: true, .. }) => keys.push("Enter play"),
         Some(media) if media.viewable() => keys.push("Enter open"),
@@ -1248,8 +1256,29 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
     }
 
     let mut body = column![header].spacing(2);
+    if let Some(forward) = &m.forward {
+        let from = match forward.sender {
+            Some(sender) if forward.name.is_empty() => app.sender_name(sender).to_owned(),
+            Some(sender) => format!("{} ({})", app.sender_name(sender), forward.name),
+            None => forward.name.clone(),
+        };
+        body = body.push(
+            mouse_area(
+                container(text(format!("Forwarded from {from}")).size(12).wrapping(Wrapping::None).style(primary_text))
+                    .height(FORWARD_H - 2.0)
+                    .align_y(Alignment::Center)
+                    .clip(true),
+            )
+            .on_press(Message::ClickSource(m.id))
+            .interaction(Interaction::Pointer),
+        );
+    }
     if let Some(reply_to) = m.reply_to {
-        body = body.push(reply_quote(app, reply_to));
+        body = body.push(
+            mouse_area(reply_quote(app, reply_to))
+                .on_press(Message::ClickSource(m.id))
+                .interaction(Interaction::Pointer),
+        );
     }
     if !m.media.is_empty() {
         body = body.push(container(media_block(app, m, width)).padding([MEDIA_GAP / 2.0, 0.0]));
@@ -1671,6 +1700,7 @@ mod tests {
             deleted: false,
             local_files: Vec::new(),
             reactions: Vec::new(),
+            forward: None,
         }
     }
 

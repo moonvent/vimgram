@@ -318,6 +318,7 @@ mod tests {
             deleted: false,
             local_files: Vec::new(),
             reactions: Vec::new(),
+            forward: None,
         }
     }
 

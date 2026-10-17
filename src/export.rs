@@ -144,6 +144,7 @@ mod tests {
             deleted,
             local_files: Vec::new(),
             reactions: Vec::new(),
+            forward: None,
         }
     }
 

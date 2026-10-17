@@ -52,7 +52,7 @@ pub const TALL_ID: &str = "tall-message";
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes  J/K gt/gT Alt-N folders  \
                     Enter open/play  i insert  q record  r reply  R react  cc/e edit  f forward  dd delete  \
                     yy/Y copy  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  H/L seek  \
-                    / filter chats or search messages  n/N next/prev match  ga attach  gp pinned  \
+                    / filter chats or search messages  n/N next/prev match  ga attach  gp pinned  gf original/reply  ^o back  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
                     :folder  :theme  :autostart  :cleancache  :q";
 
@@ -138,6 +138,14 @@ pub enum Message {
     JumpPlaying,
     /// The cursor rested on this chat (`open_on_select`).
     PreviewChat(i64),
+    /// The reply quote or "Forwarded from" line of a message was clicked.
+    ClickSource(i64),
+    /// The chat of a forward's origin is loaded: open it (at `msg_id`).
+    GoTo {
+        from: (i64, i64),
+        msg_id: Option<i64>,
+        result: Result<i64, String>,
+    },
     PauseVoice,
     StopVoice,
     /// Emoji panel: open/close, pick a tab, insert an emoji.
@@ -488,6 +496,8 @@ pub struct App {
     pub compose: Compose,
     /// Messages being forwarded: source chat and message ids.
     pub forward: Option<(i64, Vec<i64>)>,
+    /// Where `gf` jumped from (chat, message), newest last; `Ctrl-o` goes back.
+    jumps: Vec<(i64, i64)>,
     pub found: Option<Found>,
     /// `/` searches messages instead of filtering chats.
     pub search_messages: bool,
@@ -593,6 +603,7 @@ impl App {
             input: Input::default(),
             compose: Compose::New,
             forward: None,
+            jumps: Vec::new(),
             found: None,
             search_messages: false,
             confirm: None,
@@ -1238,6 +1249,20 @@ impl App {
                 self.activate_media(msg_id, item)
             }
             Message::Scroll(pane, delta) => self.on_scroll(pane, delta),
+            Message::ClickSource(msg_id) => {
+                self.select_message(msg_id);
+                self.go_to_source()
+            }
+            Message::GoTo { from, msg_id, result } => match result {
+                Ok(chat_id) => {
+                    self.jumps.push(from);
+                    self.open_chat_at(chat_id, msg_id)
+                }
+                Err(e) => {
+                    self.error(format!("Can't open the original: {e}"));
+                    Task::none()
+                }
+            },
             Message::PreviewChat(id) => {
                 let still_here = self.selected == Some(id) && self.focus == Focus::Chats;
                 if !still_here || self.forward.is_some() || self.auth != Auth::Ready || self.open.as_ref().is_some_and(|o| o.id == id) {
@@ -3112,6 +3137,17 @@ impl App {
                 }
             },
             Action::Pinned => self.handle(Message::JumpPinned),
+            Action::GoToSource => self.go_to_source(),
+            Action::JumpBack => match self.jumps.pop() {
+                Some((chat_id, msg_id)) if self.open.as_ref().is_some_and(|o| o.id == chat_id) => {
+                    self.jump_to_message(msg_id)
+                }
+                Some((chat_id, msg_id)) => self.open_chat_at(chat_id, Some(msg_id)),
+                None => {
+                    self.error("Nowhere to go back to (gf jumps)");
+                    Task::none()
+                }
+            },
             Action::SearchNext => self.next_match(1),
             Action::SearchPrev => self.next_match(-1),
             Action::Delete => {
@@ -3225,6 +3261,43 @@ impl App {
                 Task::none()
             }
         }
+    }
+
+    /// `gf`: the original of a forwarded message (or at least its author's
+    /// chat), otherwise the message it replies to.
+    fn go_to_source(&mut self) -> Task<Message> {
+        let Some(m) = self.focused_message() else {
+            self.error("Select a message first (l)");
+            return Task::none();
+        };
+        let from = (m.chat_id, m.id);
+        let (chat, msg_id) = match (&m.forward, m.reply_to) {
+            (Some(f), _) => match (f.source, f.sender) {
+                (Some((chat, id)), _) => (Sender::Chat(chat), Some(id)),
+                (None, Some(sender)) => (sender, None),
+                (None, None) => {
+                    self.error(format!("{} hides their account", f.name));
+                    return Task::none();
+                }
+            },
+            (None, Some(reply_to)) => (Sender::Chat(m.chat_id), Some(reply_to)),
+            (None, None) => {
+                self.error("Neither a forward nor a reply");
+                return Task::none();
+            }
+        };
+        if let (Sender::Chat(chat_id), Some(msg_id)) = (chat, msg_id)
+            && chat_id == from.0
+        {
+            self.jumps.push(from);
+            return self.jump_to_message(msg_id);
+        }
+        let load = match chat {
+            Sender::Chat(chat_id) => Task::perform(tg::load_chat(chat_id), move |result| Message::GoTo { from, msg_id, result }),
+            Sender::User(user_id) => Task::perform(tg::private_chat(user_id), move |result| Message::GoTo { from, msg_id, result }),
+        };
+        self.info("Opening the original…");
+        load
     }
 
     fn forward_to(&mut self, chat_id: i64) -> Task<Message> {
@@ -3703,6 +3776,7 @@ mod tests {
             deleted: false,
             local_files: Vec::new(),
             reactions: Vec::new(),
+            forward: None,
         }
     }
 

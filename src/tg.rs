@@ -500,6 +500,18 @@ pub async fn remove_reaction(chat_id: i64, message_id: i64, kind: ReactionKind) 
         .map_err(err)
 }
 
+/// Load a chat TDLib may not know yet (the origin of a forward); fails
+/// when it can't be opened, e.g. a private channel you are not in.
+pub async fn load_chat(chat_id: i64) -> Res<i64> {
+    functions::get_chat(chat_id, client()).await.map(|_| chat_id).map_err(err)
+}
+
+/// The private chat with a user, created if needed.
+pub async fn private_chat(user_id: i64) -> Res<i64> {
+    let enums::Chat::Chat(chat) = functions::create_private_chat(user_id, false, client()).await.map_err(err)?;
+    Ok(chat.id)
+}
+
 pub async fn forward(to_chat: i64, from_chat: i64, ids: Vec<i64>) -> Res<()> {
     functions::forward_messages(to_chat, None, from_chat, ids, None, false, false, client())
         .await
@@ -921,6 +933,39 @@ pub struct Msg {
     pub local_files: Vec<(i32, String)>,
     #[serde(default)]
     pub reactions: Vec<Reaction>,
+    #[serde(default)]
+    pub forward: Option<Forward>,
+}
+
+/// Where a forwarded message comes from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Forward {
+    /// The original author; `None` when they hide their account.
+    pub sender: Option<Sender>,
+    /// Their name when hidden, or a channel post's signature.
+    pub name: String,
+    /// The original message (chat, message), when Telegram says where it is:
+    /// channel posts, and messages saved to Saved Messages.
+    pub source: Option<(i64, i64)>,
+}
+
+fn forward_origin(info: Option<&types::MessageForwardInfo>) -> Option<Forward> {
+    let info = info?;
+    let saved = info.source.as_ref().map(|s| (s.chat_id, s.message_id)).filter(|&(chat, msg)| chat != 0 && msg != 0);
+    Some(match &info.origin {
+        enums::MessageOrigin::User(u) => Forward { sender: Some(Sender::User(u.sender_user_id)), name: String::new(), source: saved },
+        enums::MessageOrigin::HiddenUser(h) => Forward { sender: None, name: h.sender_name.clone(), source: saved },
+        enums::MessageOrigin::Chat(c) => Forward {
+            sender: Some(Sender::Chat(c.sender_chat_id)),
+            name: c.author_signature.clone(),
+            source: saved,
+        },
+        enums::MessageOrigin::Channel(c) => Forward {
+            sender: Some(Sender::Chat(c.chat_id)),
+            name: c.author_signature.clone(),
+            source: Some((c.chat_id, c.message_id)),
+        },
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1018,6 +1063,7 @@ impl From<types::Message> for Msg {
             deleted: false,
             local_files,
             reactions: reactions(m.interaction_info.as_ref()),
+            forward: forward_origin(m.forward_info.as_ref()),
         }
     }
 }
@@ -1056,6 +1102,7 @@ impl From<Record> for Msg {
             deleted: true,
             local_files: Vec::new(),
             reactions: Vec::new(),
+            forward: None,
         }
     }
 }

@@ -135,6 +135,10 @@ pub enum Action {
     Attach,
     /// Jump to the pinned message (`gp`).
     Pinned,
+    /// The original of a forwarded message, or the message replied to (`gf`).
+    GoToSource,
+    /// Back to where `gf` came from (`Ctrl-o`).
+    JumpBack,
     /// Emoji panel (`ge`).
     Emoji,
     /// Back to the voice message playing in another chat (`gv`).
@@ -176,6 +180,7 @@ impl Pending {
             (Some('g'), NKey::Char('T')) => Some(Action::PrevFolder),
             (Some('g'), NKey::Char('a')) => Some(Action::Attach),
             (Some('g'), NKey::Char('p')) => Some(Action::Pinned),
+            (Some('g'), NKey::Char('f')) => Some(Action::GoToSource),
             (Some('g'), NKey::Char('e')) => Some(Action::Emoji),
             (Some('g'), NKey::Char('v')) => Some(Action::JumpPlaying),
             (Some('y'), NKey::Char('y')) => Some(Action::Yank),
@@ -196,6 +201,7 @@ impl Pending {
             (None, NKey::Char('G')) => Some(Action::Bottom),
             (None, NKey::Ctrl('d')) => Some(Action::HalfDown),
             (None, NKey::Ctrl('u')) => Some(Action::HalfUp),
+            (None, NKey::Ctrl('o')) => Some(Action::JumpBack),
             // Ctrl-h/l like moving between Vim windows; Ctrl+arrows arrive as arrows.
             (None, NKey::Char('h') | NKey::Left | NKey::Ctrl('h')) => Some(Action::FocusChats),
             (None, NKey::Char('l') | NKey::Right | NKey::Ctrl('l')) => Some(Action::FocusMessages),
@@ -430,6 +436,7 @@ mod tests {
         assert_eq!(feed("ge"), vec![Action::Emoji]);
         assert_eq!(feed("gv"), vec![Action::JumpPlaying]);
         assert_eq!(feed("rR"), vec![Action::Reply, Action::React]);
+        assert_eq!(feed("gf"), vec![Action::GoToSource]);
         let mut p = Pending::default();
         assert_eq!(p.feed(NKey::Ctrl('h')), Some(Action::FocusChats));
         assert_eq!(p.feed(NKey::Ctrl('l')), Some(Action::FocusMessages));
