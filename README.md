@@ -132,7 +132,7 @@ next (voice messages also from another chat; round videos while their chat is op
 plays on the same way, track after track, but only into more music.
 
 Photo/video viewer: `j`/`k` next/previous, `h`/`l` seek ±5s, `H`/`L` ±30s, `Space` pause,
-`[` `]` `=` speed, `{` `}` volume, `Esc` close.
+`[` `]` `=` speed, `{` `}` volume, `Esc` close. Under a video: time played, progress and length.
 
 Mouse: click folders, chats, messages and media; the wheel moves the cursor.
 

@@ -1697,11 +1697,15 @@ fn media_viewer(app: &App) -> Option<Element<'_, Message>> {
             }
         }
         Media::Video { .. } => match app.video.as_ref().and_then(VideoPlayback::video) {
-            Some(video) => VideoPlayer::new(video)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .content_fit(ContentFit::Contain)
-                .into(),
+            Some(video) => column![
+                VideoPlayer::new(video)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .content_fit(ContentFit::Contain),
+                video_progress(video),
+            ]
+            .spacing(10)
+            .into(),
             None => center(text("Loading video…").size(14).style(|_: &Theme| text::Style {
                 color: Some(Color::WHITE),
             }))
@@ -1720,6 +1724,23 @@ fn media_viewer(app: &App) -> Option<Element<'_, Message>> {
             })
             .into(),
     )
+}
+
+/// Under a video in the viewer: time played, progress, length.
+fn video_progress<'a>(video: &iced_video_player::Video) -> Element<'a, Message> {
+    let total = video.duration().as_secs_f64();
+    let pos = video.position().as_secs_f64().min(total);
+    let time = |secs: f64| {
+        text(fmt_secs(secs)).size(12).font(Font::MONOSPACE).style(|_: &Theme| text::Style {
+            color: Some(Color::from_rgb8(0xc8, 0xc8, 0xd0)),
+        })
+    };
+    let progress = if total > 0.0 { (pos / total) as f32 } else { 0.0 };
+    row![time(pos), progress_bar(0.0..=1.0, progress).girth(4), time(total)]
+        .spacing(10)
+        .padding([0, 4])
+        .align_y(Alignment::Center)
+        .into()
 }
 
 /// Line editor contents with a cursor bar when it is being edited.
