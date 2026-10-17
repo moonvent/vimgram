@@ -46,7 +46,7 @@ const CACHE_DAYS: i32 = 7;
 /// Scrollable showing a message taller than the screen.
 pub const TALL_ID: &str = "tall-message";
 
-const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l panes  J/K gt/gT Alt-N folders  \
+const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes  J/K gt/gT Alt-N folders  \
                     Enter open/play  i insert  q record  r reply  R react  cc/e edit  f forward  dd delete  \
                     yy/Y copy  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  H/L seek  \
                     / filter chats or search messages  n/N next/prev match  ga attach  gp pinned  \

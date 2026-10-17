@@ -196,8 +196,9 @@ impl Pending {
             (None, NKey::Char('G')) => Some(Action::Bottom),
             (None, NKey::Ctrl('d')) => Some(Action::HalfDown),
             (None, NKey::Ctrl('u')) => Some(Action::HalfUp),
-            (None, NKey::Char('h') | NKey::Left) => Some(Action::FocusChats),
-            (None, NKey::Char('l') | NKey::Right) => Some(Action::FocusMessages),
+            // Ctrl-h/l like moving between Vim windows; Ctrl+arrows arrive as arrows.
+            (None, NKey::Char('h') | NKey::Left | NKey::Ctrl('h')) => Some(Action::FocusChats),
+            (None, NKey::Char('l') | NKey::Right | NKey::Ctrl('l')) => Some(Action::FocusMessages),
             (None, NKey::Tab) => Some(Action::ToggleFocus),
             (None, NKey::Enter | NKey::Char('o')) => Some(Action::Open),
             (None, NKey::Char('i' | 'a')) => Some(Action::Insert),
@@ -429,6 +430,9 @@ mod tests {
         assert_eq!(feed("ge"), vec![Action::Emoji]);
         assert_eq!(feed("gv"), vec![Action::JumpPlaying]);
         assert_eq!(feed("rR"), vec![Action::Reply, Action::React]);
+        let mut p = Pending::default();
+        assert_eq!(p.feed(NKey::Ctrl('h')), Some(Action::FocusChats));
+        assert_eq!(p.feed(NKey::Ctrl('l')), Some(Action::FocusMessages));
         assert_eq!(feed("][="), vec![Action::Faster, Action::Slower, Action::NormalSpeed]);
     }
 
