@@ -137,6 +137,8 @@ pub enum Action {
     Pinned,
     /// The original of a forwarded message, or the message replied to (`gf`).
     GoToSource,
+    /// Open the n-th (1-based) link of the message (`gx`, `2gx`).
+    OpenLink(usize),
     /// Back to where `gf` came from (`Ctrl-o`).
     JumpBack,
     /// Emoji panel (`ge`).
@@ -181,6 +183,7 @@ impl Pending {
             (Some('g'), NKey::Char('a')) => Some(Action::Attach),
             (Some('g'), NKey::Char('p')) => Some(Action::Pinned),
             (Some('g'), NKey::Char('f')) => Some(Action::GoToSource),
+            (Some('g'), NKey::Char('x')) => Some(Action::OpenLink(explicit.unwrap_or(1))),
             (Some('g'), NKey::Char('e')) => Some(Action::Emoji),
             (Some('g'), NKey::Char('v')) => Some(Action::JumpPlaying),
             (Some('y'), NKey::Char('y')) => Some(Action::Yank),
@@ -424,7 +427,7 @@ mod tests {
         assert_eq!(feed("12j"), vec![Action::Down(12)]);
         assert_eq!(feed("gg"), vec![Action::Top]);
         assert_eq!(feed("yy"), vec![Action::Yank]);
-        assert_eq!(feed("gxj"), vec![Action::Down(1)]);
+        assert_eq!(feed("gzj"), vec![Action::Down(1)]);
         assert_eq!(feed("0j"), vec![Action::Down(1)]);
         assert_eq!(feed("10k"), vec![Action::Up(10)]);
         assert_eq!(feed("gt"), vec![Action::NextFolder]);
@@ -437,6 +440,7 @@ mod tests {
         assert_eq!(feed("gv"), vec![Action::JumpPlaying]);
         assert_eq!(feed("rR"), vec![Action::Reply, Action::React]);
         assert_eq!(feed("gf"), vec![Action::GoToSource]);
+        assert_eq!(feed("gx2gx"), vec![Action::OpenLink(1), Action::OpenLink(2)]);
         let mut p = Pending::default();
         assert_eq!(p.feed(NKey::Ctrl('h')), Some(Action::FocusChats));
         assert_eq!(p.feed(NKey::Ctrl('l')), Some(Action::FocusMessages));

@@ -332,11 +332,36 @@ pub fn view(app: &App, _window: iced::window::Id) -> Element<'_, Message> {
 /// User text (messages, titles, previews) with its emoji in the color
 /// emoji font, see `fonts::EMOJI`.
 fn emoji_text<'a>(s: &str) -> text::Rich<'a, (), Message> {
-    let spans: Vec<text::Span<'a, ()>> = fonts::emoji_runs(s)
+    rich_text(emoji_spans(s).collect::<Vec<text::Span<'a, ()>>>())
+}
+
+fn emoji_spans<'a, L>(s: &str) -> impl Iterator<Item = text::Span<'a, L>> {
+    fonts::emoji_runs(s)
         .into_iter()
         .map(|(run, emoji)| span(run.to_owned()).font_maybe(emoji.then_some(EMOJI)))
-        .collect();
+}
+
+/// A message's text with its links underlined in the theme's color;
+/// clicking one opens it.
+fn message_text<'a>(app: &App, m: &Msg) -> Element<'a, Message> {
+    let link_color = app.theme.palette().primary;
+    let mut spans: Vec<text::Span<'a, String>> = Vec::new();
+    let mut at = 0;
+    for link in &m.links {
+        let (Some(before), Some(shown)) = (m.text.get(at..link.start), m.text.get(link.start..link.end)) else {
+            continue; // overlapping or out of range
+        };
+        spans.extend(emoji_spans(before));
+        spans.extend(emoji_spans(shown).map(|s| s.link(link.url.clone()).underline(true).color(link_color)));
+        at = link.end;
+    }
+    spans.extend(emoji_spans(m.text.get(at..).unwrap_or("")));
+    let deleted = m.deleted;
     rich_text(spans)
+        .size(TEXT)
+        .style(move |t: &Theme| if deleted { muted_text(t) } else { text::Style::default() })
+        .on_link_click(Message::OpenLink)
+        .into()
 }
 
 fn muted(theme: &Theme) -> Color {
@@ -1218,6 +1243,9 @@ fn reply_quote<'a>(app: &'a App, reply_to: i64) -> Element<'a, Message> {
 fn message_keys(app: &App, m: &Msg) -> String {
     let channel = app.chats.get(&m.chat_id).is_some_and(|c| c.kind == ChatKind::Channel);
     let mut keys = Vec::new();
+    if !m.links.is_empty() {
+        keys.push("gx link");
+    }
     if m.forward.is_some() {
         keys.push("gf original");
     } else if m.reply_to.is_some() {
@@ -1308,10 +1336,7 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
         body = body.push(container(media_block(app, m, width)).padding([MEDIA_GAP / 2.0, 0.0]));
     }
     if !m.text.is_empty() {
-        let deleted = m.deleted;
-        body = body.push(emoji_text(&m.text).size(TEXT).style(move |t: &Theme| {
-            if deleted { muted_text(t) } else { text::Style::default() }
-        }));
+        body = body.push(message_text(app, m));
     }
 
     if !m.reactions.is_empty() {
@@ -1727,6 +1752,7 @@ mod tests {
             local_files: Vec::new(),
             reactions: Vec::new(),
             forward: None,
+            links: Vec::new(),
         }
     }
 

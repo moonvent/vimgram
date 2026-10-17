@@ -515,6 +515,24 @@ pub async fn remove_reaction(chat_id: i64, message_id: i64, kind: ReactionKind) 
         .map_err(err)
 }
 
+/// Where a t.me link points inside Telegram: a chat, maybe a message in it.
+pub async fn resolve_link(url: String) -> Res<(i64, Option<i64>)> {
+    if let Ok(enums::MessageLinkInfo::MessageLinkInfo(info)) = functions::get_message_link_info(url.clone(), client()).await
+        && info.chat_id != 0
+    {
+        return Ok((info.chat_id, info.message.map(|m| m.id)));
+    }
+    // Not a message link: t.me/username opens the chat.
+    let parsed = url::Url::parse(&url).map_err(|e| e.to_string())?;
+    let username = parsed
+        .path_segments()
+        .and_then(|mut s| s.next())
+        .filter(|u| !u.is_empty() && !u.starts_with('+') && !["c", "joinchat", "addstickers", "share"].contains(u))
+        .ok_or_else(|| format!("can't open {url} here"))?;
+    let enums::Chat::Chat(chat) = functions::search_public_chat(username.to_owned(), client()).await.map_err(err)?;
+    Ok((chat.id, None))
+}
+
 /// Load a chat TDLib may not know yet (the origin of a forward); fails
 /// when it can't be opened, e.g. a private channel you are not in.
 pub async fn load_chat(chat_id: i64) -> Res<i64> {
@@ -950,7 +968,70 @@ pub struct Msg {
     pub reactions: Vec<Reaction>,
     #[serde(default)]
     pub forward: Option<Forward>,
+    #[serde(default)]
+    pub links: Vec<Link>,
 }
+
+/// A link in a message's text: the byte range of `Msg::text` it covers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Link {
+    pub start: usize,
+    pub end: usize,
+    pub url: String,
+}
+
+/// Byte offset in `text` of an offset in UTF-16 code units (TDLib's).
+fn byte_offset(text: &str, units: i32) -> usize {
+    let mut seen = 0;
+    for (i, c) in text.char_indices() {
+        if seen >= units {
+            return i;
+        }
+        seen += c.len_utf16() as i32;
+    }
+    text.len()
+}
+
+/// Links of formatted text: URLs, links behind words, e-mail addresses
+/// and @mentions (as t.me links).
+pub fn links(text: &types::FormattedText) -> Vec<Link> {
+    use enums::TextEntityType as T;
+    let mut links: Vec<Link> = text
+        .entities
+        .iter()
+        .filter_map(|e| {
+            let start = byte_offset(&text.text, e.offset);
+            let end = byte_offset(&text.text, e.offset + e.length);
+            let shown = text.text.get(start..end).filter(|s| !s.is_empty())?;
+            let url = match &e.r#type {
+                T::Url if shown.contains("://") => shown.to_owned(),
+                T::Url => format!("https://{shown}"),
+                T::TextUrl(t) => t.url.clone(),
+                T::EmailAddress => format!("mailto:{shown}"),
+                T::Mention => format!("https://t.me/{}", shown.trim_start_matches('@')),
+                _ => return None,
+            };
+            Some(Link { start, end, url })
+        })
+        .collect();
+    links.sort_by_key(|l| l.start);
+    links
+}
+
+/// The formatted text a message shows as its text, with its links.
+pub fn content_links(content: &MessageContent, shown: &str) -> Vec<Link> {
+    let formatted = match content {
+        MessageContent::MessageText(t) => &t.text,
+        MessageContent::MessagePhoto(p) => &p.caption,
+        MessageContent::MessageAnimation(a) => &a.caption,
+        MessageContent::MessageVideo(v) => &v.caption,
+        MessageContent::MessageVoiceNote(v) => &v.caption,
+        _ => return Vec::new(),
+    };
+    // Offsets only fit when the text is shown as is (no "[photo] " label).
+    if formatted.text == shown { links(formatted) } else { Vec::new() }
+}
+
 
 /// Where a forwarded message comes from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1068,7 +1149,6 @@ impl From<types::Message> for Msg {
             outgoing: m.is_outgoing,
             date: m.date,
             edited: m.edit_date != 0,
-            text,
             media: media.into_iter().collect(),
             album: m.media_album_id,
             members: vec![m.id],
@@ -1079,6 +1159,8 @@ impl From<types::Message> for Msg {
             local_files,
             reactions: reactions(m.interaction_info.as_ref()),
             forward: forward_origin(m.forward_info.as_ref()),
+            links: content_links(&m.content, &text),
+            text,
         }
     }
 }
@@ -1118,6 +1200,7 @@ impl From<Record> for Msg {
             local_files: Vec::new(),
             reactions: Vec::new(),
             forward: None,
+            links: Vec::new(),
         }
     }
 }
@@ -1149,6 +1232,9 @@ impl Msg {
         self.members.extend(other.members);
         self.media.extend(other.media);
         self.edited |= other.edited;
+        // The other part's text is appended after a newline, its links too.
+        let shift = if self.text.is_empty() { 0 } else { self.text.len() + 1 };
+        self.links.extend(other.links.into_iter().map(|l| Link { start: l.start + shift, end: l.end + shift, ..l }));
         // Reactions to an album are put on one of its parts.
         if self.reactions.is_empty() {
             self.reactions = other.reactions;
@@ -1463,5 +1549,30 @@ mod tests {
             full: FileRef { id: 1, width: 1, height: 1, size: 0 },
         };
         assert!(!photo.unlistened());
+    }
+
+    #[test]
+    fn links_in_text() {
+        let entity = |offset, length, r#type| types::TextEntity { offset, length, r#type };
+        // 😁 is two UTF-16 units and four bytes.
+        let text = types::FormattedText {
+            text: "😁 see example.com, @durov or this".into(),
+            entities: vec![
+                entity(30, 4, enums::TextEntityType::TextUrl(types::TextEntityTypeTextUrl { url: "https://a.b/c".into() })),
+                entity(7, 11, enums::TextEntityType::Url),
+                entity(20, 6, enums::TextEntityType::Mention),
+                entity(0, 2, enums::TextEntityType::Bold),
+            ],
+        };
+        let found = links(&text);
+        let found: Vec<(&str, &str)> = found.iter().map(|l| (&text.text[l.start..l.end], l.url.as_str())).collect();
+        assert_eq!(
+            found,
+            [
+                ("example.com", "https://example.com"),
+                ("@durov", "https://t.me/durov"),
+                ("this", "https://a.b/c"),
+            ]
+        );
     }
 }

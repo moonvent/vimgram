@@ -52,7 +52,7 @@ pub const TALL_ID: &str = "tall-message";
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes  J/K gt/gT Alt-N folders  \
                     Enter open/play  i insert  q record  r reply  R react  cc/e edit  f forward  dd delete  \
                     yy/Y copy  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  H/L seek  \
-                    / filter chats or search messages  n/N next/prev match  ga attach  gp pinned  gf original/reply  ^o back  \
+                    / filter chats or search messages  n/N next/prev match  ga attach  gp pinned  gf original/reply  gx link  ^o back  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
                     :folder  :theme  :autostart  :cleancache  :q";
 
@@ -140,6 +140,13 @@ pub enum Message {
     PreviewChat(i64),
     /// The reply quote or "Forwarded from" line of a message was clicked.
     ClickSource(i64),
+    /// A link in a message was clicked (or picked with `gx`).
+    OpenLink(String),
+    /// A t.me link resolved to a chat (and maybe a message in it).
+    LinkResolved {
+        from: Option<(i64, i64)>,
+        result: Result<(i64, Option<i64>), String>,
+    },
     /// The chat of a forward's origin is loaded: open it (at `msg_id`).
     GoTo {
         from: (i64, i64),
@@ -1249,6 +1256,17 @@ impl App {
                 self.activate_media(msg_id, item)
             }
             Message::Scroll(pane, delta) => self.on_scroll(pane, delta),
+            Message::OpenLink(url) => self.open_link(url),
+            Message::LinkResolved { from, result } => match result {
+                Ok((chat_id, msg_id)) => {
+                    self.jumps.extend(from);
+                    self.open_chat_at(chat_id, msg_id)
+                }
+                Err(e) => {
+                    self.error(format!("Can't open the link: {e}"));
+                    Task::none()
+                }
+            },
             Message::ClickSource(msg_id) => {
                 self.select_message(msg_id);
                 self.go_to_source()
@@ -1443,6 +1461,7 @@ impl App {
                     if msg.media.is_empty() {
                         msg.text = tg::content_text(&u.new_content, msg.outgoing);
                     }
+                    msg.links = tg::content_links(&u.new_content, &msg.text);
                     let msg = msg.clone();
                     self.archive_save(&[msg]);
                 }
@@ -3138,6 +3157,24 @@ impl App {
             },
             Action::Pinned => self.handle(Message::JumpPinned),
             Action::GoToSource => self.go_to_source(),
+            Action::OpenLink(n) => {
+                let url = self.focused_message().map(|m| m.links.get(n.saturating_sub(1)).map(|l| l.url.clone()));
+                match url {
+                    Some(Some(url)) => self.open_link(url),
+                    Some(None) if n > 1 => {
+                        self.error(format!("The message has no link #{n}"));
+                        Task::none()
+                    }
+                    Some(None) => {
+                        self.error("No link in this message");
+                        Task::none()
+                    }
+                    None => {
+                        self.error("Select a message first (l)");
+                        Task::none()
+                    }
+                }
+            }
             Action::JumpBack => match self.jumps.pop() {
                 Some((chat_id, msg_id)) if self.open.as_ref().is_some_and(|o| o.id == chat_id) => {
                     self.jump_to_message(msg_id)
@@ -3261,6 +3298,26 @@ impl App {
                 Task::none()
             }
         }
+    }
+
+    /// t.me links open here (at the post, `Ctrl-o` comes back); web and
+    /// e-mail links in the system's browser or mail client.
+    fn open_link(&mut self, url: String) -> Task<Message> {
+        let parsed = url::Url::parse(&url).ok();
+        let host = parsed.as_ref().and_then(|u| u.host_str()).unwrap_or("");
+        if ["t.me", "telegram.me", "telegram.dog"].contains(&host.trim_start_matches("www.")) {
+            let from = self.focused_message().map(|m| (m.chat_id, m.id));
+            self.info(format!("Opening {url}…"));
+            return Task::perform(tg::resolve_link(url), move |result| Message::LinkResolved { from, result });
+        }
+        match parsed.as_ref().map(url::Url::scheme) {
+            Some("http" | "https" | "mailto") => match open_external(&url) {
+                Ok(()) => self.info(format!("Opened {url}")),
+                Err(e) => self.error(format!("Can't open {url}: {e}")),
+            },
+            _ => self.error(format!("Not opening {url}: only web and e-mail links")),
+        }
+        Task::none()
     }
 
     /// `gf`: the original of a forwarded message (or at least its author's
@@ -3659,6 +3716,32 @@ fn parse_date(arg: &str) -> Option<chrono::NaiveDate> {
 }
 
 
+/// Hand a URL to the system (browser, mail client); doesn't wait for it.
+fn open_external(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    let mut command = std::process::Command::new("xdg-open");
+    // rundll32 takes the URL as one argument; `cmd /c start` would parse its `&`s.
+    #[cfg(windows)]
+    let mut command = {
+        let mut c = std::process::Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    command
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|mut child| {
+            // Reap it, or every opened link leaves a zombie behind.
+            std::thread::spawn(move || child.wait());
+        })
+        .map_err(|e| e.to_string())
+}
+
 fn clean_cache(days: i32) -> Task<Message> {
     icon::clean_cache(days.max(0) as u64);
     Task::perform(tg::clean_cache(days), Message::CacheCleaned)
@@ -3777,6 +3860,7 @@ mod tests {
             local_files: Vec::new(),
             reactions: Vec::new(),
             forward: None,
+            links: Vec::new(),
         }
     }
 

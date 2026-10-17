@@ -145,6 +145,7 @@ mod tests {
             local_files: Vec::new(),
             reactions: Vec::new(),
             forward: None,
+            links: Vec::new(),
         }
     }
 
