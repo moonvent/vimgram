@@ -1909,7 +1909,7 @@ fn status_line(app: &App) -> Element<'_, Message> {
 
     let viewer_hint = match app.viewer_media() {
         Some(Media::Video { .. }) => {
-            Some("Space pause   h/l ±5s   H/L ±30s   [ ] speed   = 1x   j/k next/prev   Esc close")
+            Some("Space pause   h/l ±5s   H/L ±30s   [ ] speed   = 1x   { } volume   j/k next/prev   Esc close")
         }
         Some(_) => Some("j/k — next/previous   Esc — close"),
         None => None,
