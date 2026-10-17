@@ -5,8 +5,8 @@ use chrono::{DateTime, Local};
 use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Column, Row, center, column, container, image, mouse_area, progress_bar, row, rule, scrollable, space,
-    stack, text, tooltip,
+    Column, Row, center, column, container, image, mouse_area, progress_bar, rich_text, row, rule, scrollable,
+    space, span, stack, text, tooltip,
 };
 use iced::mouse::Interaction;
 use iced::{Alignment, Color, ContentFit, Element, Length, Size, Theme};
@@ -14,6 +14,7 @@ use iced_video_player::VideoPlayer;
 
 use crate::app::{App, Auth, Chat, Compose, Confirm, Focus, Message, Pane, TALL_ID, VideoPlayback};
 use crate::emoji::{self, Picker};
+use crate::fonts::{self, EMOJI};
 use crate::media::Loaded;
 use crate::player;
 use crate::tg::{ChatKind, Media, Msg, Presence, Sender, fmt_duration};
@@ -324,6 +325,16 @@ pub fn view(app: &App, _window: iced::window::Id) -> Element<'_, Message> {
 
 /// Secondary text: the text color, faded. Readable on the background and
 /// on highlighted rows alike.
+/// User text (messages, titles, previews) with its emoji in the color
+/// emoji font, see `fonts::EMOJI`.
+fn emoji_text<'a>(s: &str) -> text::Rich<'a, (), Message> {
+    let spans: Vec<text::Span<'a, ()>> = fonts::emoji_runs(s)
+        .into_iter()
+        .map(|(run, emoji)| span(run.to_owned()).font_maybe(emoji.then_some(EMOJI)))
+        .collect();
+    rich_text(spans)
+}
+
 fn muted(theme: &Theme) -> Color {
     theme.palette().text.scale_alpha(0.6)
 }
@@ -585,7 +596,7 @@ fn chat_row<'a>(app: &'a App, chat: &'a Chat, selected: bool, focused: bool) -> 
 
     // Text is clipped to its own column so it never runs under the time.
     let mut title_line = row![
-        container(text(&chat.title).size(TEXT).wrapping(Wrapping::None))
+        container(emoji_text(&chat.title).size(TEXT).wrapping(Wrapping::None))
             .width(Length::Fill)
             .clip(true),
     ]
@@ -598,7 +609,7 @@ fn chat_row<'a>(app: &'a App, chat: &'a Chat, selected: bool, focused: bool) -> 
 
     let mut preview_line = row![
         container(
-            text(preview)
+            emoji_text(&preview)
                 .size(13)
                 .wrapping(Wrapping::WordOrGlyph)
                 .style(muted_text)
@@ -765,7 +776,7 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
         row![
             header_avatar,
             column![
-                text(title).size(15).wrapping(Wrapping::None),
+                emoji_text(title).size(15).wrapping(Wrapping::None),
                 text(details.join(" · "))
                     .size(12)
                     .wrapping(Wrapping::None)
@@ -878,7 +889,7 @@ fn emoji_panel<'a>(app: &'a App, picker: &'a Picker) -> Element<'a, Message> {
     let tabs = Row::with_children(emoji::TABS.iter().enumerate().map(|(i, (icon, _))| {
         let active = i == picker.tab && picker.query.is_empty();
         mouse_area(
-            container(text(*icon).size(17))
+            container(text(*icon).size(17).font(EMOJI))
                 .width(EMOJI_CELL * emoji::COLS as f32 / emoji::TABS.len() as f32)
                 .height(EMOJI_TABS_H - 4.0)
                 .align_x(Alignment::Center)
@@ -928,7 +939,7 @@ fn emoji_panel<'a>(app: &'a App, picker: &'a Picker) -> Element<'a, Message> {
                     Row::with_children(chunk.iter().enumerate().map(|(col, e)| {
                         let selected = row_i * emoji::COLS + col == picker.cursor;
                         mouse_area(
-                            container(text(*e).size(22))
+                            container(text(*e).size(22).font(EMOJI))
                                 .width(EMOJI_CELL)
                                 .height(EMOJI_CELL)
                                 .align_x(Alignment::Center)
@@ -981,7 +992,7 @@ fn pinned_bar(pinned: &Msg) -> Element<'_, Message> {
                 column![
                     text("Pinned message   gp").size(11).style(primary_text),
                     // Two lines at most, wrapped within the pane.
-                    container(text(summary).size(13).wrapping(Wrapping::WordOrGlyph).width(Length::Fill))
+                    container(emoji_text(&summary).size(13).wrapping(Wrapping::WordOrGlyph).width(Length::Fill))
                         .width(Length::Fill)
                         .max_height(PINNED_TEXT_H)
                         .clip(true),
@@ -1182,7 +1193,7 @@ fn reply_quote<'a>(app: &'a App, reply_to: i64) -> Element<'a, Message> {
         }
         None => "↪ reply".to_owned(),
     };
-    container(text(label).size(12).wrapping(Wrapping::None).style(muted_text))
+    container(emoji_text(&label).size(12).wrapping(Wrapping::None).style(muted_text))
         .height(REPLY_H - 4.0)
         .padding([0, 8])
         .align_y(Alignment::Center)
@@ -1294,7 +1305,7 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
     }
     if !m.text.is_empty() {
         let deleted = m.deleted;
-        body = body.push(text(&m.text).size(TEXT).style(move |t: &Theme| {
+        body = body.push(emoji_text(&m.text).size(TEXT).style(move |t: &Theme| {
             if deleted { muted_text(t) } else { text::Style::default() }
         }));
     }
@@ -1337,7 +1348,7 @@ fn reactions_row(m: &Msg) -> Element<'_, Message> {
         let chosen = r.chosen;
         mouse_area(
             container(
-                row![text(r.kind.label()).size(14), text(r.count).size(12)]
+                row![text(r.kind.label()).size(14).font(EMOJI), text(r.count).size(12)]
                     .spacing(4)
                     .align_y(Alignment::Center),
             )
@@ -1415,7 +1426,7 @@ fn input_text<'a>(input: &Input, editing: bool, mask: bool, prefix: &str) -> Ele
     } else {
         format!("{prefix}{}", show(input.as_str()))
     };
-    text(content).size(TEXT).into()
+    emoji_text(&content).size(TEXT).into()
 }
 
 /// "📎 photo.png" or "📎 3 files: a.png, b.mp4, …"

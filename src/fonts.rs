@@ -8,7 +8,49 @@
 
 use std::path::PathBuf;
 
+use iced::Font;
 use iced::advanced::graphics::text::cosmic_text::fontdb;
+
+/// The color emoji font loaded by `setup`. Emoji have to ask for it: plain
+/// fonts like DejaVu Sans have outline versions of some (😁, 😎, ❤, ⚡)
+/// that would be picked first.
+pub const EMOJI: Font = Font::with_name("Noto Color Emoji");
+
+/// Starts an emoji (variation selectors, ZWJ sequences, skin tones and
+/// keycaps continue one).
+fn emoji_start(c: char, next: Option<char>) -> bool {
+    matches!(c as u32, 0x1F000..=0x1FAFF | 0x2300..=0x23FF | 0x2600..=0x27BF | 0x2B00..=0x2BFF | 0x3030 | 0x303D | 0x3297 | 0x3299)
+        || next == Some('\u{FE0F}')
+}
+
+fn emoji_continues(c: char) -> bool {
+    matches!(c as u32, 0x200D | 0xFE0E | 0xFE0F | 0x20E3 | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F)
+}
+
+/// Split text into runs of emoji (`true`) and everything else.
+pub fn emoji_runs(text: &str) -> Vec<(&str, bool)> {
+    let mut runs: Vec<(&str, bool)> = Vec::new();
+    let mut start = 0;
+    let mut in_emoji = false;
+    let mut prev = None;
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        let next = chars.peek().map(|&(_, n)| n);
+        // A ZWJ joins whatever follows into the same emoji.
+        let joined = prev == Some('\u{200D}');
+        let emoji = emoji_start(c, next) || (in_emoji && (emoji_continues(c) || joined));
+        prev = Some(c);
+        if emoji != in_emoji && i > start {
+            runs.push((&text[start..i], in_emoji));
+            start = i;
+        }
+        in_emoji = emoji;
+    }
+    if start < text.len() {
+        runs.push((&text[start..], in_emoji));
+    }
+    runs
+}
 
 /// Where `scripts/fetch-emoji.sh` puts Noto Color Emoji (CBDT).
 pub fn emoji_font_path() -> PathBuf {
@@ -100,7 +142,7 @@ fn tables(data: &[u8], index: u32) -> Option<Vec<([u8; 4], usize)>> {
 mod tests {
     use super::*;
     use iced::advanced::graphics::text::cosmic_text::{
-        Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache, SwashContent,
+        Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, SwashContent,
     };
 
     #[test]
@@ -113,6 +155,38 @@ mod tests {
         assert!(colrv1_only(&font, 0));
         font[28..30].copy_from_slice(&[0, 0]);
         assert!(!colrv1_only(&font, 0));
+    }
+
+    #[test]
+    fn splits_emoji_runs() {
+        assert_eq!(emoji_runs("hi 😁!"), [("hi ", false), ("😁", true), ("!", false)]);
+        assert_eq!(emoji_runs("❤‍🔥 👨‍💻👍🏽"), [("❤‍🔥", true), (" ", false), ("👨‍💻👍🏽", true)]);
+        assert_eq!(emoji_runs("1️⃣ ok"), [("1️⃣", true), (" ok", false)]);
+        assert_eq!(emoji_runs("plain"), [("plain", false)]);
+        assert!(emoji_runs("").is_empty());
+    }
+
+    /// Emoji that plain fonts also have as outlines come out in color when
+    /// they ask for the emoji font.
+    #[test]
+    fn outline_emoji_use_the_color_font() {
+        let Ok(bytes) = std::fs::read(emoji_font_path()) else {
+            eprintln!("skipped: emoji font missing (scripts/fetch-emoji.sh)");
+            return;
+        };
+        let mut fonts = FontSystem::new();
+        remove_undrawable(fonts.db_mut());
+        fonts.db_mut().load_font_data(bytes);
+        let mut cache = SwashCache::new();
+        let attrs = Attrs::new().family(Family::Name("Noto Color Emoji"));
+        for emoji in ["😁", "😎", "❤", "⚡"] {
+            let mut buffer = Buffer::new(&mut fonts, Metrics::new(14.0, 18.0));
+            buffer.set_text(&mut fonts, emoji, &attrs, Shaping::Advanced, None);
+            buffer.shape_until_scroll(&mut fonts, false);
+            let glyph = buffer.layout_runs().next().unwrap().glyphs[0].physical((0.0, 0.0), 1.0);
+            let image = cache.get_image_uncached(&mut fonts, glyph.cache_key).expect("emoji glyph");
+            assert_eq!(image.content, SwashContent::Color, "{emoji}");
+        }
     }
 
     /// With the fix, an emoji rasterizes to a color bitmap instead of nothing.
