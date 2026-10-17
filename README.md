@@ -182,3 +182,8 @@ the Windows zip:
 ```sh
 git tag v0.1.0 && git push origin v0.1.0
 ```
+
+## License
+
+[MIT](LICENSE). Release builds bundle TDLib (BSL-1.0), GStreamer (LGPL-2.1+,
+linked dynamically) and Noto Color Emoji (OFL-1.1) under their own licenses.
