@@ -1,0 +1,88 @@
+name: CI
+
+# Every push and pull request is built and tested; a `v*` tag also
+# publishes a GitHub release with the Windows build attached.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  GSTREAMER: "1.26.11"
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config cmake ninja-build clang libclang-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            libc++1 libc++abi1 libunwind-18
+      - name: TDLib
+        run: ./scripts/fetch-tdlib.sh
+      - run: cargo build --release --locked
+      - run: cargo test --release --locked
+
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: GStreamer
+        shell: pwsh
+        run: |
+          $base = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GSTREAMER/msvc"
+          foreach ($msi in "gstreamer-1.0-msvc-x86_64-$env:GSTREAMER.msi", "gstreamer-1.0-devel-msvc-x86_64-$env:GSTREAMER.msi") {
+            Invoke-WebRequest "$base/$msi" -OutFile $msi
+            Start-Process msiexec -Wait -ArgumentList "/i", $msi, "/passive", "/norestart", "INSTALLDIR=C:\gstreamer", "ADDLOCAL=ALL"
+          }
+          $root = (Get-ChildItem C:\gstreamer -Recurse -Filter gstreamer-1.0.pc | Select-Object -First 1).Directory.Parent.Parent.FullName
+          "GSTREAMER_ROOT=$root" >> $env:GITHUB_ENV
+          "PKG_CONFIG_PATH=$root\lib\pkgconfig" >> $env:GITHUB_ENV
+          "$root\bin" >> $env:GITHUB_PATH
+      - name: pkg-config
+        run: choco install pkgconfiglite --no-progress -y
+      - name: TDLib
+        shell: pwsh
+        run: ./scripts/fetch-tdlib.ps1
+      - run: cargo build --release --locked
+      # Same layout as GStreamer's own prefix, so it finds its plugins in
+      # lib\gstreamer-1.0 next to bin\ without any environment variables.
+      - name: Package
+        shell: pwsh
+        run: |
+          $dist = "dist\vimgram"
+          New-Item -ItemType Directory -Force "$dist\bin", "$dist\lib\gstreamer-1.0" | Out-Null
+          Copy-Item target\release\vimgram.exe "$dist\bin"
+          Copy-Item vendor\tdlib\bin\*.dll "$dist\bin"
+          Copy-Item "$env:GSTREAMER_ROOT\bin\*.dll" "$dist\bin"
+          Copy-Item "$env:GSTREAMER_ROOT\lib\gstreamer-1.0\*.dll" "$dist\lib\gstreamer-1.0"
+          # Found by vimgram in fonts\ next to bin\ (fonts.rs).
+          New-Item -ItemType Directory -Force "$dist\fonts" | Out-Null
+          $tag = (Select-String -Path scripts\fetch-emoji.ps1 -Pattern '^\$Tag = "(.+)"').Matches[0].Groups[1].Value
+          Invoke-WebRequest "https://raw.githubusercontent.com/googlefonts/noto-emoji/$tag/2D/fonts/NotoColorEmoji.ttf" -OutFile "$dist\fonts\NotoColorEmoji.ttf"
+          Copy-Item README.md, LICENSE "$dist" -ErrorAction SilentlyContinue
+          Compress-Archive -Path $dist -DestinationPath dist\vimgram-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vimgram-windows-x86_64
+          path: dist/vimgram-windows-x86_64.zip
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/vimgram-windows-x86_64.zip
+          generate_release_notes: true
