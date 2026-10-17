@@ -1187,6 +1187,34 @@ fn reply_quote<'a>(app: &'a App, reply_to: i64) -> Element<'a, Message> {
         .into()
 }
 
+/// Keys that act on the message under the cursor, shown on its header.
+fn message_keys(app: &App, m: &Msg) -> String {
+    let channel = app.chats.get(&m.chat_id).is_some_and(|c| c.kind == ChatKind::Channel);
+    let mut keys = Vec::new();
+    match m.media.first() {
+        Some(Media::Voice { .. } | Media::Video { round: true, .. }) => keys.push("Enter play"),
+        Some(media) if media.viewable() => keys.push("Enter open"),
+        _ => {}
+    }
+    if !m.deleted {
+        if !channel || m.outgoing {
+            keys.push("r reply");
+        }
+        keys.push("R react");
+        if m.outgoing && m.media.is_empty() {
+            keys.push("e edit");
+        }
+        keys.push("f forward");
+    }
+    if !m.text.is_empty() {
+        keys.push("yy copy");
+    }
+    if !m.deleted {
+        keys.push("dd delete");
+    }
+    keys.join("  ")
+}
+
 fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_avatar: bool) -> Element<'a, Message> {
     let sender = m.sender;
     let mut header = row![
@@ -1208,6 +1236,14 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
             text("🗑 deleted")
                 .size(12)
                 .style(|t: &Theme| text::Style { color: Some(t.palette().danger) }),
+        );
+    }
+    if selected {
+        header = header.push(space::horizontal()).push(
+            text(message_keys(app, m))
+                .size(11)
+                .wrapping(Wrapping::None)
+                .style(|t: &Theme| text::Style { color: Some(muted(t).scale_alpha(0.8)) }),
         );
     }
 
