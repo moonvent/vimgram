@@ -258,11 +258,14 @@ pub struct Audio {
     speed: f64,
     /// The rate seek needs a known position, so it waits for preroll.
     rate_pending: bool,
+    /// Where to start, once it can seek there.
+    start: Option<Duration>,
     finished: bool,
 }
 
 impl Audio {
-    pub fn open(path: &str, speed: f64, volume: f64) -> Result<Self, String> {
+    /// Play from `start` (from the beginning when zero).
+    pub fn open(path: &str, speed: f64, volume: f64, start: Duration) -> Result<Self, String> {
         gst::init().map_err(|e| e.to_string())?;
         let playbin = gst::ElementFactory::make("playbin")
             .property("uri", uri(path)?.as_str())
@@ -280,6 +283,7 @@ impl Audio {
             pipeline,
             speed,
             rate_pending: (speed - 1.0).abs() > 1e-6,
+            start: (start > Duration::ZERO).then_some(start),
             finished: false,
         })
     }
@@ -295,8 +299,9 @@ impl Audio {
                 }
             }
         }
-        if self.rate_pending && self.seek_to(self.position()).is_ok() {
+        if (self.rate_pending || self.start.is_some()) && self.seek_to(self.start.unwrap_or(self.position())).is_ok() {
             self.rate_pending = false;
+            self.start = None;
         }
         Ok(())
     }
@@ -639,13 +644,24 @@ mod tests {
         let Some(path) = stream::tests::sample_mp4() else {
             return;
         };
-        let mut audio = Audio::open(path.to_str().unwrap(), 2.0, 0.5).unwrap();
+        let mut audio = Audio::open(path.to_str().unwrap(), 2.0, 0.5, Duration::from_secs(1)).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while audio.duration().is_none() && std::time::Instant::now() < deadline {
             audio.poll().unwrap();
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(audio.duration().is_some());
+        // Started from 1s, not from the beginning: right after the seek
+        // it is there already.
+        while audio.start.is_some() && std::time::Instant::now() < deadline {
+            audio.poll().unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let soon = std::time::Instant::now() + Duration::from_millis(150);
+        while audio.position() < Duration::from_millis(900) && std::time::Instant::now() < soon {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(audio.position() >= Duration::from_millis(900), "at {:?}", audio.position());
         audio.set_speed(4.0);
         audio.seek_by(1.0);
         audio.toggle_pause();

@@ -37,6 +37,9 @@ const TICK: Duration = Duration::from_millis(33);
 const PREVIEW_DELAY: Duration = Duration::from_millis(150);
 const SEEK_SHORT: f64 = 5.0;
 const SEEK_LONG: f64 = 30.0;
+/// A voice message or music left for something else goes on from this
+/// much earlier, to pick up the thread.
+const RESUME_BACK: Duration = Duration::from_secs(5);
 /// Touchpad pixels per list step.
 const SCROLL_PIXELS: f32 = 40.0;
 /// Messages kept visible above and below the cursor, like Vim's `scrolloff`.
@@ -540,6 +543,9 @@ pub struct App {
     pub viewer: Option<Viewer>,
     pub video: Option<VideoPlayback>,
     pub voice: Option<VoicePlayback>,
+    /// Where voice messages and music were left when something else
+    /// started, by file: they go on from a bit earlier.
+    resume: HashMap<i32, Duration>,
     /// Playback speed per kind of media, remembered across restarts.
     speeds: Speeds,
     /// Of videos and voice messages, 0.0–1.0.
@@ -664,6 +670,7 @@ impl App {
             viewer: None,
             video: None,
             voice: None,
+            resume: HashMap::new(),
             speeds: Speeds::load(),
             volume: player::load_volume(),
             media: Store::default(),
@@ -720,7 +727,7 @@ impl App {
                 self.focused = false;
                 // Nothing plays to a closed window.
                 self.stop_recording(false);
-                self.voice = None;
+                self.stop_voice();
                 self.video = None;
                 self.viewer = None;
                 window::close(id)
@@ -1336,7 +1343,7 @@ impl App {
                 Task::none()
             }
             Message::StopVoice => {
-                self.voice = None;
+                self.stop_voice();
                 self.scroll_messages();
                 Task::none()
             }
@@ -2477,8 +2484,15 @@ impl App {
                 return Task::none();
             }
         };
-        if let Some(voice) = self.voice.as_mut().filter(|v| v.file_id == file_id) {
-            match Audio::open(&path, self.speeds.get(voice.kind), self.volume) {
+        if self.voice.as_ref().is_none_or(|v| v.file_id != file_id) {
+            return Task::none();
+        }
+        let start = self.resume.remove(&file_id).map_or(Duration::ZERO, |at| at.saturating_sub(RESUME_BACK));
+        if start > Duration::ZERO {
+            self.info(format!("Going on from {}", tg::fmt_duration(start.as_secs() as i32)));
+        }
+        if let Some(voice) = self.voice.as_mut() {
+            match Audio::open(&path, self.speeds.get(voice.kind), self.volume, start) {
                 Ok(audio) => voice.audio = Some(audio),
                 Err(e) => {
                     self.voice = None;
@@ -2523,6 +2537,7 @@ impl App {
     }
 
     fn play_audio(&mut self, chat_id: i64, msg_id: i64, sender: Sender, file_id: i32, kind: SpeedKind) -> Task<Message> {
+        self.stop_voice();
         self.voice = Some(VoicePlayback {
             chat_id,
             msg_id,
@@ -2532,6 +2547,17 @@ impl App {
             audio: None,
         });
         Self::play_download(file_id)
+    }
+
+    /// Stop the voice message or music, remembering where it was.
+    fn stop_voice(&mut self) {
+        let Some(voice) = self.voice.take() else { return };
+        if let Some(audio) = voice.audio.as_ref().filter(|a| !a.finished()) {
+            let at = audio.position();
+            if at > Duration::ZERO {
+                self.resume.insert(voice.file_id, at);
+            }
+        }
     }
 
     fn open_viewer(&mut self, viewer: Viewer) -> Task<Message> {
@@ -2556,7 +2582,7 @@ impl App {
             Some((file_id, _)) if self.video.as_ref().is_some_and(|v| v.file_id == file_id) => Task::none(),
             Some((file_id, kind)) => {
                 // A video brings its own sound; don't talk over it.
-                self.voice = None;
+                self.stop_voice();
                 self.video = Some(VideoPlayback {
                     file_id,
                     round_msg,
@@ -3842,7 +3868,7 @@ impl App {
             self.error("Open a chat first (Enter)");
             return;
         }
-        self.voice = None;
+        self.stop_voice();
         match Recorder::start(config::dirs().data_dir().join("voice")) {
             Ok(recorder) => {
                 self.recorder = Some(recorder);

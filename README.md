@@ -129,7 +129,8 @@ wav) go as music, with title and artist from their tags; several of them as an a
 
 When a voice or round video message ends and the very next message is one too, it plays
 next (voice messages also from another chat; round videos while their chat is open). Music
-plays on the same way, track after track, but only into more music.
+plays on the same way, track after track, but only into more music. A voice message or track left
+for another one (or for a video, or stopped with ✕) goes on where it was, 5 seconds earlier.
 
 Photo/video viewer: `j`/`k` next/previous, `h`/`l` seek ±5s, `H`/`L` ±30s, `Space` pause,
 `[` `]` `=` speed, `{` `}` volume, `Esc` close. Under a video: time played, progress and length.
