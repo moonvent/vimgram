@@ -2871,7 +2871,16 @@ impl App {
             }
             Action::Open => match (self.focus, self.selected) {
                 (Focus::Chats, Some(id)) if self.forward.is_some() => self.forward_to(id),
-                (Focus::Chats, Some(id)) if self.auth == Auth::Ready => self.open_chat(id),
+                (Focus::Chats, Some(id)) if self.auth == Auth::Ready => {
+                    let reopen = self.open.as_ref().is_some_and(|o| o.id == id);
+                    let task = self.open_chat(id);
+                    // A channel opens next to the list, so j/k keep going through
+                    // the chats; Enter again (or l, Tab) moves on to the posts.
+                    if !reopen && self.chats.get(&id).is_some_and(|c| c.kind == ChatKind::Channel) {
+                        self.focus = Focus::Chats;
+                    }
+                    task
+                }
                 (Focus::Messages, _) => {
                     let target = self.focused_message().and_then(|m| {
                         let item = m.media.iter().position(|x| x.viewable() || matches!(x, Media::Voice { .. }))?;
