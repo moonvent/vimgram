@@ -15,10 +15,18 @@ pub fn emoji_font_path() -> PathBuf {
     crate::config::dirs().data_dir().join("fonts/NotoColorEmoji.ttf")
 }
 
+/// The copy shipped with a packaged build: `fonts\` next to `bin\`.
+fn bundled_font_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.parent()?.parent()?.join("fonts/NotoColorEmoji.ttf"))
+}
+
 /// Fix emoji in iced's global font system. Call before the first frame.
 pub fn setup() -> Result<(), String> {
     let path = emoji_font_path();
-    let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let bytes = std::fs::read(&path)
+        .or_else(|e| bundled_font_path().and_then(|p| std::fs::read(p).ok()).ok_or(e))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     let mut fonts = iced::advanced::graphics::text::font_system()
         .write()
         .map_err(|_| "font system poisoned".to_string())?;
