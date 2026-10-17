@@ -1547,9 +1547,14 @@ fn status_line(app: &App) -> Element<'_, Message> {
 
     let middle: Element<_> = match mode {
         _ if app.confirm.is_some() => {
-            let Some(Confirm::Delete { ids, .. }) = &app.confirm else { unreachable!() };
-            let what = if ids.len() > 1 { "these messages" } else { "this message" };
-            text(format!("Delete {what}?   y — for everyone   m — only for me   n/Esc — cancel"))
+            let prompt = match &app.confirm {
+                Some(Confirm::Delete { ids, .. }) => {
+                    let what = if ids.len() > 1 { "these messages" } else { "this message" };
+                    format!("Delete {what}?   y — for everyone   m — only for me   n/Esc — cancel")
+                }
+                _ => "Quit vimgram?   y/Enter — quit   n/Esc — stay".to_owned(),
+            };
+            text(prompt)
                 .size(13)
                 .style(|t: &Theme| text::Style { color: Some(t.palette().danger) })
                 .into()

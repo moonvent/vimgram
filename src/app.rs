@@ -243,6 +243,8 @@ pub struct Found {
 #[derive(Debug, Clone)]
 pub enum Confirm {
     Delete { chat_id: i64, ids: Vec<i64> },
+    /// Esc with nothing left to cancel.
+    Quit,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2566,8 +2568,14 @@ impl App {
     }
 
     fn key_confirm(&mut self, key: NKey) -> Task<Message> {
-        let Some(Confirm::Delete { chat_id, ids }) = self.confirm.take() else {
-            return Task::none();
+        let (chat_id, ids) = match self.confirm.take() {
+            Some(Confirm::Delete { chat_id, ids }) => (chat_id, ids),
+            Some(Confirm::Quit) if matches!(key, NKey::Char('y') | NKey::Enter) => return self.handle(Message::Quit),
+            Some(Confirm::Quit) => {
+                self.info("Not quitting");
+                return Task::none();
+            }
+            None => return Task::none(),
         };
         let revoke = match key {
             NKey::Char('y') => true,
@@ -3164,15 +3172,22 @@ impl App {
                     self.scroll_messages();
                     return Task::none();
                 }
+                let mut cancelled = false;
                 if self.forward.take().is_some() {
                     self.info("Forward cancelled");
+                    cancelled = true;
                 }
                 if matches!(self.compose, Compose::Edit(_)) {
                     self.input.clear();
                 }
+                cancelled |= !matches!(self.compose, Compose::New);
                 self.compose = Compose::New;
                 if !self.filter.is_empty() {
                     self.set_filter(String::new());
+                    cancelled = true;
+                }
+                if !cancelled {
+                    self.confirm = Some(Confirm::Quit);
                 }
                 self.scroll_messages();
                 Task::none()

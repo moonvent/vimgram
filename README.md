@@ -61,7 +61,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `gv`, click on the player bar | back to the voice message playing in another chat (the bar above the chat shows it; ✕ stops) |
 | `]` `+` / `[` `-` / `=` | speed up / down (0.25x–5x) / reset to 1x; voice messages, videos and round videos each remember their own speed |
 | `H` / `L` | seek voice message −5s / +5s |
-| `Esc`, `Ctrl-[` | normal mode; cancel reply, edit, forward, filter, attachment |
+| `Esc`, `Ctrl-[` | normal mode; cancel reply, edit, forward, filter, attachment; with nothing to cancel asks to quit (`y`/`Enter`) |
 | `/` | chat list: filter chats; message pane: search messages |
 | `n` / `N` | next (older) / previous (newer) search match |
 | `G` | after a search or date jump: back to the latest messages |
