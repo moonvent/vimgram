@@ -252,6 +252,16 @@ impl VideoPlayback {
     }
 }
 
+/// Messages picked with `f`, waiting for the chat to forward them to.
+pub struct Forward {
+    from: i64,
+    ids: Vec<i64>,
+    /// "the message" or "3 messages".
+    pub what: String,
+    /// What the compose line held before: it is the comment's while forwarding.
+    draft: Input,
+}
+
 /// Results of `/` in the message pane.
 pub struct Found {
     pub query: String,
@@ -503,8 +513,7 @@ pub struct App {
     /// Message being composed, or the login field before authorization.
     pub input: Input,
     pub compose: Compose,
-    /// Messages being forwarded: source chat and message ids.
-    pub forward: Option<(i64, Vec<i64>)>,
+    pub forward: Option<Forward>,
     /// Where `gf` jumped from (chat, message), newest last; `Ctrl-o` goes back.
     jumps: Vec<(i64, i64)>,
     /// Visual selection in the open chat: the message it started at.
@@ -2034,6 +2043,15 @@ impl App {
 
     /// Send (or save the edit of) the composed message.
     fn send_with(&mut self, mut options: SendOptions) -> Task<Message> {
+        if self.forward.is_some() {
+            return match self.selected.or(self.forward_marks.first().copied()) {
+                Some(chat) => self.forward_to(chat, options),
+                None => {
+                    self.error("Pick a chat to forward to (j/k)");
+                    Task::none()
+                }
+            };
+        }
         let Some(open) = &self.open else {
             return Task::none();
         };
@@ -2786,6 +2804,7 @@ impl App {
             && matches!(key, Key::Named(Named::ArrowUp))
             && self.input.is_empty()
             && self.attachments.is_empty()
+            && self.forward.is_none()
             && matches!(self.compose, Compose::New)
         {
             self.edit_last_own();
@@ -3150,7 +3169,7 @@ impl App {
                 Task::none()
             }
             Action::Open => match (self.focus, self.selected) {
-                (Focus::Chats, Some(id)) if self.forward.is_some() => self.forward_to(id),
+                (Focus::Chats, Some(id)) if self.forward.is_some() => self.forward_to(id, SendOptions::default()),
                 (Focus::Chats, Some(id)) if self.auth == Auth::Ready => {
                     let reopen = self.open.as_ref().is_some_and(|o| o.id == id);
                     let task = self.open_chat(id);
@@ -3332,10 +3351,13 @@ impl App {
                             n => format!("{n} messages"),
                         };
                         self.visual = None;
-                        self.forward = Some((chat, ids));
-                        self.forward_marks.clear();
+                        self.end_forward();
+                        let draft = std::mem::take(&mut self.input);
+                        self.info(format!(
+                            "Forward {what}: Enter sends to the chat, v marks several, i adds a comment (Esc cancels)"
+                        ));
+                        self.forward = Some(Forward { from: chat, ids, what, draft });
                         self.focus = Focus::Chats;
-                        self.info(format!("Forward {what}: Enter sends to the chat, v marks several (Esc cancels)"));
                     }
                     _ => self.error("Select a message first (l)"),
                 }
@@ -3385,8 +3407,7 @@ impl App {
                     return Task::none();
                 }
                 let mut cancelled = false;
-                if self.forward.take().is_some() {
-                    self.forward_marks.clear();
+                if self.end_forward().is_some() {
                     self.info("Forward cancelled");
                     cancelled = true;
                 }
@@ -3465,20 +3486,35 @@ impl App {
         load
     }
 
-    /// Forward to the chats marked with `v`, or to this one when none are.
-    fn forward_to(&mut self, chat_id: i64) -> Task<Message> {
-        let Some((from, ids)) = self.forward.take() else {
+    /// Forward to the chats marked with `v`, or to this one when none are,
+    /// with the compose line as the comment.
+    fn forward_to(&mut self, chat_id: i64, options: SendOptions) -> Task<Message> {
+        let mut to = std::mem::take(&mut self.forward_marks);
+        let Some((forward, comment)) = self.end_forward() else {
             return Task::none();
         };
-        let mut to = std::mem::take(&mut self.forward_marks);
         if to.is_empty() {
             to.push(chat_id);
         }
+        self.mode = Mode::Normal;
         self.info(match to.as_slice() {
             [one] => format!("Forwarded to {}", self.chats.get(one).map_or("chat", |c| c.title.as_str())),
             many => format!("Forwarded to {} chats", many.len()),
         });
-        Task::batch(to.into_iter().map(|chat| Task::perform(tg::forward(chat, from, ids.clone()), Message::Done)))
+        let options = SendOptions { reply_to: None, ..options };
+        Task::batch(to.into_iter().map(|chat| {
+            let task = tg::forward(chat, forward.from, forward.ids.clone(), comment.clone(), options);
+            Task::perform(task, Message::Done)
+        }))
+    }
+
+    /// Stop forwarding and give the compose line back what it held before;
+    /// returns the forward and the comment typed for it.
+    fn end_forward(&mut self) -> Option<(Forward, String)> {
+        let mut forward = self.forward.take()?;
+        self.forward_marks.clear();
+        let comment = std::mem::replace(&mut self.input, std::mem::take(&mut forward.draft));
+        Some((forward, comment.as_str().trim().to_owned()))
     }
 
     fn start_recording(&mut self) {

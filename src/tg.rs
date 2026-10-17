@@ -545,8 +545,13 @@ pub async fn private_chat(user_id: i64) -> Res<i64> {
     Ok(chat.id)
 }
 
-pub async fn forward(to_chat: i64, from_chat: i64, ids: Vec<i64>) -> Res<()> {
-    functions::forward_messages(to_chat, None, from_chat, ids, None, false, false, client())
+/// Forward `ids`; a non-empty `comment` goes first as a message of its own,
+/// like Telegram's "add a comment".
+pub async fn forward(to_chat: i64, from_chat: i64, ids: Vec<i64>, comment: String, options: SendOptions) -> Res<()> {
+    if !comment.is_empty() {
+        send_text(to_chat, comment, options).await?;
+    }
+    functions::forward_messages(to_chat, None, from_chat, ids, options.options(), false, false, client())
         .await
         .map(|_| ())
         .map_err(err)

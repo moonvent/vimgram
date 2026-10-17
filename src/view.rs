@@ -533,7 +533,7 @@ fn chat_list(app: &App) -> Element<'_, Message> {
     let focused = app.focus == Focus::Chats;
     let folder = app.folders.get(app.folder).map_or("", |f| f.name.as_str());
     let title = if app.forward.is_some() {
-        "Forward to… (Enter — send, Esc — cancel)".to_owned()
+        "Forward to… (Enter, i — comment, Esc)".to_owned()
     } else if app.filter.is_empty() {
         format!("{folder}  {}", app.list.len())
     } else {
@@ -1519,6 +1519,9 @@ fn attachments_label(paths: &[std::path::PathBuf]) -> String {
 }
 
 fn compose_banner(app: &App) -> Option<Element<'_, Message>> {
+    if let Some(forward) = &app.forward {
+        return Some(banner(format!("↪ Forward {}, the text goes first as a comment", forward.what)));
+    }
     let attached = (!app.attachments.is_empty()).then(|| attachments_label(&app.attachments));
     let label = match app.compose {
         Compose::New => attached.clone()?,
@@ -1538,25 +1541,32 @@ fn compose_banner(app: &App) -> Option<Element<'_, Message>> {
         (Compose::Reply(_), Some(attached)) => format!("{attached}  ·  {label}"),
         _ => label,
     };
-    Some(
-        row![
-            text(label).size(12).wrapping(Wrapping::None).style(primary_text).width(Length::Fill),
-            text("Esc — cancel").size(12).style(muted_text),
-        ]
-        .height(BANNER_H)
-        .align_y(Alignment::Center)
-        .into(),
-    )
+    Some(banner(label))
+}
+
+fn banner<'a>(label: String) -> Element<'a, Message> {
+    row![
+        text(label).size(12).wrapping(Wrapping::None).style(primary_text).width(Length::Fill),
+        text("Esc — cancel").size(12).style(muted_text),
+    ]
+    .height(BANNER_H)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 pub fn has_banner(app: &App) -> bool {
-    app.compose != Compose::New || !app.attachments.is_empty()
+    app.forward.is_some() || app.compose != Compose::New || !app.attachments.is_empty()
 }
 
 fn compose(app: &App) -> Element<'_, Message> {
     let editing = app.mode == Mode::Insert;
     let content = if app.input.is_empty() && !editing {
-        text("i — write a message   q — record voice   ga — attach file   ge — emoji")
+        let hint = if app.forward.is_some() {
+            "i — add a comment   Enter — send"
+        } else {
+            "i — write a message   q — record voice   ga — attach file   ge — emoji"
+        };
+        text(hint)
             .size(TEXT)
             .style(muted_text)
             .into()
