@@ -71,6 +71,9 @@ pub fn emoji_rows(height: f32) -> usize {
 
 /// Date separator above the first message of each day.
 const DAY_H: f32 = 30.0;
+/// Line between posts or between messages far apart in time.
+const BLOCK_H: f32 = 13.0;
+const BLOCK_GAP: i32 = 3600;
 
 pub fn chat_rows(size: Size) -> usize {
     (((size.height - STATUS_H - HEADER_H) / CHAT_ROW_H).floor() as usize).max(1)
@@ -182,9 +185,26 @@ pub fn starts_day(msgs: &[Msg], i: usize) -> bool {
     }
 }
 
-/// Height of message `i` in the list, with its date separator.
+/// The message is separated from the previous one by a line: every channel
+/// post, and messages after an hour of silence. A new day has its date instead.
+pub fn starts_block(msgs: &[Msg], i: usize) -> bool {
+    let Some(prev) = i.checked_sub(1).and_then(|p| msgs.get(p)) else {
+        return false;
+    };
+    let m = &msgs[i];
+    !starts_day(msgs, i) && (m.sender == Sender::Chat(m.chat_id) || m.date - prev.date > BLOCK_GAP)
+}
+
+/// Height of message `i` in the list, with its date separator or line.
 pub fn item_height(msgs: &[Msg], i: usize, width: f32) -> f32 {
-    message_height(&msgs[i], width) + if starts_day(msgs, i) { DAY_H } else { 0.0 }
+    let separator = if starts_day(msgs, i) {
+        DAY_H
+    } else if starts_block(msgs, i) {
+        BLOCK_H
+    } else {
+        0.0
+    };
+    message_height(&msgs[i], width) + separator
 }
 
 /// "Today", "Yesterday", "Monday, 13 October", "2 March 2024".
@@ -224,11 +244,26 @@ fn day_separator<'a>(unix: i32) -> Element<'a, Message> {
     .into()
 }
 
-/// A message of the list, below its date separator when it starts a day.
+fn block_separator<'a>() -> Element<'a, Message> {
+    container(rule::horizontal(1).style(|t: &Theme| rule::Style {
+        color: t.extended_palette().background.strong.color,
+        ..rule::default(t)
+    }))
+    .width(Length::Fill)
+    .height(BLOCK_H - MSG_SPACING)
+    .padding([0.0, 24.0])
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// A message of the list, below its date separator when it starts a day
+/// (or a line when it starts a block).
 fn list_item<'a>(app: &'a App, msgs: &'a [Msg], i: usize, selected: bool, width: f32) -> Element<'a, Message> {
     let message = message_view(app, &msgs[i], selected, width, starts_run(msgs, i));
     if starts_day(msgs, i) {
         column![day_separator(msgs[i].date), message].spacing(MSG_SPACING).into()
+    } else if starts_block(msgs, i) {
+        column![block_separator(), message].spacing(MSG_SPACING).into()
     } else {
         message
     }
@@ -1563,6 +1598,21 @@ mod tests {
         // A new day also shows the sender's avatar again.
         assert!(starts_run(&msgs, 2));
         assert!(!starts_run(&msgs, 3));
+    }
+
+    #[test]
+    fn blocks_are_separated() {
+        let noon = Local::now().date_naive().and_hms_opt(12, 0, 0).unwrap();
+        let t = noon.and_local_timezone(Local).unwrap().timestamp() as i32;
+        let chat = [msg_at(1, t), msg_at(2, t + 60), msg_at(3, t + 60 + 2 * 3600)];
+        let starts: Vec<bool> = (0..chat.len()).map(|i| starts_block(&chat, i)).collect();
+        assert_eq!(starts, [false, false, true], "an hour of silence starts a block");
+        let width = 500.0;
+        assert_eq!(item_height(&chat, 2, width), message_height(&chat[2], width) + BLOCK_H);
+        // Every channel post is separated, but the first of a day gets the date only.
+        let post = |id, date| Msg { sender: Sender::Chat(1), ..msg_at(id, date) };
+        let channel = [post(1, t), post(2, t + 60)];
+        assert_eq!([starts_block(&channel, 0), starts_block(&channel, 1)], [false, true]);
     }
 
     #[test]
