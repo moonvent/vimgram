@@ -59,7 +59,7 @@ pub const SPOILER_LINK: &str = "spoiler:";
 
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes  J/K gt/gT Alt-N folders  \
                     Enter open/play  i insert  q record  r reply  R react  cc/e edit  f forward  v visual  dd delete  \
-                    yy/Y copy  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  { } volume  H/L seek  m mute  U leave/join  \
+                    yy/Y copy  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  { } volume  H/L seek  m mute  U leave/join  gc comments  \
                     / filter chats or search messages  n/N next/prev match  ga attach  gp pinned  gf original/reply  gx link  ^o back  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
                     :folder  :theme  :autostart  :cleancache  :q";
@@ -73,9 +73,19 @@ pub enum Message {
         chat_id: i64,
         /// The hashtag the page was searched for (`OpenChat::tag`).
         tag: Option<String>,
+        /// The comment thread it was loaded from (`CommentThread::root`); 0: none.
+        thread: i64,
         newer: bool,
         result: Result<Vec<Msg>, String>,
     },
+    /// The comments of a channel post found: where they are.
+    ThreadOpened {
+        channel: i64,
+        post: i64,
+        result: Result<tg::Thread, String>,
+    },
+    /// Click on "💬 N comments" under a post.
+    OpenComments(i64),
     /// History around a message we jump to (search result or date).
     Window {
         chat_id: i64,
@@ -381,6 +391,33 @@ pub struct OpenChat {
     pub preview: bool,
     /// Only the messages with this hashtag are shown (`#tag`).
     pub tag: Option<String>,
+    /// The chat is a discussion group, showing the comments of a post.
+    pub thread: Option<CommentThread>,
+}
+
+/// The comments of a channel post, shown in its discussion group.
+pub struct CommentThread {
+    pub channel: i64,
+    pub post: i64,
+    /// The thread's id in the group: the post's copy there.
+    pub root: i64,
+    /// The post's copy, shown above the comments once they are all loaded.
+    roots: Vec<Msg>,
+}
+
+/// Which messages of the chat an open chat shows.
+#[derive(Clone)]
+struct Shown {
+    tag: Option<String>,
+    thread: i64,
+}
+
+impl Shown {
+    fn keeps(&self, m: &Msg) -> bool {
+        // A comment answers the post, should its thread be missing.
+        let in_thread = self.thread == 0 || m.thread == self.thread || m.reply_to == Some(self.thread);
+        self.tag.as_ref().is_none_or(|tag| tg::has_hashtag(&m.text, tag)) && in_thread
+    }
 }
 
 impl OpenChat {
@@ -397,7 +434,19 @@ impl OpenChat {
             pinned: None,
             preview: false,
             tag: None,
+            thread: None,
         }
+    }
+
+    fn shown(&self) -> Shown {
+        Shown {
+            tag: self.tag.clone(),
+            thread: self.thread_root(),
+        }
+    }
+
+    pub fn thread_root(&self) -> i64 {
+        self.thread.as_ref().map_or(0, |t| t.root)
     }
 
     /// Show the messages with `tag` only (`None`: all), loaded afresh.
@@ -471,8 +520,13 @@ impl OpenChat {
 
 /// Add archived deleted messages. Live messages win, except ones already
 /// known to be deleted: their archived copy has the media files.
-fn restore_archived(msgs: &mut Vec<Msg>, records: Vec<Record>) {
-    let archived: Vec<Msg> = records.into_iter().map(Msg::from).collect();
+fn restore_archived(msgs: &mut Vec<Msg>, records: Vec<Record>, shown: &Shown) {
+    let archived: Vec<Msg> = records
+        .into_iter()
+        .map(Msg::from)
+        .filter(|m| shown.keeps(m))
+        .map(|m| m.in_thread(shown.thread))
+        .collect();
     // A deleted album goes as a whole; `merge_albums` rebuilds it from parts.
     msgs.retain(|m| !m.deleted || !archived.iter().any(|a| m.contains(a.id)));
     msgs.extend(archived);
@@ -1111,11 +1165,25 @@ impl App {
                 self.scroll_messages();
                 Task::none()
             }
-            Message::History { chat_id, tag, newer, result } => {
-                if self.open.as_ref().is_some_and(|o| o.tag != tag) {
+            Message::History { chat_id, tag, thread, newer, result } => {
+                if self.open.as_ref().is_some_and(|o| o.tag != tag || o.thread_root() != thread) {
                     return Task::none();
                 }
                 self.on_history(chat_id, newer, result)
+            }
+            Message::ThreadOpened { channel, post, result } => match result {
+                Ok(thread) if self.open.as_ref().is_some_and(|o| o.id == channel) => {
+                    self.open_thread(channel, post, thread)
+                }
+                Ok(_) => Task::none(),
+                Err(e) => {
+                    self.error(format!("Can't open the comments: {e}"));
+                    Task::none()
+                }
+            },
+            Message::OpenComments(msg_id) => {
+                self.select_message(msg_id);
+                self.open_comments()
             }
             Message::Window { chat_id, target, result } => self.on_window(chat_id, target, result),
             Message::Count { chat_id, tag, result } => {
@@ -1196,12 +1264,10 @@ impl App {
             }
             Message::Archived { chat_id, result } => {
                 match result {
-                    Ok(mut records) if !records.is_empty() => {
+                    Ok(records) if !records.is_empty() => {
                         if let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id) {
-                            if let Some(tag) = &open.tag {
-                                records.retain(|r| tg::has_hashtag(&r.text, tag));
-                            }
-                            open.edit(|msgs| restore_archived(msgs, records));
+                            let shown = open.shown();
+                            open.edit(|msgs| restore_archived(msgs, records, &shown));
                             self.scroll_messages();
                         }
                     }
@@ -1619,8 +1685,9 @@ impl App {
                 let msg = Msg::from(u.message);
                 self.archive_save(std::slice::from_ref(&msg));
                 if let Some(open) = self.open.as_mut().filter(|o| o.id == msg.chat_id)
-                    && (open.tag.is_none() || open.position(u.old_message_id).is_some())
+                    && (open.shown().keeps(&msg) || open.position(u.old_message_id).is_some())
                 {
+                    let msg = msg.in_thread(open.thread_root());
                     let follow = open.at_end();
                     open.edit(|msgs| {
                         msgs.retain(|m| m.id != u.old_message_id);
@@ -1667,6 +1734,10 @@ impl App {
                     // Another part of an album without reactions doesn't clear them.
                     if msg.id == u.message_id || !reactions.is_empty() {
                         msg.reactions = reactions;
+                    }
+                    let comments = tg::comments(u.interaction_info.as_ref());
+                    if msg.id == u.message_id || comments.is_some() {
+                        msg.comments = comments;
                     }
                 }
             }
@@ -1769,9 +1840,10 @@ impl App {
         let Some(open) = self.open.as_mut().filter(|o| o.id == msg.chat_id) else {
             return Task::none();
         };
-        if open.tag.as_ref().is_some_and(|tag| !tg::has_hashtag(&msg.text, tag)) {
+        if !open.shown().keeps(&msg) {
             return Task::none();
         }
+        let msg = msg.in_thread(open.thread_root());
         let (chat_id, id, incoming) = (msg.chat_id, msg.id, !msg.outgoing);
         // Still pending: sent from here, not from another device.
         let sent_here = msg.sending;
@@ -1882,6 +1954,13 @@ impl App {
         }
         if batch.is_empty() {
             open.exhausted = true;
+            // All comments are here: the post goes on top.
+            if let Some(roots) = open.thread.as_mut().map(|t| std::mem::take(&mut t.roots))
+                && !roots.is_empty()
+            {
+                open.edit(|msgs| msgs.extend(roots));
+                self.scroll_messages();
+            }
             return Task::none();
         }
 
@@ -2002,11 +2081,16 @@ impl App {
         let from = if older { open.msgs.first().map_or(0, |m| m.id) } else { 0 };
         if let Some(tag) = open.tag.clone() {
             return Task::perform(tg::tagged(chat_id, tag.clone(), from, HISTORY_PAGE), move |result| {
-                Message::History { chat_id, tag: Some(tag.clone()), newer: false, result }
+                Message::History { chat_id, tag: Some(tag.clone()), thread: 0, newer: false, result }
+            });
+        }
+        if let Some(thread) = open.thread.as_ref().map(|t| t.root) {
+            return Task::perform(tg::thread_history(chat_id, thread, from, HISTORY_PAGE), move |result| {
+                Message::History { chat_id, tag: None, thread, newer: false, result }
             });
         }
         Task::perform(tg::history(chat_id, from, 0, HISTORY_PAGE), move |result| {
-            Message::History { chat_id, tag: None, newer: false, result }
+            Message::History { chat_id, tag: None, thread: 0, newer: false, result }
         })
     }
 
@@ -2024,7 +2108,7 @@ impl App {
         open.loading = true;
         let chat_id = open.id;
         Task::perform(tg::history(chat_id, from, -(HISTORY_PAGE - 1), HISTORY_PAGE), move |result| {
-            Message::History { chat_id, tag: None, newer: true, result }
+            Message::History { chat_id, tag: None, thread: 0, newer: true, result }
         })
     }
 
@@ -2037,6 +2121,11 @@ impl App {
         if let Some(i) = open.position(id) {
             open.cursor = i;
             self.scroll_messages();
+            return Task::none();
+        }
+        // Comments come in order only: not loaded yet means not there.
+        if open.thread.is_some() {
+            self.error("Not among the loaded comments (k loads older ones)");
             return Task::none();
         }
         // Not among the tagged messages: show it among all of them.
@@ -2254,19 +2343,13 @@ impl App {
         self.focus = Focus::Messages;
         let mut tasks = Vec::new();
         if let Some(prev) = self.open.take() {
-            if prev.id == id {
+            if prev.id == id && prev.thread.is_none() {
                 self.open = Some(prev);
                 return at.map_or_else(Task::none, |msg| self.jump_to_message(msg));
             }
             tasks.push(Task::perform(tg::close_chat(prev.id), Message::Done));
         }
-        self.open = Some(OpenChat::new(id));
-        self.visual = None;
-        self.close_viewer();
-        self.compose = Compose::New;
-        self.input.clear();
-        self.found = None;
-        tasks.push(Task::perform(tg::open_chat(id), Message::Done));
+        tasks.push(self.switch_chat(OpenChat::new(id)));
         tasks.push(Task::perform(tg::message_count(id), move |result| Message::Count {
             chat_id: id,
             tag: None,
@@ -2279,6 +2362,66 @@ impl App {
             None => self.load_history(false),
         });
         Task::batch(tasks)
+    }
+
+    /// Show `open` in place of the open chat (closed by the caller).
+    fn switch_chat(&mut self, open: OpenChat) -> Task<Message> {
+        let id = open.id;
+        self.open = Some(open);
+        self.visual = None;
+        self.close_viewer();
+        self.compose = Compose::New;
+        self.input.clear();
+        self.found = None;
+        Task::perform(tg::open_chat(id), Message::Done)
+    }
+
+    /// `gc` on a channel post: find its comments.
+    fn open_comments(&mut self) -> Task<Message> {
+        let Some(open) = self.open.as_ref().filter(|o| o.thread.is_none()) else {
+            return Task::none();
+        };
+        let Some(parts) = open.current().filter(|m| m.comments.is_some()).map(|m| m.members.clone()) else {
+            self.error("No comments under this message");
+            return Task::none();
+        };
+        let (channel, post) = (open.id, parts[0]);
+        self.info("Loading comments…");
+        Task::perform(tg::thread(channel, parts), move |result| Message::ThreadOpened { channel, post, result })
+    }
+
+    /// The comments of `post`, in the discussion group; Esc comes back.
+    fn open_thread(&mut self, channel: i64, post: i64, thread: tg::Thread) -> Task<Message> {
+        let mut tasks = Vec::new();
+        if let Some(prev) = self.open.take() {
+            tasks.push(Task::perform(tg::close_chat(prev.id), Message::Done));
+        }
+        self.jumps.push((channel, post));
+        let mut open = OpenChat::new(thread.chat_id);
+        open.total = Some(thread.count);
+        open.thread = Some(CommentThread {
+            channel,
+            post,
+            root: thread.root,
+            roots: thread.roots,
+        });
+        self.focus = Focus::Messages;
+        tasks.push(self.switch_chat(open));
+        self.reset_tall();
+        tasks.push(self.load_history(false));
+        self.info("Comments: i writes one, r replies, Esc back to the post");
+        Task::batch(tasks)
+    }
+
+    /// Esc in the comments: back to the post in the channel.
+    fn leave_thread(&mut self) -> Task<Message> {
+        let Some((channel, post)) = self.open.as_ref().and_then(|o| o.thread.as_ref()).map(|t| (t.channel, t.post)) else {
+            return Task::none();
+        };
+        if self.jumps.last() == Some(&(channel, post)) {
+            self.jumps.pop();
+        }
+        self.open_chat_at(channel, Some(post))
     }
 
     /// A voice message playing in a chat other than the open one.
@@ -2306,6 +2449,7 @@ impl App {
         };
         if !self.attachments.is_empty() && !matches!(self.compose, Compose::Edit(_)) {
             let paths = std::mem::take(&mut self.attachments);
+            options.thread = open.thread_root();
             return self.send_files(paths, options);
         }
         let text = self.input.as_str().trim();
@@ -2314,6 +2458,7 @@ impl App {
             return Task::none();
         }
         let (chat_id, text) = (open.id, text.to_owned());
+        options.thread = open.thread_root();
         self.input.clear();
         let compose = std::mem::replace(&mut self.compose, Compose::New);
         match compose {
@@ -3584,6 +3729,7 @@ impl App {
                     }
                 }
             }
+            Action::Comments => self.open_comments(),
             Action::JumpBack => match self.jumps.pop() {
                 Some((chat_id, msg_id)) if self.open.as_ref().is_some_and(|o| o.id == chat_id) => {
                     self.jump_to_message(msg_id)
@@ -3759,6 +3905,9 @@ impl App {
                 if !cancelled && self.open.as_ref().is_some_and(|o| o.tag.is_some()) {
                     return self.leave_tag();
                 }
+                if !cancelled && self.open.as_ref().is_some_and(|o| o.thread.is_some()) {
+                    return self.leave_thread();
+                }
                 if !cancelled {
                     self.confirm = Some(Confirm::Quit);
                 }
@@ -3891,11 +4040,12 @@ impl App {
 
     fn finish_recording(&mut self) -> Task<Message> {
         let chat_id = self.open.as_ref().map(|o| o.id);
+        let thread = self.open.as_ref().map_or(0, OpenChat::thread_root);
         let (Some(recorder), Some(chat_id)) = (self.stop_recording(true), chat_id) else {
             return Task::none();
         };
         self.info("Sending voice message…");
-        Task::perform(stop_and_send(chat_id, recorder), Message::Done)
+        Task::perform(stop_and_send(chat_id, thread, recorder), Message::Done)
     }
 
     fn yank(&mut self) -> Task<Message> {
@@ -4133,11 +4283,11 @@ impl App {
 }
 
 /// Finalizing the OGG file waits for the pipeline, so do it off the UI thread.
-async fn stop_and_send(chat_id: i64, recorder: Recorder) -> Result<(), String> {
+async fn stop_and_send(chat_id: i64, thread: i64, recorder: Recorder) -> Result<(), String> {
     let recording = tokio::task::spawn_blocking(move || recorder.stop())
         .await
         .map_err(|e| e.to_string())??;
-    tg::send_voice(chat_id, recording, SendOptions::default()).await
+    tg::send_voice(chat_id, recording, SendOptions { thread, ..SendOptions::default() }).await
 }
 
 enum Edit {
@@ -4366,7 +4516,34 @@ mod tests {
             styles: Vec::new(),
             spoiler: false,
             preview: None,
+            comments: None,
+            thread: 0,
         }
+    }
+
+    #[test]
+    fn comments_of_a_thread_only() {
+        let shown = Shown { tag: None, thread: 10 };
+        let comment = |id, thread, reply_to| Msg { thread, reply_to, ..msg(id, 0) };
+        assert!(shown.keeps(&comment(11, 10, Some(10))));
+        assert!(shown.keeps(&comment(12, 10, Some(11))));
+        // No thread known, but it answers the post.
+        assert!(shown.keeps(&comment(13, 0, Some(10))));
+        assert!(!shown.keeps(&comment(14, 20, Some(20))));
+        assert!(!shown.keeps(&comment(15, 0, None)));
+        assert!(Shown { tag: None, thread: 0 }.keeps(&comment(15, 0, None)));
+        // Answering the post is not quoted; answering a comment is.
+        assert_eq!(comment(11, 10, Some(10)).in_thread(10).reply_to, None);
+        assert_eq!(comment(12, 10, Some(11)).in_thread(10).reply_to, Some(11));
+        assert_eq!(comment(16, 0, Some(10)).in_thread(0).reply_to, Some(10));
+    }
+
+    #[test]
+    fn album_comments_come_from_any_part() {
+        let mut chat = OpenChat::new(1);
+        let part = |id, comments| Msg { comments, ..msg(id, 7) };
+        chat.edit(|m| m.extend([part(1, None), part(2, Some(4))]));
+        assert_eq!(chat.msgs[0].comments, Some(4));
     }
 
     #[test]

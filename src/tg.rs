@@ -265,6 +265,57 @@ pub async fn history(chat_id: i64, from_id: i64, offset: i32, limit: i32) -> Res
     Ok(msgs)
 }
 
+/// The comments of a channel post: a thread in the channel's discussion
+/// group.
+#[derive(Debug, Clone)]
+pub struct Thread {
+    /// The discussion group.
+    pub chat_id: i64,
+    /// The thread's id there: the post's copy in the group.
+    pub root: i64,
+    /// The post's copy (or copies, for an album), oldest first.
+    pub roots: Vec<Msg>,
+    pub count: i32,
+}
+
+/// The thread of a post: of the first of `posts` that has one (the parts
+/// of an album).
+pub async fn thread(chat_id: i64, posts: Vec<i64>) -> Res<Thread> {
+    let mut error = String::from("no comments");
+    for post in posts {
+        match functions::get_message_thread(chat_id, post, client()).await {
+            Ok(enums::MessageThreadInfo::MessageThreadInfo(info)) => return Ok(thread_of(info)),
+            Err(e) => error = err(e),
+        }
+    }
+    Err(error)
+}
+
+fn thread_of(info: types::MessageThreadInfo) -> Thread {
+    let mut roots: Vec<Msg> = info.messages.into_iter().map(Msg::from).collect();
+    roots.sort_by_key(|m| m.id);
+    // These are the comments.
+    roots.iter_mut().for_each(|m| m.comments = None);
+    Thread {
+        chat_id: info.chat_id,
+        root: info.message_thread_id,
+        roots,
+        count: info.reply_info.map_or(0, |r| r.reply_count),
+    }
+}
+
+/// Comments in a thread older than `from_id` (0: the newest ones), oldest
+/// first.
+pub async fn thread_history(chat_id: i64, root: i64, from_id: i64, limit: i32) -> Res<Vec<Msg>> {
+    let enums::Messages::Messages(page) =
+        functions::get_message_thread_history(chat_id, root, from_id, 0, limit, client())
+            .await
+            .map_err(err)?;
+    let mut msgs: Vec<Msg> = page.messages.into_iter().flatten().map(|m| Msg::from(m).in_thread(root)).collect();
+    msgs.reverse();
+    Ok(msgs)
+}
+
 /// Ids of messages matching `query`, newest first, and the total count.
 pub async fn search(chat_id: i64, query: String) -> Res<(Vec<i64>, i32)> {
     let enums::FoundChatMessages::FoundChatMessages(found) =
@@ -348,6 +399,8 @@ pub struct SendOptions {
     pub silent: bool,
     /// Unix time to send at (scheduled message).
     pub at: Option<i32>,
+    /// A comment in this thread (`Thread::root`); 0: none.
+    pub thread: i64,
 }
 
 impl SendOptions {
@@ -359,6 +412,12 @@ impl SendOptions {
                 checklist_task_id: 0,
             })
         })
+    }
+
+    fn topic(self) -> Option<enums::MessageTopic> {
+        (self.thread != 0).then_some(enums::MessageTopic::Thread(types::MessageTopicThread {
+            message_thread_id: self.thread,
+        }))
     }
 
     fn options(self) -> Option<types::MessageSendOptions> {
@@ -376,7 +435,7 @@ impl SendOptions {
 }
 
 async fn send(chat_id: i64, content: InputMessageContent, options: SendOptions) -> Res<()> {
-    functions::send_message(chat_id, None, options.reply_to(), options.options(), content, client())
+    functions::send_message(chat_id, options.topic(), options.reply_to(), options.options(), content, client())
         .await
         .map(|_| ())
         .map_err(err)
@@ -513,7 +572,7 @@ pub async fn send_files(chat_id: i64, paths: Vec<std::path::PathBuf>, caption: S
         })
         .collect();
     if album {
-        return functions::send_message_album(chat_id, None, options.reply_to(), options.options(), contents, client())
+        return functions::send_message_album(chat_id, options.topic(), options.reply_to(), options.options(), contents, client())
             .await
             .map(|_| ())
             .map_err(err);
@@ -1122,6 +1181,12 @@ pub struct Msg {
     /// What the first link in the text points to.
     #[serde(default)]
     pub preview: Option<Preview>,
+    /// Channel posts open for comments: how many there are.
+    #[serde(default)]
+    pub comments: Option<i32>,
+    /// The comment thread this message is in (`Thread::root`); 0: none.
+    #[serde(default)]
+    pub thread: i64,
 }
 
 /// A link preview: the page's site, title, description and picture.
@@ -1370,6 +1435,11 @@ pub struct Reaction {
     pub chosen: bool,
 }
 
+/// Comments under a channel post; `None` when it can't have any.
+pub fn comments(info: Option<&types::MessageInteractionInfo>) -> Option<i32> {
+    info?.reply_info.as_ref().map(|r| r.reply_count)
+}
+
 pub fn reactions(info: Option<&types::MessageInteractionInfo>) -> Vec<Reaction> {
     let Some(reactions) = info.and_then(|i| i.reactions.as_ref()) else {
         return Vec::new();
@@ -1423,6 +1493,11 @@ impl From<types::Message> for Msg {
             styles: content_styles(&m.content, &text),
             spoiler: media_spoiler(&m.content),
             preview: link_preview(&m.content),
+            comments: comments(m.interaction_info.as_ref()),
+            thread: match &m.topic_id {
+                Some(enums::MessageTopic::Thread(t)) => t.message_thread_id,
+                _ => 0,
+            },
             text,
         }
     }
@@ -1467,11 +1542,22 @@ impl From<Record> for Msg {
             styles: Vec::new(),
             spoiler: false,
             preview: None,
+            comments: None,
+            thread: 0,
         }
     }
 }
 
 impl Msg {
+    /// Shown among the comments of thread `root`: answering the post itself
+    /// is what a comment is, so it is not quoted.
+    pub fn in_thread(mut self, root: i64) -> Self {
+        if root != 0 && self.reply_to == Some(root) {
+            self.reply_to = None;
+        }
+        self
+    }
+
     /// The text with its spoilers blanked out, for previews.
     pub fn masked_text(&self) -> String {
         let mut text = self.text.clone();
@@ -1527,10 +1613,11 @@ impl Msg {
         self.links.extend(other.links.into_iter().map(|l| Link { start: l.start + shift, end: l.end + shift, ..l }));
         self.styles.extend(other.styles.into_iter().map(|s| Styled { start: s.start + shift, end: s.end + shift, ..s }));
         self.spoiler |= other.spoiler;
-        // Reactions to an album are put on one of its parts.
+        // Reactions to an album are put on one of its parts, comments too.
         if self.reactions.is_empty() {
             self.reactions = other.reactions;
         }
+        self.comments = self.comments.max(other.comments);
         if self.text.is_empty() {
             self.text = other.text;
         } else if !other.text.is_empty() {

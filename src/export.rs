@@ -149,6 +149,8 @@ mod tests {
             styles: Vec::new(),
             spoiler: false,
             preview: None,
+            comments: None,
+            thread: 0,
         }
     }
 

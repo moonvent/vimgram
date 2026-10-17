@@ -143,6 +143,8 @@ pub enum Action {
     Pinned,
     /// The original of a forwarded message, or the message replied to (`gf`).
     GoToSource,
+    /// The comments of a channel post (`gc`).
+    Comments,
     /// Messages: start / end a Visual selection. Picking chats to forward
     /// to: mark / unmark the chat (`v`).
     Visual,
@@ -192,6 +194,7 @@ impl Pending {
             (Some('g'), NKey::Char('a')) => Some(Action::Attach),
             (Some('g'), NKey::Char('p')) => Some(Action::Pinned),
             (Some('g'), NKey::Char('f')) => Some(Action::GoToSource),
+            (Some('g'), NKey::Char('c')) => Some(Action::Comments),
             (Some('g'), NKey::Char('x')) => Some(Action::OpenLink(explicit.unwrap_or(1))),
             (Some('g'), NKey::Char('e')) => Some(Action::Emoji),
             (Some('g'), NKey::Char('v')) => Some(Action::JumpPlaying),
@@ -454,6 +457,7 @@ mod tests {
         assert_eq!(feed("gv"), vec![Action::JumpPlaying]);
         assert_eq!(feed("rR"), vec![Action::Reply, Action::React]);
         assert_eq!(feed("gf"), vec![Action::GoToSource]);
+        assert_eq!(feed("gccc"), vec![Action::Comments, Action::Edit]);
         assert_eq!(feed("vjf"), vec![Action::Visual, Action::Down(1), Action::Forward]);
         assert_eq!(feed("gx2gx"), vec![Action::OpenLink(1), Action::OpenLink(2)]);
         let mut p = Pending::default();

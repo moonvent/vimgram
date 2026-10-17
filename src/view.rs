@@ -90,6 +90,8 @@ const REACTIONS_H: f32 = REACTION_CHIP_H + 4.0;
 const REACTION_W: f32 = 68.0;
 /// Line between posts or between messages far apart in time.
 const BLOCK_H: f32 = 13.0;
+/// "💬 12 comments" under a channel post.
+const COMMENTS_H: f32 = 22.0;
 const BLOCK_GAP: i32 = 3600;
 
 pub fn chat_rows(size: Size) -> usize {
@@ -264,7 +266,9 @@ pub fn message_height(m: &Msg, width: f32) -> f32 {
     let rows = m.reactions.len().div_ceil(per_row);
     let reactions = if rows == 0 { 0.0 } else { rows as f32 * REACTIONS_H + 2.0 };
     let preview = m.preview.as_ref().map_or(0.0, |p| preview_height(p, width));
-    16.0 + 18.0 + reply + media_block_height(&m.media, width) + lines as f32 * LINE_H + preview + reactions + MSG_SPACING
+    let comments = if m.comments.is_some() { COMMENTS_H } else { 0.0 };
+    16.0 + 18.0 + reply + media_block_height(&m.media, width) + lines as f32 * LINE_H + preview + reactions + comments
+        + MSG_SPACING
 }
 
 fn local_day(unix: i32) -> Option<chrono::NaiveDate> {
@@ -907,8 +911,14 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
         };
     };
 
-    let chat = app.chats.get(&open.id);
+    // Comments: under the channel's name and picture.
+    let thread = open.thread.as_ref();
+    let chat = app.chats.get(&thread.map_or(open.id, |t| t.channel));
     let title = chat.map_or("", |c| c.title.as_str());
+    let title = match thread {
+        Some(_) => format!("Comments · {title}"),
+        None => title.to_owned(),
+    };
     let mut details: Vec<String> = Vec::new();
     if let Some(presence) = app.presence(open.id).map(fmt_presence).filter(|p| !p.is_empty()) {
         details.push(presence);
@@ -916,8 +926,13 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
     if let Some(tag) = &open.tag {
         details.push(format!("only {tag} — Esc for all"));
     }
-    if let Some(total) = open.total {
-        details.push(format!("{} messages", fmt_count(total)));
+    match (open.total, thread) {
+        (Some(total), Some(_)) => details.push(format!("{} comments", fmt_count(total))),
+        (Some(total), None) => details.push(format!("{} messages", fmt_count(total))),
+        (None, _) => {}
+    }
+    if thread.is_some() {
+        details.push("Esc back to the post".into());
     }
     if !open.at_latest {
         details.push("viewing history — G for latest".into());
@@ -931,7 +946,7 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
         row![
             header_avatar,
             column![
-                emoji_text(title).size(15).wrapping(Wrapping::None),
+                emoji_text(&title).size(15).wrapping(Wrapping::None),
                 text(details.join(" · "))
                     .size(12)
                     .wrapping(Wrapping::None)
@@ -1475,6 +1490,9 @@ fn message_keys(app: &App, m: &Msg) -> String {
     } else if m.reply_to.is_some() {
         keys.push("gf reply");
     }
+    if m.comments.is_some() {
+        keys.push("gc comments");
+    }
     match m.media.first() {
         Some(Media::Voice { .. } | Media::Audio { .. } | Media::Video { round: true, .. }) => keys.push("Enter play"),
         Some(media) if media.viewable() => keys.push("Enter open"),
@@ -1568,6 +1586,22 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
 
     if !m.reactions.is_empty() {
         body = body.push(reactions_row(m));
+    }
+    if let Some(count) = m.comments {
+        let label = match count {
+            0 => "💬 Leave a comment".to_owned(),
+            1 => "💬 1 comment".to_owned(),
+            n => format!("💬 {} comments", fmt_count(n)),
+        };
+        body = body.push(
+            mouse_area(
+                container(text(label).size(13).style(primary_text))
+                    .height(COMMENTS_H - 2.0)
+                    .align_y(Alignment::Center),
+            )
+            .on_press(Message::OpenComments(m.id))
+            .interaction(Interaction::Pointer),
+        );
     }
 
     let highlighted = selected || app.in_visual(m.id);
@@ -1813,7 +1847,7 @@ pub fn has_banner(app: &App) -> bool {
 fn channel_bar(app: &App, chat: &Chat) -> Element<'static, Message> {
     let mute = if app.muted(chat) { "m — unmute" } else { "m — mute" };
     let leave = if app.membership(chat) == Some(Membership::Left) { "U — subscribe" } else { "U — unsubscribe" };
-    container(text(format!("Channel   {mute}   {leave}")).size(TEXT).style(muted_text))
+    container(text(format!("Channel   {mute}   {leave}   gc — comments")).size(TEXT).style(muted_text))
         .padding([10.0, MSG_PAD_X])
         .width(Length::Fill)
         .height(20.0 + LINE_H)
@@ -2123,6 +2157,8 @@ mod tests {
             styles: Vec::new(),
             spoiler: false,
             preview: None,
+            comments: None,
+            thread: 0,
         }
     }
 

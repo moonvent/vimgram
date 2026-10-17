@@ -93,7 +93,8 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `gp` | jump to the pinned message |
 | `gf`, click on the reply quote or "Forwarded from" | go to the original of a forwarded message (channel posts and Saved Messages say where it is; otherwise its author's chat), or to the message replied to |
 | `gx`, `2gx`, click on a link | open the (n-th) link of the message: t.me links and @mentions open here, at the post; web and e-mail links in the browser; a #hashtag shows only the chat's messages with it (`Esc` shows all again, at the message under the cursor) |
-| `Ctrl-o` | back to where `gf` or a t.me link came from |
+| `gc`, click on "💬 N comments" | the comments of a channel post: `i` comments, `r` answers a comment, `Esc` (or `Ctrl-o`) goes back to the post |
+| `Ctrl-o` | back to where `gf`, `gc` or a t.me link came from |
 | `ge`, `Ctrl-.` in insert mode, `:emoji`, the 😀 button | emoji panel: `h`/`j`/`k`/`l` move, `Enter` inserts, `Tab`/`[`/`]`/`1`–`0` groups, `/` search by name, `Esc` closes |
 | `yy`, `Y` | copy message text (or chat title) to the clipboard |
 | `p` / `P` | paste the clipboard at the end / start of the message; a copied image or file becomes an attachment |
