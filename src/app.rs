@@ -247,8 +247,8 @@ impl VideoPlayback {
         self.movie.as_ref().map(|m| &m.video)
     }
 
-    fn video_mut(&mut self) -> Option<&mut iced_video_player::Video> {
-        self.movie.as_mut().map(|m| &mut m.video)
+    fn movie_mut(&mut self) -> Option<&mut Movie> {
+        self.movie.as_mut()
     }
 }
 
@@ -2341,8 +2341,8 @@ impl App {
         let mut finished = Vec::new();
         if let Some(playback) = self.video.as_mut().filter(|p| p.speed_pending) {
             let speed = self.speeds.get(playback.kind);
-            if let Some(video) = playback.video_mut() {
-                playback.speed_pending = video.set_speed(speed).is_err();
+            if let Some(movie) = playback.movie_mut() {
+                playback.speed_pending = movie.set_speed(speed).is_err();
             }
         }
         // A round video counts as watched once it played to the end.
@@ -2477,8 +2477,12 @@ impl App {
     }
 
     fn toggle_pause(&mut self) -> Task<Message> {
-        if let Some(video) = self.video.as_mut().and_then(VideoPlayback::video_mut) {
-            video.set_paused(!video.paused());
+        if let Some(playback) = self.video.as_mut()
+            && let Some(movie) = playback.movie.as_mut()
+        {
+            // Played to the end: it starts over at 1x, so the speed is set again.
+            playback.speed_pending |= movie.video.eos();
+            movie.video.set_paused(!movie.video.paused());
         } else if let Some(audio) = self.voice.as_mut().and_then(|v| v.audio.as_mut()) {
             audio.toggle_pause();
         } else if let Some(msg) = self.open.as_ref().and_then(OpenChat::current)
@@ -2490,10 +2494,10 @@ impl App {
     }
 
     fn seek(&mut self, delta: f64) {
-        if let Some(video) = self.video.as_mut().and_then(VideoPlayback::video_mut) {
-            let target = (video.position().as_secs_f64() + delta)
-                .clamp(0.0, video.duration().as_secs_f64());
-            let _ = video.seek(Duration::from_secs_f64(target), false);
+        if let Some(movie) = self.video.as_mut().and_then(VideoPlayback::movie_mut) {
+            let target = (movie.video.position().as_secs_f64() + delta)
+                .clamp(0.0, movie.video.duration().as_secs_f64());
+            let _ = movie.seek(Duration::from_secs_f64(target));
         } else if let Some(audio) = self.voice.as_mut().and_then(|v| v.audio.as_mut()) {
             audio.seek_by(delta);
         }
@@ -2514,9 +2518,9 @@ impl App {
         self.speeds.set(self.speed_kind(), speed);
         self.speeds.save();
         if let Some(playback) = self.video.as_mut()
-            && let Some(video) = playback.video_mut()
+            && let Some(movie) = playback.movie_mut()
         {
-            playback.speed_pending = video.set_speed(speed).is_err();
+            playback.speed_pending = movie.set_speed(speed).is_err();
         }
         if let Some(audio) = self.voice.as_mut().and_then(|v| v.audio.as_mut()) {
             audio.set_speed(speed);

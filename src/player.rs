@@ -116,7 +116,42 @@ fn uri(path: &str) -> Result<url::Url, String> {
 /// A video being played, and the stream feeding it.
 pub struct Movie {
     pub video: Video,
+    speed: f64,
     _stream: Option<stream::Handle>,
+}
+
+impl Movie {
+    /// Jump to `to`, keeping the speed.
+    pub fn seek(&mut self, to: Duration) -> Result<(), String> {
+        self.seek_at(to, self.speed, gst::SeekFlags::empty())
+    }
+
+    /// Play at `speed` from where the video is now. Not `Video::set_speed`:
+    /// its seek runs to "the end", which qtdemux reading a stream (push
+    /// mode) doesn't know yet and takes as 0, so the video stops dead.
+    pub fn set_speed(&mut self, speed: f64) -> Result<(), String> {
+        let position = self.video.pipeline().query_position::<gst::ClockTime>();
+        let position = position.ok_or("video: position unknown")?;
+        self.seek_at(Duration::from_nanos(position.nseconds()), speed, gst::SeekFlags::ACCURATE)?;
+        self.speed = speed;
+        Ok(())
+    }
+
+    /// `Video::seek` would reset the speed to its own (1x): the speed is
+    /// changed here, not through it.
+    fn seek_at(&self, to: Duration, speed: f64, flags: gst::SeekFlags) -> Result<(), String> {
+        self.video
+            .pipeline()
+            .seek(
+                speed,
+                gst::SeekFlags::FLUSH | flags,
+                gst::SeekType::Set,
+                gst::ClockTime::from_nseconds(to.as_nanos() as u64),
+                gst::SeekType::None,
+                gst::ClockTime::NONE,
+            )
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// A video with sound for the full-screen viewer, streamed while it
@@ -163,14 +198,16 @@ fn build(uri: &str, source: Option<(Arc<dyn stream::Source>, u64)>, speed: f64) 
         .and_then(|sink| sink.downcast::<gstreamer_app::AppSink>().ok())
         .ok_or_else(|| "video: no appsink".to_string())?;
 
-    let mut video = Video::from_gst_pipeline(pipeline, video_sink, None).map_err(|e| e.to_string())?;
-    if (speed - 1.0).abs() > 1e-6 {
-        let _ = video.set_speed(speed);
-    }
-    Ok(Movie {
+    let video = Video::from_gst_pipeline(pipeline, video_sink, None).map_err(|e| e.to_string())?;
+    let mut movie = Movie {
         video,
+        speed: 1.0,
         _stream: stream,
-    })
+    };
+    if (speed - 1.0).abs() > 1e-6 {
+        let _ = movie.set_speed(speed);
+    }
+    Ok(movie)
 }
 
 /// Audio-only playback (voice messages).
@@ -436,6 +473,32 @@ mod tests {
         assert_eq!(fmt_speed(0.25), "0.25x");
     }
 
+    /// Counts the frames reaching the video sink from now on.
+    fn count_frames(movie: &Movie) -> Arc<std::sync::atomic::AtomicUsize> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let count = Arc::new(AtomicUsize::new(0));
+        let sink: gst::Element = movie.video.pipeline().property("video-sink");
+        let pad = sink
+            .downcast::<gst::Bin>()
+            .ok()
+            .and_then(|bin| bin.by_name("iced_video"))
+            .and_then(|sink| sink.static_pad("sink"))
+            .unwrap();
+        let counter = count.clone();
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            gst::PadProbeReturn::Ok
+        });
+        count
+    }
+
+    /// Frames shown within `time`.
+    fn frames_within(movie: &Movie, time: Duration) -> usize {
+        let count = count_frames(movie);
+        std::thread::sleep(time);
+        count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     #[test]
     fn plays_streamed_video_with_seek_and_speed() {
         let Some(path) = stream::tests::sample_mp4() else {
@@ -443,19 +506,24 @@ mod tests {
             return;
         };
         let size = std::fs::metadata(&path).unwrap().len();
-        let mut movie = open_stream(Arc::new(stream::tests::FileSource(path)), size, 2.0).unwrap();
-        let video = &mut movie.video;
-        assert_eq!(video.size(), (320, 240));
-        assert!(video.duration() > Duration::from_secs(2), "{:?}", video.duration());
-        video.seek(Duration::from_millis(1500), true).unwrap();
+        // Opening at another speed froze streamed videos on their first frame.
+        let mut movie = open_stream(Arc::new(stream::tests::FileSource(path)), size, 1.5).unwrap();
+        assert_eq!(movie.video.size(), (320, 240));
+        assert!(movie.video.duration() > Duration::from_secs(2), "{:?}", movie.video.duration());
+        assert!(frames_within(&movie, Duration::from_millis(400)) > 3);
+        movie.seek(Duration::from_millis(1000)).unwrap();
         // The rate change needs the position, which is unknown mid-seek.
-        let _ = video.pipeline().state(gst::ClockTime::from_seconds(5));
-        video.set_speed(5.0).unwrap();
-        assert_eq!(video.speed(), 5.0);
-        // A speed change is a seek too.
-        let _ = video.pipeline().state(gst::ClockTime::from_seconds(5));
-        video.set_speed(0.25).unwrap();
-        assert_eq!(video.speed(), 0.25);
+        let _ = movie.video.pipeline().state(gst::ClockTime::from_seconds(5));
+        assert!(frames_within(&movie, Duration::from_millis(300)) > 3);
+        movie.set_speed(0.5).unwrap();
+        assert!(frames_within(&movie, Duration::from_millis(300)) > 3);
+        // Still at half speed after a seek.
+        movie.seek(Duration::from_millis(1500)).unwrap();
+        let _ = movie.video.pipeline().state(gst::ClockTime::from_seconds(5));
+        let from = movie.video.position();
+        std::thread::sleep(Duration::from_millis(400));
+        let played = movie.video.position().saturating_sub(from);
+        assert!(played < Duration::from_millis(330), "{played:?} in 400 ms at 0.5x");
     }
 
     #[test]
