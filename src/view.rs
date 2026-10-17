@@ -33,6 +33,8 @@ const TEXT: f32 = 15.0;
 const LINE_H: f32 = TEXT * 1.35;
 const MSG_PAD_X: f32 = 16.0;
 const MSG_SPACING: f32 = 2.0;
+/// The ↓ button that brings a scrolled-up chat back to its newest messages.
+const TO_LATEST: f32 = 40.0;
 /// Space between the newest message and the line above the compose field.
 const LIST_BOTTOM: f32 = 12.0;
 const MAX_COMPOSE_LINES: usize = 8;
@@ -889,6 +891,13 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
     let messages: Element<_> = mouse_area(messages)
         .on_scroll(|delta| Message::Scroll(Pane::Messages, delta))
         .into();
+    // Scrolled up (or in old history): a way back down besides `G`.
+    let scrolled_up = !open.at_latest || open.bottom + 1 < open.msgs.len();
+    let messages: Element<_> = if scrolled_up {
+        stack![messages, to_latest_button()].into()
+    } else {
+        messages
+    };
     let messages: Element<_> = match &app.emoji {
         Some(picker) => row![messages, rule::vertical(1), emoji_panel(app, picker)]
             .height(Length::Fill)
@@ -912,6 +921,35 @@ fn starts_run(msgs: &[Msg], i: usize) -> bool {
         }
         None => true,
     }
+}
+
+/// Round ↓ in the corner of the message list.
+fn to_latest_button<'a>() -> Element<'a, Message> {
+    let button = mouse_area(
+        container(text("↓").size(20))
+            .width(TO_LATEST)
+            .height(TO_LATEST)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .style(|t: &Theme| {
+                let p = t.extended_palette();
+                container::Style {
+                    background: Some(p.background.weak.color.into()),
+                    text_color: Some(p.background.weak.text),
+                    border: iced::border::rounded(TO_LATEST / 2.0).color(p.background.strong.color).width(1.0),
+                    ..Default::default()
+                }
+            }),
+    )
+    .on_press(Message::ToLatest)
+    .interaction(Interaction::Pointer);
+    container(button)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::End)
+        .align_y(Alignment::End)
+        .padding(iced::Padding { right: MSG_PAD_X + 8.0, bottom: LIST_BOTTOM + 8.0, ..Default::default() })
+        .into()
 }
 
 fn emoji_panel<'a>(app: &'a App, picker: &'a Picker) -> Element<'a, Message> {

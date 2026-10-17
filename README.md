@@ -101,7 +101,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `Esc`, `Ctrl-[` | normal mode; cancel reply, edit, forward, filter, attachment; with nothing to cancel asks to quit (`y`/`Enter`) |
 | `/` | chat list: filter chats; message pane: search messages |
 | `n` / `N` | next (older) / previous (newer) search match |
-| `G` | after a search or date jump: back to the latest messages |
+| `G`, the ↓ button | back to the latest messages (also after a search or date jump) |
 | `:q` | quit |
 | `:date 01.05.2024` (`01.05`, `2024-05-01`, `yesterday`) | jump to a day |
 | `:silent`, `Alt-Enter` in insert mode | send the composed message without sound |

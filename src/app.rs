@@ -140,6 +140,8 @@ pub enum Message {
     PreviewChat(i64),
     /// The reply quote or "Forwarded from" line of a message was clicked.
     ClickSource(i64),
+    /// The ↓ button over a chat scrolled up.
+    ToLatest,
     /// A link in a message was clicked (or picked with `gx`).
     OpenLink(String),
     /// A t.me link resolved to a chat (and maybe a message in it).
@@ -1257,6 +1259,7 @@ impl App {
             }
             Message::Scroll(pane, delta) => self.on_scroll(pane, delta),
             Message::OpenLink(url) => self.open_link(url),
+            Message::ToLatest => self.to_latest(),
             Message::LinkResolved { from, result } => match result {
                 Ok((chat_id, msg_id)) => {
                     self.jumps.extend(from);
