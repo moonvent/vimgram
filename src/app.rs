@@ -578,6 +578,8 @@ pub struct App {
     pub users: HashMap<i64, User>,
     /// Your standing in each supergroup and channel, by supergroup id.
     memberships: HashMap<i64, Membership>,
+    /// Supergroups holding the comments of a channel, by supergroup id.
+    discussions: HashSet<i64>,
     archive: Option<Archive>,
     /// Default mute duration per kind of chat.
     scope_mute: HashMap<Scope, i32>,
@@ -714,6 +716,7 @@ impl App {
             chats: HashMap::new(),
             users: HashMap::new(),
             memberships: HashMap::new(),
+            discussions: HashSet::new(),
             archive: Archive::open(config::dirs().data_dir().join("archive.sqlite")).ok(),
             scope_mute: HashMap::new(),
             focused: true,
@@ -942,7 +945,9 @@ impl App {
     }
 
     /// A desktop notification for an incoming message, unless unwanted.
-    fn notification(&self, msg: &Msg) -> Task<Message> {
+    /// The comments under channel posts only notify of replies to you
+    /// (`to_me`, which @mentions are too).
+    fn notification(&self, msg: &Msg, to_me: bool) -> Task<Message> {
         if msg.outgoing || msg.scheduled {
             return Task::none();
         }
@@ -951,7 +956,8 @@ impl App {
         };
         let looking = self.looking() && self.open.as_ref().is_some_and(|o| o.id == chat.id);
         let age = chrono::Utc::now().timestamp() - i64::from(msg.date);
-        if looking || self.muted(chat) || age > NOTIFY_MAX_AGE {
+        let comments = chat.supergroup.is_some_and(|id| self.discussions.contains(&id));
+        if looking || self.muted(chat) || age > NOTIFY_MAX_AGE || (comments && !to_me) {
             return Task::none();
         }
         let title = match chat.kind {
@@ -1693,11 +1699,18 @@ impl App {
             }
             Update::Supergroup(u) => {
                 self.memberships.insert(u.supergroup.id, Membership::of(&u.supergroup.status));
+                if u.supergroup.has_linked_chat && !u.supergroup.is_channel {
+                    self.discussions.insert(u.supergroup.id);
+                } else {
+                    self.discussions.remove(&u.supergroup.id);
+                }
             }
             Update::NewMessage(u) => {
+                // Replies to your messages count as mentions too.
+                let to_me = u.message.contains_unread_mention;
                 let msg = Msg::from(u.message);
                 self.archive_save(std::slice::from_ref(&msg));
-                let notify = self.notification(&msg);
+                let notify = self.notification(&msg, to_me);
                 let prefetch = self.prefetch(&msg);
                 return Task::batch([notify, prefetch, self.on_new_message(msg)]);
             }
