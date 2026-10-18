@@ -183,15 +183,20 @@ pub fn clean_cache(days: u64) {
 }
 
 /// A round avatar with the app icon in its corner, so notification daemons
-/// that show a single image (mako) still show both. Cached per avatar file.
-pub fn notification_image(avatar: &Path, key: i32) -> Option<PathBuf> {
-    let path = cache_dir().join(format!("avatar-{key}.png"));
+/// that show a single image (mako) still show both. Cached per photo: by
+/// its content, as TDLib's file ids are reused after a restart.
+pub fn notification_image(avatar: &Path) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let bytes = std::fs::read(avatar).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let path = cache_dir().join(format!("avatar-{:016x}.png", hasher.finish()));
     if path.exists() {
         return Some(path);
     }
     const SIZE: u32 = 128;
     const BADGE_SIZE: u32 = 48;
-    let photo = image::open(avatar)
+    let photo = image::load_from_memory(&bytes)
         .ok()?
         .resize_to_fill(SIZE, SIZE, image::imageops::FilterType::Lanczos3)
         .to_rgba8();
@@ -277,13 +282,28 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let avatar = dir.join("a.png");
         image::RgbaImage::from_pixel(160, 160, image::Rgba([0, 200, 0, 255])).save(&avatar).unwrap();
-        let out = notification_image(&avatar, -(std::process::id() as i32)).unwrap();
+        let out = notification_image(&avatar).unwrap();
         let img = image::open(&out).unwrap().to_rgba8();
         assert_eq!(img.get_pixel(0, 0).0[3], 0, "round");
         assert_eq!(img.get_pixel(40, 64).0, [0, 200, 0, 255]);
         let corner = img.get_pixel(128 - 10, 128 - 24).0;
         assert!(corner[2] > 150, "badge in the corner: {corner:?}");
         let _ = std::fs::remove_file(out);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn other_photos_get_other_images() {
+        let dir = std::env::temp_dir().join(format!("vimgram-icons-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (red, blue) = (dir.join("r.png"), dir.join("b.png"));
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([200, 0, 0, 255])).save(&red).unwrap();
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([0, 0, 200, 255])).save(&blue).unwrap();
+        let (a, b) = (notification_image(&red).unwrap(), notification_image(&blue).unwrap());
+        assert_ne!(a, b);
+        assert_eq!(notification_image(&red).unwrap(), a, "cached");
+        let _ = std::fs::remove_file(a);
+        let _ = std::fs::remove_file(b);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

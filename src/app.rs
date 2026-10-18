@@ -966,7 +966,7 @@ impl App {
                 let image = match avatar {
                     Some(file) => match tg::download(file, 16).await {
                         Ok(path) => tokio::task::spawn_blocking(move || {
-                            icon::notification_image(std::path::Path::new(&path), file)
+                            icon::notification_image(std::path::Path::new(&path))
                         })
                         .await
                         .ok()
