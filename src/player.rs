@@ -149,6 +149,17 @@ fn uri(path: &str) -> Result<url::Url, String> {
     url::Url::from_file_path(path).map_err(|()| format!("bad path: {path}"))
 }
 
+/// `caps` with a frame rate, when they say none (0/1) or lack it.
+fn with_framerate(caps: &gst::CapsRef) -> Option<gst::Caps> {
+    let rate = caps.structure(0)?.get::<gst::Fraction>("framerate").ok();
+    if rate.is_some_and(|r| r.numer() > 0 && r.denom() > 0) {
+        return None;
+    }
+    let mut caps = caps.to_owned();
+    caps.make_mut().set("framerate", gst::Fraction::new(30, 1));
+    Some(caps)
+}
+
 /// A video being played, and the stream feeding it.
 pub struct Movie {
     pub video: Video,
@@ -239,6 +250,20 @@ fn build(uri: &str, source: Option<(Arc<dyn stream::Source>, u64)>, speed: f64, 
         .and_then(|bin| bin.by_name("iced_video"))
         .and_then(|sink| sink.downcast::<gstreamer_app::AppSink>().ok())
         .ok_or_else(|| "video: no appsink".to_string())?;
+    // Variable frame rate videos (phones, screen recordings) say 0/1, which
+    // iced_video_player refuses; it only keeps the number, frames follow
+    // their timestamps anyway.
+    if let Some(pad) = video_sink.static_pad("sink") {
+        pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, |_, info| {
+            if let Some(gst::PadProbeData::Event(event)) = &mut info.data
+                && let gst::EventView::Caps(c) = event.view()
+                && let Some(caps) = with_framerate(c.caps())
+            {
+                *event = gst::event::Caps::new(&caps);
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
 
     let video = Video::from_gst_pipeline(pipeline, video_sink, None).map_err(|e| e.to_string())?;
     let mut movie = Movie {
@@ -510,6 +535,7 @@ pub fn video_thumbnail(path: &std::path::Path, info: VideoInfo) -> Result<Thumbn
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn probes_video_length_and_size() {
@@ -539,6 +565,18 @@ mod tests {
         let thumb = video_thumbnail(&sample, big).expect("thumbnail");
         assert_eq!((thumb.width, thumb.height), (320, 180));
         let _ = std::fs::remove_file(&thumb.path);
+    }
+
+    #[test]
+    fn variable_frame_rate_gets_one() {
+        gst::init().unwrap();
+        let caps = |rate: &str| gst::Caps::from_str(&format!("video/x-raw,format=NV12,framerate={rate}")).unwrap();
+        let fixed = with_framerate(&caps("0/1")).expect("replaced");
+        let rate = fixed.structure(0).unwrap().get::<gst::Fraction>("framerate").unwrap();
+        assert_eq!(rate, gst::Fraction::new(30, 1));
+        assert!(with_framerate(&caps("25/1")).is_none(), "real rates stay");
+        let none = gst::Caps::from_str("video/x-raw,format=NV12").unwrap();
+        assert!(with_framerate(&none).is_some());
     }
 
     #[test]
