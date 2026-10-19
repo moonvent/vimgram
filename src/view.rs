@@ -2238,8 +2238,8 @@ fn status_line(app: &App) -> Element<'_, Message> {
             format!("{}/{}", fmt_count(open.cursor + 1), fmt_count(open.msgs.len()))
         }
         _ => app
-            .selected_index()
-            .map(|i| format!("{}/{}", fmt_count(i + 1), fmt_count(app.list.len())))
+            .cursor_row()
+            .map(|i| format!("{}/{}", fmt_count(i + 1), fmt_count(app.rows())))
             .unwrap_or_default(),
     };
 
