@@ -35,6 +35,10 @@ const TICK: Duration = Duration::from_millis(33);
 /// How long the chat list cursor rests on a chat before it opens
 /// (`open_on_select`), so holding j doesn't open every chat on the way.
 const PREVIEW_DELAY: Duration = Duration::from_millis(150);
+/// How long the chat filter rests before the server is searched for it.
+const GLOBAL_DELAY: Duration = Duration::from_millis(350);
+/// Shorter filters only match your chats.
+const GLOBAL_MIN_CHARS: usize = 2;
 const SEEK_SHORT: f64 = 5.0;
 const SEEK_LONG: f64 = 30.0;
 /// A voice message or music left for something else goes on from this
@@ -60,7 +64,7 @@ pub const SPOILER_LINK: &str = "spoiler:";
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes  J/K gt/gT Alt-N folders  \
                     Enter open/play  i insert  q record  r reply  R react  cc/e edit  f forward  v visual  dd delete  \
                     yy/Y copy  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  { } volume  H/L seek  m mute  U leave/join  gc comments  \
-                    / filter chats or search messages  n/N next/prev match  ga attach  gp pinned  gf original/reply  gx link  ^o back  \
+                    / search chats, Telegram or messages  :posts public posts  n/N next/prev match  ga attach  gp pinned  gf original/reply  gx link  ^o back  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
                     :folder  :theme  :autostart  :cleancache  :q";
 
@@ -107,6 +111,21 @@ pub enum Message {
         result: Result<i64, String>,
     },
     ChatsLoaded(ListKey, Result<(), String>),
+    /// The chat filter stayed the same for a moment: search the server.
+    GlobalSearch(String),
+    GlobalFound {
+        query: String,
+        result: Result<tg::Global, String>,
+    },
+    /// A further page of messages found in all chats.
+    GlobalMore {
+        query: String,
+        result: Result<(Vec<Msg>, String), String>,
+    },
+    PostsFound {
+        query: String,
+        result: Result<tg::Posts, String>,
+    },
     /// An inline file (avatar, photo, sticker, thumbnail) finished downloading.
     Downloaded {
         file_id: i32,
@@ -194,6 +213,8 @@ pub enum Message {
     ToggleReaction { msg_id: i64, kind: ReactionKind },
     ClickFolder(usize),
     ClickChat(i64),
+    /// A message found by the chat filter was clicked.
+    ClickHit(usize),
     SelectMsg(i64),
     ClickMedia { msg_id: i64, item: usize },
     /// Click on a bar of a voice message's waveform: play from there.
@@ -309,6 +330,32 @@ pub struct Found {
     pub index: usize,
 }
 
+/// What the chat filter found on the server, below the chats it matches.
+#[derive(Default)]
+pub struct Global {
+    /// The filter these are for.
+    query: String,
+    /// Chats beyond the filtered folder: your other chats, public ones.
+    chats: Vec<i64>,
+    /// Messages in all your chats, newest first.
+    pub msgs: Vec<Msg>,
+    /// Where the next page of `msgs` starts; empty: no more.
+    offset: String,
+    /// Posts of public channels, after Enter.
+    pub posts: Vec<Msg>,
+    pub loading: bool,
+}
+
+impl Global {
+    pub fn hits(&self) -> usize {
+        self.msgs.len() + self.posts.len()
+    }
+
+    pub fn hit(&self, i: usize) -> Option<&Msg> {
+        self.msgs.get(i).or_else(|| self.posts.get(i.checked_sub(self.msgs.len())?))
+    }
+}
+
 /// A destructive action waiting for confirmation.
 #[derive(Debug, Clone)]
 pub enum Confirm {
@@ -368,6 +415,11 @@ impl Chat {
         } else {
             self.positions.insert(key, position.order);
         }
+    }
+
+    /// In one of your chat lists (not just found on the server).
+    pub fn listed(&self) -> bool {
+        !self.positions.is_empty()
     }
 
     fn order(&self, list: ListKey) -> Option<i64> {
@@ -645,6 +697,9 @@ pub struct App {
     scroll_pixels: f32,
     pub cmdline: Input,
     pub filter: String,
+    pub global: Global,
+    /// The cursor of the chat list is on this message of `global`.
+    pub hit: Option<usize>,
     pub pending: Pending,
     pub status: Option<Status>,
     pub theme: Theme,
@@ -761,6 +816,8 @@ impl App {
             scroll_pixels: 0.0,
             cmdline: Input::default(),
             filter: String::new(),
+            global: Global::default(),
+            hit: None,
             pending: Pending::default(),
             status: None,
             theme,
@@ -1052,6 +1109,23 @@ impl App {
         self.list.iter().position(|&c| c == id)
     }
 
+    /// Row of the chat list cursor: a chat, or a found message below them.
+    pub fn cursor_row(&self) -> Option<usize> {
+        match self.hit {
+            Some(i) => Some(self.list.len() + i),
+            None => self.selected_index(),
+        }
+    }
+
+    /// Rows of the chat list: chats, then the messages found.
+    pub fn rows(&self) -> usize {
+        self.list.len() + self.global.hits()
+    }
+
+    fn current_hit(&self) -> Option<&Msg> {
+        self.global.hit(self.hit?)
+    }
+
     /// Size of the message list, which shrinks with the compose box.
     pub fn viewport(&self) -> (f32, f32) {
         let pinned = self.open.as_ref().is_some_and(|o| o.pinned.is_some());
@@ -1124,7 +1198,7 @@ impl App {
     /// With `open_on_select`, open the chat the cursor stopped on.
     fn schedule_preview(&self) -> Task<Message> {
         match self.selected {
-            Some(id) if self.cfg.open_on_select && self.open.as_ref().is_none_or(|o| o.id != id) => {
+            Some(id) if self.cfg.open_on_select && self.hit.is_none() && self.open.as_ref().is_none_or(|o| o.id != id) => {
                 Task::perform(tokio::time::sleep(PREVIEW_DELAY), move |()| Message::PreviewChat(id))
             }
             _ => Task::none(),
@@ -1153,10 +1227,9 @@ impl App {
     fn select_chat(&mut self, chat_id: i64) {
         if !self.list.contains(&chat_id) {
             self.folder = 0;
-            self.filter.clear();
-            self.list_dirty = true;
-            self.refresh_list();
+            self.clear_filter();
         }
+        self.hit = None;
         self.selected = Some(chat_id);
         self.scroll_chats();
     }
@@ -1397,15 +1470,12 @@ impl App {
                 }
                 Task::none()
             }
-            Message::Clip(Ok(Clip::Text(text))) => {
-                self.on_paste(Some(text));
-                Task::none()
-            }
+            Message::Clip(Ok(Clip::Text(text))) => self.on_paste(Some(text)),
             Message::Clip(Ok(Clip::Files(paths))) => {
                 match self.paste {
                     PasteTarget::Cmdline => {
                         let text: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-                        self.on_paste(Some(text.join(" ")));
+                        return self.on_paste(Some(text.join(" ")));
                     }
                     PasteTarget::Input(_) => self.attach(paths),
                 }
@@ -1489,15 +1559,28 @@ impl App {
                 self.tall_max = Some((viewport.content_bounds().height - viewport.bounds().height).max(0.0));
                 Task::none()
             }
-            Message::Paste(text) => {
-                self.on_paste(text);
-                Task::none()
-            }
+            Message::Paste(text) => self.on_paste(text),
             Message::ClickFolder(index) => self.switch_folder(index),
             Message::ClickChat(id) => {
                 self.selected = Some(id);
+                self.hit = None;
                 self.focus = Focus::Chats;
                 self.act(Action::Open)
+            }
+            Message::ClickHit(i) => {
+                self.hit = Some(i);
+                self.focus = Focus::Chats;
+                self.act(Action::Open)
+            }
+            Message::GlobalSearch(query) => self.search_global(query),
+            Message::GlobalFound { query, result } => self.on_global(query, result),
+            Message::GlobalMore { query, result } => {
+                self.on_more_hits(query, result);
+                Task::none()
+            }
+            Message::PostsFound { query, result } => {
+                self.on_posts(query, result);
+                Task::none()
             }
             Message::SelectMsg(id) => {
                 self.select_message(id);
@@ -1547,7 +1630,7 @@ impl App {
                 }
             },
             Message::PreviewChat(id) => {
-                let still_here = self.selected == Some(id) && self.focus == Focus::Chats;
+                let still_here = self.selected == Some(id) && self.hit.is_none() && self.focus == Focus::Chats;
                 if !still_here || self.forward.is_some() || self.auth != Auth::Ready || self.open.as_ref().is_some_and(|o| o.id == id) {
                     return Task::none();
                 }
@@ -2046,17 +2129,161 @@ impl App {
             .collect();
         chats.sort_unstable_by_key(|&(order, _)| std::cmp::Reverse(order));
         self.list = chats.into_iter().map(|(_, id)| id).collect();
-        if self.selected_index().is_none() {
+        if !self.filter.is_empty() {
+            for &id in &self.global.chats {
+                if self.chats.contains_key(&id) && !self.list.contains(&id) {
+                    self.list.push(id);
+                }
+            }
+        }
+        if self.hit.is_none() && self.selected_index().is_none() {
             self.selected = self.list.first().copied();
         }
         self.scroll_chats();
     }
 
-    fn set_filter(&mut self, filter: String) {
+    /// Filter the chat list; a while later the server is searched too.
+    fn set_filter(&mut self, filter: String) -> Task<Message> {
         self.filter = filter;
         self.list_dirty = true;
         self.selected = None;
+        self.hit = None;
+        let query = self.filter.trim().to_owned();
+        if self.global.query != query {
+            self.global = Global::default();
+        }
         self.refresh_list();
+        if query.chars().count() < GLOBAL_MIN_CHARS || self.forward.is_some() || self.auth != Auth::Ready {
+            return Task::none();
+        }
+        Task::perform(tokio::time::sleep(GLOBAL_DELAY), move |()| Message::GlobalSearch(query.clone()))
+    }
+
+    fn clear_filter(&mut self) {
+        let _ = self.set_filter(String::new());
+    }
+
+    fn search_global(&mut self, query: String) -> Task<Message> {
+        if self.filter.trim() != query || self.global.query == query {
+            return Task::none();
+        }
+        self.global = Global {
+            query: query.clone(),
+            loading: true,
+            ..Default::default()
+        };
+        Task::perform(tg::search_global(query.clone()), move |result| Message::GlobalFound {
+            query: query.clone(),
+            result,
+        })
+    }
+
+    /// `:posts [query]`: posts of public channels too, below the other
+    /// results. Only on request: Telegram allows a few free a day.
+    fn search_posts(&mut self, arg: Option<&str>) -> Task<Message> {
+        if let Some(query) = arg.filter(|q| q.trim() != self.filter.trim()) {
+            let _ = self.set_filter(query.to_owned());
+        }
+        let query = self.filter.trim().to_owned();
+        if query.chars().count() < GLOBAL_MIN_CHARS || self.forward.is_some() {
+            self.error("Search public posts for what? /query, then :posts (or :posts query)");
+            return Task::none();
+        }
+        self.focus = Focus::Chats;
+        let global = self.search_global(query.clone());
+        self.info(format!("Searching public posts for {query}…"));
+        let posts = Task::perform(tg::search_posts(query.clone()), move |result| Message::PostsFound {
+            query: query.clone(),
+            result,
+        });
+        Task::batch([global, posts])
+    }
+
+    /// Found messages not shown yet.
+    fn new_hits(&self, msgs: Vec<Msg>) -> Vec<Msg> {
+        let shown = |m: &Msg| {
+            let same = |x: &Msg| x.chat_id == m.chat_id && x.id == m.id;
+            self.global.msgs.iter().any(same) || self.global.posts.iter().any(same)
+        };
+        msgs.into_iter().filter(|m| !m.scheduled && !shown(m)).collect()
+    }
+
+    fn on_global(&mut self, query: String, result: Result<tg::Global, String>) -> Task<Message> {
+        if self.global.query != query {
+            return Task::none();
+        }
+        self.global.loading = false;
+        match result {
+            Ok(found) => {
+                self.global.chats = found.chats;
+                self.global.msgs = self.new_hits(found.msgs);
+                self.global.offset = found.offset;
+                // The cursor on a post stays on it.
+                if let Some(hit) = self.hit.as_mut() {
+                    *hit += self.global.msgs.len();
+                }
+                self.list_dirty = true;
+                self.refresh_list();
+            }
+            Err(e) => self.error(format!("Search failed: {e}")),
+        }
+        Task::none()
+    }
+
+    /// The cursor came near the last message found: the next page.
+    fn more_hits(&mut self) -> Task<Message> {
+        let global = &mut self.global;
+        if global.loading || global.offset.is_empty() {
+            return Task::none();
+        }
+        global.loading = true;
+        let (query, offset) = (global.query.clone(), global.offset.clone());
+        Task::perform(tg::search_messages(query.clone(), offset), move |result| Message::GlobalMore {
+            query: query.clone(),
+            result,
+        })
+    }
+
+    fn on_more_hits(&mut self, query: String, result: Result<(Vec<Msg>, String), String>) {
+        if self.global.query != query {
+            return;
+        }
+        self.global.loading = false;
+        match result {
+            Ok((msgs, offset)) => {
+                let msgs = self.new_hits(msgs);
+                if let Some(hit) = self.hit.as_mut().filter(|h| **h >= self.global.msgs.len()) {
+                    *hit += msgs.len();
+                }
+                self.global.msgs.extend(msgs);
+                self.global.offset = offset;
+            }
+            Err(e) => {
+                self.global.offset.clear();
+                self.error(format!("Search failed: {e}"));
+            }
+        }
+    }
+
+    fn on_posts(&mut self, query: String, result: Result<tg::Posts, String>) {
+        if self.filter.trim() != query {
+            return;
+        }
+        match result {
+            Ok(posts) if posts.exceeded => {
+                let hours = (posts.next_in + 3599) / 3600;
+                self.error(format!("No free searches of public posts left today (next in {hours} h)"));
+            }
+            Ok(posts) => {
+                let found = self.new_hits(posts.msgs);
+                self.info(match posts.left {
+                    Some(left) => format!("{} public posts found; {left} free searches left today", tg::fmt_count(found.len())),
+                    None => format!("{} public posts found", tg::fmt_count(found.len())),
+                });
+                self.global.posts.extend(found);
+            }
+            Err(e) => self.error(format!("Public post search failed: {e}")),
+        }
     }
 
     fn switch_folder(&mut self, index: usize) -> Task<Message> {
@@ -2319,9 +2546,11 @@ impl App {
         if self.auth != Auth::Ready {
             return Task::none();
         }
+        let hits = (0..self.global.hits()).filter_map(|i| self.global.hit(i)).map(|m| &m.chat_id);
         let mut wanted: Vec<(i32, Kind, Size, i32)> = self
             .list
             .iter()
+            .chain(hits)
             .skip(self.chat_top)
             .take(view::chat_rows(self.size))
             .filter_map(|id| self.chats.get(id)?.avatar)
@@ -3387,7 +3616,7 @@ impl App {
             if let Some(entry) = entry {
                 self.cmdline.set(&entry);
                 if search && !self.search_messages {
-                    self.set_filter(entry);
+                    return self.set_filter(entry);
                 }
             }
             return Task::none();
@@ -3415,7 +3644,8 @@ impl App {
                     self.search_chat(line)
                 } else if search {
                     self.focus = Focus::Chats;
-                    Task::none()
+                    // Typed too fast for the timer: search the server now.
+                    self.search_global(self.filter.trim().to_owned())
                 } else {
                     self.run_command(&line)
                 }
@@ -3424,14 +3654,11 @@ impl App {
                 self.cmdline.clear();
                 self.mode = Mode::Normal;
                 if search && !self.search_messages {
-                    self.set_filter(String::new());
+                    self.clear_filter();
                 }
                 Task::none()
             }
-            Edit::Changed if search && !self.search_messages => {
-                self.set_filter(self.cmdline.as_str().to_owned());
-                Task::none()
-            }
+            Edit::Changed if search && !self.search_messages => self.set_filter(self.cmdline.as_str().to_owned()),
             Edit::Paste => self.read_clipboard(PasteTarget::Cmdline),
             Edit::Changed | Edit::Ignored => Task::none(),
         }
@@ -3502,23 +3729,23 @@ impl App {
         Task::perform(clipboard::read(), Message::Clip)
     }
 
-    fn on_paste(&mut self, text: Option<String>) {
+    fn on_paste(&mut self, text: Option<String>) -> Task<Message> {
         let Some(text) = text.filter(|t| !t.is_empty()) else {
             self.error("Clipboard is empty");
-            return;
+            return Task::none();
         };
         let text = text.replace("\r\n", "\n");
         match self.paste {
             PasteTarget::Cmdline => {
                 self.cmdline.insert(&text.replace('\n', " "));
-                if self.mode == Mode::Search {
-                    self.set_filter(self.cmdline.as_str().to_owned());
+                if self.mode == Mode::Search && !self.search_messages {
+                    return self.set_filter(self.cmdline.as_str().to_owned());
                 }
             }
             PasteTarget::Input(position) => {
                 if self.auth == Auth::Ready && self.open.is_none() {
                     self.error("Open a chat first (Enter)");
-                    return;
+                    return Task::none();
                 }
                 match position {
                     Some(true) => self.input.home(),
@@ -3529,6 +3756,7 @@ impl App {
                 self.scroll_messages();
             }
         }
+        Task::none()
     }
 
     fn run_command(&mut self, line: &str) -> Task<Message> {
@@ -3541,7 +3769,8 @@ impl App {
             ("", _) => {}
             ("q" | "q!" | "qa" | "qa!" | "quit" | "wq" | "x", _) => return self.handle(Message::Quit),
             ("h" | "help", _) => self.info(HELP),
-            ("noh" | "nohl" | "nohlsearch", _) => self.set_filter(String::new()),
+            ("noh" | "nohl" | "nohlsearch", _) => self.clear_filter(),
+            ("posts", arg) => return self.search_posts(arg),
             ("theme" | "colorscheme" | "colo", None) => {
                 let names: Vec<String> = Theme::ALL.iter().map(Theme::to_string).collect();
                 self.info(names.join(", "));
@@ -3700,6 +3929,12 @@ impl App {
             Action::Open if self.focus == Focus::Folders => {
                 self.focus = Focus::Chats;
                 Task::none()
+            }
+            Action::Open if self.focus == Focus::Chats && self.hit.is_some() => {
+                let Some((chat_id, msg_id)) = self.current_hit().map(|m| (m.chat_id, m.id)) else {
+                    return Task::none();
+                };
+                self.open_chat_at(chat_id, Some(msg_id))
             }
             Action::Open => match (self.focus, self.selected) {
                 (Focus::Chats, Some(id)) if self.forward.is_some() => self.forward_to(id, SendOptions::default()),
@@ -3974,7 +4209,7 @@ impl App {
                 cancelled |= !matches!(self.compose, Compose::New);
                 self.compose = Compose::New;
                 if !self.filter.is_empty() {
-                    self.set_filter(String::new());
+                    self.clear_filter();
                     cancelled = true;
                 }
                 if !cancelled && self.open.as_ref().is_some_and(|o| o.tag.is_some()) {
@@ -4209,7 +4444,7 @@ impl App {
         match (self.focus, &self.open) {
             (Focus::Messages, Some(open)) => open.cursor,
             (Focus::Folders, _) => self.folder,
-            _ => self.selected_index().unwrap_or(0),
+            _ => self.cursor_row().unwrap_or(0),
         }
     }
 
@@ -4294,10 +4529,21 @@ impl App {
                 return scroll;
             }
             _ => {
-                if self.list.is_empty() {
+                if self.rows() == 0 {
                     return Task::none();
                 }
-                let index = index.min(self.list.len() - 1);
+                let index = index.min(self.rows() - 1);
+                if let Some(hit) = index.checked_sub(self.list.len()) {
+                    // m, U and yy act on the chat of the message.
+                    self.hit = Some(hit);
+                    self.selected = self.current_hit().map(|m| m.chat_id);
+                    self.scroll_chats();
+                    if hit + PREFETCH >= self.global.msgs.len() {
+                        return self.more_hits();
+                    }
+                    return Task::none();
+                }
+                self.hit = None;
                 self.selected = Some(self.list[index]);
                 self.scroll_chats();
                 let preview = self.schedule_preview();
@@ -4311,13 +4557,13 @@ impl App {
 
     fn scroll_chats(&mut self) {
         let rows = view::chat_rows(self.size);
-        let index = self.selected_index().unwrap_or(0);
+        let index = self.cursor_row().unwrap_or(0);
         if index < self.chat_top {
             self.chat_top = index;
         } else if index >= self.chat_top + rows {
             self.chat_top = index + 1 - rows;
         }
-        self.chat_top = self.chat_top.min(self.list.len().saturating_sub(rows));
+        self.chat_top = self.chat_top.min(self.rows().saturating_sub(rows));
     }
 
     fn scroll_messages(&mut self) {
@@ -4707,5 +4953,17 @@ mod tests {
         assert_eq!(find_folder(&folders, "личка"), Some(folders.len() - 1));
         assert_eq!(find_folder(&folders, " ЛИЧКА "), Some(folders.len() - 1));
         assert_eq!(find_folder(&folders, "work"), None);
+    }
+
+    #[test]
+    fn found_messages_then_posts() {
+        let global = Global {
+            msgs: vec![msg(1, 0), msg(2, 0)],
+            posts: vec![msg(7, 0)],
+            ..Default::default()
+        };
+        assert_eq!(global.hits(), 3);
+        let ids: Vec<i64> = (0..4).filter_map(|i| global.hit(i)).map(|m| m.id).collect();
+        assert_eq!(ids, [1, 2, 7]);
     }
 }

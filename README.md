@@ -107,7 +107,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `}` / `{`, `:volume 70` | volume up / down by 10% (or set it); one volume for videos, voice messages and music, remembered |
 | `H` / `L` | seek voice message or music −5s / +5s; with the mouse: click on a voice message's waveform, drag the progress of music or of a video |
 | `Esc`, `Ctrl-[` | normal mode; cancel reply, edit, forward, filter, attachment; with nothing to cancel asks to quit (`y`/`Enter`) |
-| `/` | chat list: filter chats; message pane: search messages (`/#tag`: only the messages with that hashtag, like clicking it) |
+| `/` | chat list: filter chats, and search Telegram: your other chats, public channels, groups and users, then the messages of all your chats below them (`Enter` on one opens its chat there); message pane: search messages (`/#tag`: only the messages with that hashtag, like clicking it) |
 | `n` / `N` | next (older) / previous (newer) search match |
 | `G`, the ↓ button | back to the latest messages (also after a search or date jump) |
 | `:q` | quit |
@@ -115,6 +115,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `:silent`, `Alt-Enter` in insert mode | send the composed message without sound |
 | `:later 21:00` (`+30m`, `+2h`, `01.11 09:00`) | schedule the composed message |
 | `:export [path]` | export the chat to PDF (default `~/Documents/vimgram/`) |
+| `:posts [query]` | also find posts of public channels for the chat filter (or `query`), below the other results; Telegram allows a few free searches a day, none paid |
 | `:search word`, `:folder name`, `:theme name`, `:speed 1.5`, `:42` | commands |
 | `:autostart [on\|off]` | start with the session, in the tray (off by default) |
 | `:cleancache [days]` | delete cached media unused for that many days (default 7; also done weekly) |
@@ -181,7 +182,6 @@ build without checking for changes.
 
 ## Roadmap
 
-- Global search: chats (yours, on the server, public) and messages across all chats
 - Windows: tray icon, notifications under vimgram's own name that are withdrawn
   once read, an installer with a Start menu entry, a slimmer GStreamer bundle
 - Linux release builds (TDLib next to the binary, `$ORIGIN` rpath)

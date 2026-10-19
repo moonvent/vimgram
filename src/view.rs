@@ -658,7 +658,15 @@ fn chat_list(app: &App) -> Element<'_, Message> {
     } else if app.filter.is_empty() {
         format!("{folder}  {}", fmt_count(app.list.len()))
     } else {
-        format!("{folder} /{}  {}", app.filter, fmt_count(app.list.len()))
+        let mut title = format!("/{}  {} chats", app.filter, fmt_count(app.list.len()));
+        let hits = app.global.hits();
+        if hits > 0 {
+            title += &format!(" · {} messages", fmt_count(hits));
+        }
+        if app.global.loading {
+            title += " · searching…";
+        }
+        title
     };
     let forwarding = app.forward.is_some();
     let header = container(text(title).size(13).style(move |t: &Theme| {
@@ -668,13 +676,16 @@ fn chat_list(app: &App) -> Element<'_, Message> {
     .padding([0, 12])
     .align_y(Alignment::Center);
 
-    let rows = app
+    let chats = app
         .list
         .iter()
-        .skip(app.chat_top)
-        .take(chat_rows(app.size))
         .filter_map(|id| app.chats.get(id))
-        .map(|chat| chat_row(app, chat, app.selected == Some(chat.id), focused));
+        .map(|chat| chat_row(app, chat, app.hit.is_none() && app.selected == Some(chat.id), focused));
+    // Messages found by the filter, below the chats.
+    let hits = (0..app.global.hits())
+        .filter_map(|i| Some((i, app.global.hit(i)?)))
+        .map(|(i, m)| hit_row(app, m, i, app.hit == Some(i), focused));
+    let rows = chats.chain(hits).skip(app.chat_top).take(chat_rows(app.size));
 
     mouse_area(
         column![header, Column::with_children(rows)]
@@ -733,18 +744,33 @@ fn avatar_image<'a>(app: &'a App, file: Option<i32>, id: i64, name: &str, size: 
         .into()
 }
 
+/// A message on the two preview lines of a row.
+fn preview_of(m: &Msg, sender: Option<&str>) -> String {
+    // Newlines would waste the two preview lines.
+    let summary: String = m.summary().split_whitespace().collect::<Vec<_>>().join(" ");
+    let line: String = summary.chars().take(200).collect();
+    match sender {
+        _ if m.outgoing => format!("You: {line}"),
+        Some(name) if !name.is_empty() => format!("{name}: {line}"),
+        _ => line,
+    }
+}
+
+/// A chat not in your lists, found on the server.
+fn chat_kind_label(chat: &Chat) -> &'static str {
+    match chat.kind {
+        ChatKind::Private(_) => "User",
+        ChatKind::Group => "Group",
+        ChatKind::Channel => "Channel",
+    }
+}
+
 fn chat_row<'a>(app: &'a App, chat: &'a Chat, selected: bool, focused: bool) -> Element<'a, Message> {
     let time = chat.last.as_ref().map(|m| fmt_time(m.date, true)).unwrap_or_default();
-    let preview = chat
-        .last
-        .as_ref()
-        .map(|m| {
-            // Newlines would waste the two preview lines.
-            let summary: String = m.summary().split_whitespace().collect::<Vec<_>>().join(" ");
-            let line: String = summary.chars().take(200).collect();
-            if m.outgoing { format!("You: {line}") } else { line }
-        })
-        .unwrap_or_default();
+    let mut preview = chat.last.as_ref().map(|m| preview_of(m, None)).unwrap_or_default();
+    if !chat.listed() {
+        preview = format!("{} · not in your chats   {preview}", chat_kind_label(chat));
+    }
 
     // Text is clipped to its own column so it never runs under the time.
     let mut title_line = row![
@@ -762,26 +788,55 @@ fn chat_row<'a>(app: &'a App, chat: &'a Chat, selected: bool, focused: bool) -> 
         title_line = title_line.push(text("✓").size(15).style(primary_text));
     }
     let title_line = title_line.push(text(time).size(12).style(muted_text));
+    let preview = emoji_text(&preview).style(muted_text);
+    list_row(avatar(app, chat), title_line, preview, chat.unread, selected, focused, Message::ClickChat(chat.id))
+}
 
+/// A message found by the chat filter: its chat, when, and the message
+/// itself (in the text color, unlike a chat's last message).
+fn hit_row<'a>(app: &'a App, m: &'a Msg, i: usize, selected: bool, focused: bool) -> Element<'a, Message> {
+    // TDLib knows the chat, but its update may come a moment later.
+    let chat = app.chats.get(&m.chat_id);
+    let title = chat.map_or("", |c| c.title.as_str());
+    let title_line = row![
+        container(emoji_text(title).size(TEXT).wrapping(Wrapping::None))
+            .width(Length::Fill)
+            .clip(true),
+        text(fmt_time(m.date, true)).size(12).style(muted_text),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    let sender = chat.is_some_and(|c| c.kind == ChatKind::Group).then(|| app.sender_name(m.sender));
+    let preview = emoji_text(&preview_of(m, sender));
+    let avatar = avatar_image(app, chat.and_then(|c| c.avatar), m.chat_id, title, AVATAR);
+    list_row(avatar, title_line, preview, 0, selected, focused, Message::ClickHit(i))
+}
+
+/// A row of the chat list: avatar, title line, two preview lines.
+#[allow(clippy::too_many_arguments)]
+fn list_row<'a>(
+    avatar: Element<'a, Message>,
+    title_line: Row<'a, Message>,
+    preview: text::Rich<'a, (), Message>,
+    unread: i32,
+    selected: bool,
+    focused: bool,
+    on_press: Message,
+) -> Element<'a, Message> {
     let mut preview_line = row![
-        container(
-            emoji_text(&preview)
-                .size(13)
-                .wrapping(Wrapping::WordOrGlyph)
-                .style(muted_text)
-        )
-        .width(Length::Fill)
-        .height(PREVIEW_H)
-        .clip(true)
+        container(preview.size(13).wrapping(Wrapping::WordOrGlyph))
+            .width(Length::Fill)
+            .height(PREVIEW_H)
+            .clip(true)
     ]
     .spacing(8);
-    if chat.unread > 0 {
-        preview_line = preview_line.push(badge(fmt_count(chat.unread)));
+    if unread > 0 {
+        preview_line = preview_line.push(badge(fmt_count(unread)));
     }
 
     mouse_area(
         container(
-            row![avatar(app, chat), column![title_line, preview_line].spacing(4)]
+            row![avatar, column![title_line, preview_line].spacing(4)]
                 .spacing(10)
                 .align_y(Alignment::Center),
         )
@@ -791,7 +846,7 @@ fn chat_row<'a>(app: &'a App, chat: &'a Chat, selected: bool, focused: bool) -> 
         .clip(true)
         .style(move |t: &Theme| selection_style(t, selected, focused)),
     )
-    .on_press(Message::ClickChat(chat.id))
+    .on_press(on_press)
     .interaction(Interaction::Pointer)
     .into()
 }

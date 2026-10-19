@@ -325,6 +325,78 @@ pub async fn search(chat_id: i64, query: String) -> Res<(Vec<i64>, i32)> {
     Ok((found.messages.iter().map(|m| m.id).collect(), found.total_count))
 }
 
+/// What the chat filter finds beyond the loaded lists.
+#[derive(Debug, Clone, Default)]
+pub struct Global {
+    /// Your chats matching by title or username (also ones not loaded
+    /// yet), then public chats, channels and users.
+    pub chats: Vec<i64>,
+    /// Messages in all your chats, newest first.
+    pub msgs: Vec<Msg>,
+    /// Where the next page of `msgs` starts; empty: no more.
+    pub offset: String,
+}
+
+/// Chats and messages matching `query` everywhere. A part that fails
+/// (e.g. the server refuses a short query) is just left out.
+pub async fn search_global(query: String) -> Res<Global> {
+    let ids = |chats: Result<enums::Chats, types::Error>| match chats {
+        Ok(enums::Chats::Chats(c)) => c.chat_ids,
+        Err(_) => Vec::new(),
+    };
+    let (known, server, public, msgs) = futures::join!(
+        functions::search_chats(query.clone(), 50, client()),
+        functions::search_chats_on_server(query.clone(), 50, client()),
+        functions::search_public_chats(query.clone(), client()),
+        search_messages(query.clone(), String::new()),
+    );
+    let mut chats = Vec::new();
+    for id in [ids(known), ids(server), ids(public)].into_iter().flatten() {
+        if !chats.contains(&id) {
+            chats.push(id);
+        }
+    }
+    let (msgs, offset) = msgs.unwrap_or_default();
+    Ok(Global { chats, msgs, offset })
+}
+
+/// A page of messages matching `query` in all chats, newest first, and
+/// where the next page starts (empty: none).
+pub async fn search_messages(query: String, offset: String) -> Res<(Vec<Msg>, String)> {
+    let enums::FoundMessages::FoundMessages(found) =
+        functions::search_messages(None, query, offset, 50, None, None, 0, 0, client())
+            .await
+            .map_err(err)?;
+    Ok((found.messages.into_iter().map(Msg::from).collect(), found.next_offset))
+}
+
+/// Posts of public channels matching `query`. Telegram allows a few such
+/// searches a day for free; this one never pays.
+#[derive(Debug, Clone)]
+pub struct Posts {
+    pub msgs: Vec<Msg>,
+    /// The free searches of today are used up.
+    pub exceeded: bool,
+    /// Free searches left today, when Telegram says.
+    pub left: Option<i32>,
+    /// Seconds until the next free search, when there is none left.
+    pub next_in: i32,
+}
+
+pub async fn search_posts(query: String) -> Res<Posts> {
+    let enums::FoundPublicPosts::FoundPublicPosts(found) =
+        functions::search_public_posts(query, String::new(), 50, 0, client())
+            .await
+            .map_err(err)?;
+    let limits = found.search_limits;
+    Ok(Posts {
+        msgs: found.messages.into_iter().map(Msg::from).collect(),
+        exceeded: found.are_limits_exceeded,
+        left: limits.as_ref().map(|l| l.remaining_free_query_count),
+        next_in: limits.as_ref().map_or(0, |l| l.next_free_query_in),
+    })
+}
+
 /// Messages with hashtag `tag` older than `from_id` (0: the newest ones),
 /// oldest first.
 pub async fn tagged(chat_id: i64, tag: String, from_id: i64, limit: i32) -> Res<Vec<Msg>> {
