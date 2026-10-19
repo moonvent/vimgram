@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Local};
 
 use crate::archive::Archive;
+use crate::config;
 use crate::tg::{self, Msg, Sender};
 
 /// Fetch the whole history of a chat, oldest first, including messages
@@ -42,7 +43,7 @@ fn escape(text: &str) -> String {
 
 fn date(unix: i32) -> String {
     DateTime::from_timestamp(i64::from(unix), 0)
-        .map(|d| d.with_timezone(&Local).format("%d.%m.%Y %H:%M").to_string())
+        .map(|d| d.with_timezone(&Local).format(&format!("%d.%m.%Y {}", config::hm())).to_string())
         .unwrap_or_default()
 }
 
@@ -63,7 +64,7 @@ pub fn html(title: &str, msgs: &[Msg], names: &HashMap<Sender, String>) -> Strin
         "<h1>{}</h1><div class=\"meta\">{} messages, exported {}</div>",
         escape(title),
         crate::tg::fmt_count(msgs.len()),
-        Local::now().format("%d.%m.%Y %H:%M")
+        Local::now().format(&format!("%d.%m.%Y {}", config::hm()))
     ));
     for m in msgs {
         let who = names.get(&m.sender).map_or("…", String::as_str);

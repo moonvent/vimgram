@@ -769,6 +769,7 @@ impl App {
     pub fn new(cfg: Config, hidden: bool) -> (Self, Task<Message>) {
         let theme = find_theme(&cfg.theme).unwrap_or(Theme::TokyoNight);
         let viewer_side = cfg.viewer == config::ViewerMode::Side;
+        config::set_clock(cfg.clock);
         clipboard::clean_old_pastes();
         let mut app = App {
             cfg,

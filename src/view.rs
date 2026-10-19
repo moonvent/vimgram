@@ -13,6 +13,7 @@ use iced::{Alignment, Color, ContentFit, Element, Font, Length, Size, Theme, fon
 use iced_video_player::VideoPlayer;
 
 use crate::app::{App, Auth, Chat, Compose, Confirm, Focus, Message, Pane, COMPOSE_ID, SPOILER_LINK, TALL_ID, VideoPlayback, VoicePlayback};
+use crate::config;
 use crate::emoji::{self, Picker};
 use crate::fonts::{self, EMOJI};
 use crate::media::Loaded;
@@ -522,24 +523,24 @@ fn fmt_time(date: i32, short: bool) -> String {
     };
     let local = utc.with_timezone(&Local);
     if local.date_naive() == Local::now().date_naive() {
-        local.format("%H:%M").to_string()
+        local.format(config::hm()).to_string()
     } else if short {
         local.format("%d.%m.%y").to_string()
     } else {
-        local.format("%d.%m.%y %H:%M").to_string()
+        local.format(&format!("%d.%m.%y {}", config::hm())).to_string()
     }
 }
 
 pub fn fmt_datetime(unix: i32) -> String {
     DateTime::from_timestamp(i64::from(unix), 0)
-        .map(|d| d.with_timezone(&Local).format("%d.%m.%Y %H:%M").to_string())
+        .map(|d| d.with_timezone(&Local).format(&format!("%d.%m.%Y {}", config::hm())).to_string())
         .unwrap_or_default()
 }
 
 /// Full date for the hover tooltip: "Thursday, 16 October 2026, 19:42:07".
 fn fmt_full_date(unix: i32) -> String {
     DateTime::from_timestamp(i64::from(unix), 0)
-        .map(|d| d.with_timezone(&Local).format("%A, %-d %B %Y, %H:%M:%S").to_string())
+        .map(|d| d.with_timezone(&Local).format(&format!("%A, %-d %B %Y, {}", config::hms())).to_string())
         .unwrap_or_default()
 }
 
@@ -553,9 +554,9 @@ pub fn fmt_presence(presence: Presence) -> String {
             let local = utc.with_timezone(&Local);
             let today = Local::now().date_naive();
             if local.date_naive() == today {
-                format!("last seen today at {}", local.format("%H:%M"))
+                format!("last seen today at {}", local.format(config::hm()))
             } else if today.pred_opt() == Some(local.date_naive()) {
-                format!("last seen yesterday at {}", local.format("%H:%M"))
+                format!("last seen yesterday at {}", local.format(config::hm()))
             } else {
                 format!("last seen {}", local.format("%d.%m.%y"))
             }
