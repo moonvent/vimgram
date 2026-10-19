@@ -92,7 +92,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `v` | Visual: select messages with `j`/`k`/`gg`/`G`, then `f` forward, `y` copy their text, `d` delete; `v`/`Esc` ends it |
 | `dd` | delete message: `y` for everyone, `m` only for me |
 | `ga`, `:attach [path]` | attach photos, videos or files (system file picker without a path); `Enter` sends, the text is the caption |
-| `gp` | jump to the pinned message |
+| `gp`, click on the pinned bar, `:pin` | jump to the pinned message the bar shows (the newest one above the cursor; `3 / 5` on the right counts them, the oldest is 1); `gp` again goes to the one before it, round to the newest; after it `n` / `N` go to the older / newer pinned messages |
 | `gf`, click on the reply quote or "Forwarded from" | go to the original of a forwarded message (channel posts and Saved Messages say where it is; otherwise its author's chat), or to the message replied to |
 | `gx`, `2gx`, click on a link | open the (n-th) link of the message: t.me links and @mentions open here, at the post; web and e-mail links in the browser; a #hashtag shows only the chat's messages with it (`Esc` shows all again, at the message under the cursor) |
 | `gc`, click on "💬 N comments" | the comments of a channel post: `i` comments, `r` answers a comment, `Esc` (or `Ctrl-o`) goes back to the post |
@@ -110,7 +110,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `H` / `L` | seek voice message or music −5s / +5s; with the mouse: click on a voice message's waveform, drag the progress of music or of a video |
 | `Esc`, `Ctrl-[` | normal mode; cancel reply, edit, forward, filter, attachment; with nothing to cancel asks to quit (`y`/`Enter`) |
 | `/` | chat list: filter chats, and search Telegram: your other chats, public channels, groups and users, then the messages of all your chats below them (`Enter` on one opens its chat there); message pane: search messages (`/#tag`: only the messages with that hashtag, like clicking it) |
-| `n` / `N` | next (older) / previous (newer) search match |
+| `n` / `N` | next (older) / previous (newer) search match, or pinned message after `gp` |
 | `G`, the ↓ button | back to the latest messages (also after a search or date jump) |
 | `:q` | quit |
 | `:date 01.05.2024` (`01.05`, `2024-05-01`, `yesterday`) | jump to a day |

@@ -1097,8 +1097,8 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
         pane = pane.push(bar);
     }
     let mut pane = pane.push(header).push(rule::horizontal(1));
-    if let Some(pinned) = &open.pinned {
-        pane = pane.push(pinned_bar(pinned)).push(rule::horizontal(1));
+    if let Some((index, pinned)) = open.shown_pin() {
+        pane = pane.push(pinned_bar(pinned, open.pins.len() - index, open.pins.len())).push(rule::horizontal(1));
     }
     let messages: Element<_> = mouse_area(messages)
         .on_scroll(|delta| Message::Scroll(Pane::Messages, delta))
@@ -1261,15 +1261,21 @@ fn emoji_panel<'a>(app: &'a App, picker: &'a Picker) -> Element<'a, Message> {
     .into()
 }
 
-fn pinned_bar(pinned: &Msg) -> Element<'_, Message> {
+/// The pinned message `number` (the oldest is 1) of `total`.
+fn pinned_bar(pinned: &Msg, number: usize, total: usize) -> Element<'_, Message> {
     let summary: String = pinned.summary().split_whitespace().collect::<Vec<_>>().join(" ");
     let summary: String = summary.chars().take(400).collect();
+    let (title, counter) = if total > 1 {
+        (format!("Pinned message #{number}   gp, then n/N"), format!("{number} / {total}"))
+    } else {
+        ("Pinned message   gp".to_owned(), String::new())
+    };
     mouse_area(
         container(
             row![
                 text("📌").size(16),
                 column![
-                    text("Pinned message   gp").size(11).style(primary_text),
+                    text(title).size(11).style(primary_text),
                     // Two lines at most, wrapped within the pane.
                     container(emoji_text(&summary).size(13).wrapping(Wrapping::WordOrGlyph).width(Length::Fill))
                         .width(Length::Fill)
@@ -1278,6 +1284,7 @@ fn pinned_bar(pinned: &Msg) -> Element<'_, Message> {
                 ]
                 .width(Length::Fill)
                 .spacing(1),
+                text(counter).size(12).style(muted_text),
             ]
             .width(Length::Fill)
             .spacing(10)

@@ -64,7 +64,7 @@ pub const SPOILER_LINK: &str = "spoiler:";
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes  J/K gt/gT Alt-N folders  \
                     Enter open/play  i insert  q record  r reply  R react  cc/e edit  f forward  v visual  dd delete  \
                     yy/Y copy  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  { } volume  H/L seek  m mute  U leave/join  gc comments  \
-                    / search chats, Telegram or messages  :posts public posts  n/N next/prev match  ga attach  gp pinned  gf original/reply  gx link  ^o back  \
+                    / search chats, Telegram or messages  :posts public posts  n/N next/prev match or pinned  ga attach  gp pinned  gf original/reply  gx link  ^o back  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
                     :folder  :theme  :autostart  :cleancache  :q";
 
@@ -151,7 +151,7 @@ pub enum Message {
     },
     Pinned {
         chat_id: i64,
-        result: Result<Option<Msg>, String>,
+        result: Result<Vec<Msg>, String>,
     },
     JumpPinned,
     Picked(Vec<PathBuf>),
@@ -323,9 +323,11 @@ pub struct Forward {
     draft: Input,
 }
 
-/// Results of `/` in the message pane.
+/// Results of `/` in the message pane, or the pinned messages (`gp`).
 pub struct Found {
     pub query: String,
+    /// The pinned messages, not a search.
+    pub pins: bool,
     /// Matching message ids, newest first.
     pub ids: Vec<i64>,
     pub total: i32,
@@ -447,7 +449,8 @@ pub struct OpenChat {
     pub at_latest: bool,
     /// Total number of messages in the chat.
     pub total: Option<i32>,
-    pub pinned: Option<Msg>,
+    /// Pinned messages, newest first.
+    pub pins: Vec<Msg>,
     /// Opened by moving through the chat list (`open_on_select`): nothing
     /// is read until the message pane gets focus.
     pub preview: bool,
@@ -493,7 +496,7 @@ impl OpenChat {
             exhausted: false,
             at_latest: true,
             total: None,
-            pinned: None,
+            pins: Vec::new(),
             preview: false,
             tag: None,
             thread: None,
@@ -534,6 +537,20 @@ impl OpenChat {
 
     pub fn current(&self) -> Option<&Msg> {
         self.msgs.get(self.cursor)
+    }
+
+    /// The pinned message the bar shows: the newest one at or above the
+    /// cursor (the oldest one above them all), and its index in `pins`.
+    pub fn shown_pin(&self) -> Option<(usize, &Msg)> {
+        let i = match self.current() {
+            Some(cur) => self
+                .pins
+                .iter()
+                .position(|p| p.id <= cur.id || cur.contains(p.id))
+                .unwrap_or(self.pins.len().saturating_sub(1)),
+            None => 0,
+        };
+        self.pins.get(i).map(|p| (i, p))
     }
 
     /// Apply `f` to the message list while keeping the cursor and the
@@ -1111,7 +1128,7 @@ impl App {
     }
 
     fn load_pinned(chat_id: i64) -> Task<Message> {
-        Task::perform(tg::pinned(chat_id), move |result| Message::Pinned { chat_id, result })
+        Task::perform(tg::pins(chat_id), move |result| Message::Pinned { chat_id, result })
     }
 
     pub fn selected_index(&self) -> Option<usize> {
@@ -1138,7 +1155,7 @@ impl App {
 
     /// Size of the message list, which shrinks with the compose box.
     pub fn viewport(&self) -> (f32, f32) {
-        let pinned = self.open.as_ref().is_some_and(|o| o.pinned.is_some());
+        let pinned = self.open.as_ref().is_some_and(|o| !o.pins.is_empty());
         // A channel you can't post in has a one-line bar instead.
         let read_only = self.open.as_ref().is_some_and(|o| self.read_only(o.id));
         let empty = Input::default();
@@ -1315,7 +1332,7 @@ impl App {
                     }
                     Ok((ids, total)) => {
                         let first = ids[0];
-                        self.found = Some(Found { query, ids, total, index: 0 });
+                        self.found = Some(Found { query, pins: false, ids, total, index: 0 });
                         self.show_match();
                         self.jump_to_message(first)
                     }
@@ -1389,21 +1406,23 @@ impl App {
             }
             Message::Pinned { chat_id, result } => {
                 if let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id) {
-                    open.pinned = result.ok().flatten();
+                    open.pins = result.unwrap_or_default();
+                    let ids: Vec<i64> = open.pins.iter().map(|p| p.id).collect();
+                    // Going through them with n/N: through the new ones.
+                    if let Some(found) = self.found.as_mut().filter(|f| f.pins) {
+                        let at = found.ids.get(found.index).copied();
+                        found.index = ids.iter().position(|&id| Some(id) == at).unwrap_or(0);
+                        found.total = ids.len() as i32;
+                        found.ids = ids;
+                        if found.ids.is_empty() {
+                            self.found = None;
+                        }
+                    }
                 }
                 self.scroll_messages();
                 Task::none()
             }
-            Message::JumpPinned => match self.open.as_ref().and_then(|o| o.pinned.as_ref()) {
-                Some(pinned) => {
-                    let id = pinned.id;
-                    self.jump_to_message(id)
-                }
-                None => {
-                    self.error("No pinned message");
-                    Task::none()
-                }
-            },
+            Message::JumpPinned => self.jump_pinned(),
             Message::Picked(paths) => {
                 self.attach(paths);
                 Task::none()
@@ -2536,7 +2555,10 @@ impl App {
     }
 
     fn show_match(&mut self) {
-        if let Some(found) = &self.found {
+        if let Some(found) = self.found.as_ref().filter(|f| f.pins) {
+            let n = found.ids.len();
+            self.info(format!("📌 Pinned message {} of {n}   n/N older/newer", n - found.index));
+        } else if let Some(found) = &self.found {
             let text = format!(
                 "/{}  match {} of {}",
                 found.query,
@@ -2554,11 +2576,38 @@ impl App {
             return Task::none();
         };
         let Some(index) = found.index.checked_add_signed(step).filter(|&i| i < found.ids.len()) else {
-            self.error("No more matches");
+            match (found.pins, step > 0) {
+                (true, true) => self.error("No older pinned messages (gp goes round to the newest)"),
+                (true, false) => self.error("No newer pinned messages"),
+                _ => self.error("No more matches"),
+            }
             return Task::none();
         };
         found.index = index;
         let id = found.ids[index];
+        self.show_match();
+        self.jump_to_message(id)
+    }
+
+    /// `gp`, a click on the pinned bar: to the pinned message it shows, or
+    /// when already there to the one before it (round to the newest), like
+    /// Telegram; then n/N go through the pinned messages.
+    fn jump_pinned(&mut self) -> Task<Message> {
+        let Some(open) = self.open.as_ref() else {
+            self.error("Open a chat first (Enter)");
+            return Task::none();
+        };
+        let Some((mut index, pin)) = open.shown_pin() else {
+            self.error("No pinned messages");
+            return Task::none();
+        };
+        if open.current().is_some_and(|m| m.contains(pin.id)) {
+            index = (index + 1) % open.pins.len();
+        }
+        let ids: Vec<i64> = open.pins.iter().map(|p| p.id).collect();
+        let id = ids[index];
+        let total = ids.len() as i32;
+        self.found = Some(Found { query: String::new(), pins: true, ids, total, index });
         self.show_match();
         self.jump_to_message(id)
     }
@@ -4931,6 +4980,24 @@ mod tests {
         let part = |id, comments| Msg { comments, ..msg(id, 7) };
         chat.edit(|m| m.extend([part(1, None), part(2, Some(4))]));
         assert_eq!(chat.msgs[0].comments, Some(4));
+    }
+
+    #[test]
+    fn pinned_bar_follows_the_cursor() {
+        let mut chat = OpenChat::new(1);
+        assert!(chat.shown_pin().is_none());
+        chat.pins = vec![msg(8, 0), msg(5, 0), msg(2, 0)];
+        chat.edit(|m| m.extend((1..=10).map(|id| msg(id, 0))));
+        let mut shown = |cursor_id: i64| {
+            chat.cursor = chat.position(cursor_id).unwrap();
+            chat.shown_pin().map(|(i, p)| (i, p.id))
+        };
+        assert_eq!(shown(10), Some((0, 8)));
+        assert_eq!(shown(8), Some((0, 8)));
+        assert_eq!(shown(7), Some((1, 5)));
+        assert_eq!(shown(2), Some((2, 2)));
+        // Above all of them: the oldest.
+        assert_eq!(shown(1), Some((2, 2)));
     }
 
     #[test]

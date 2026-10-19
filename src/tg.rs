@@ -655,8 +655,33 @@ pub async fn send_files(chat_id: i64, paths: Vec<std::path::PathBuf>, caption: S
     Ok(())
 }
 
+/// Most pinned messages of a chat that are loaded.
+const PINS_MAX: usize = 1000;
+
+/// The pinned messages of a chat, newest first.
+pub async fn pins(chat_id: i64) -> Res<Vec<Msg>> {
+    let mut pins: Vec<Msg> = Vec::new();
+    let mut from = 0;
+    while pins.len() < PINS_MAX {
+        let filter = Some(enums::SearchMessagesFilter::Pinned);
+        let found = functions::search_chat_messages(chat_id, None, String::new(), None, from, 0, 100, filter, client()).await;
+        let page = match found {
+            Ok(enums::FoundChatMessages::FoundChatMessages(page)) => page,
+            // No search here (e.g. a secret chat): the newest one at least.
+            Err(_) if pins.is_empty() => return pinned(chat_id).await.map(|m| m.into_iter().collect()),
+            Err(e) => return Err(err(e)),
+        };
+        pins.extend(page.messages.into_iter().map(Msg::from));
+        if page.next_from_message_id == 0 {
+            break;
+        }
+        from = page.next_from_message_id;
+    }
+    Ok(pins)
+}
+
 /// The pinned message of a chat, if there is one.
-pub async fn pinned(chat_id: i64) -> Res<Option<Msg>> {
+async fn pinned(chat_id: i64) -> Res<Option<Msg>> {
     match functions::get_chat_pinned_message(chat_id, client()).await {
         Ok(enums::Message::Message(msg)) => Ok(Some(Msg::from(msg))),
         Err(e) if e.code == 404 => Ok(None),

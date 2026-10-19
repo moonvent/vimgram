@@ -139,7 +139,7 @@ pub enum Action {
     Delete,
     /// Attach files (`ga`).
     Attach,
-    /// Jump to the pinned message (`gp`).
+    /// Jump to the pinned message the bar shows, or the one before it (`gp`).
     Pinned,
     /// The original of a forwarded message, or the message replied to (`gf`).
     GoToSource,
