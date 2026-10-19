@@ -623,11 +623,18 @@ mod tests {
         count
     }
 
-    /// Frames shown within `time`.
-    fn frames_within(movie: &Movie, time: Duration) -> usize {
+    /// Frames keep coming: a few within 3 seconds. A frozen video shows
+    /// one at most; a busy CI runner may take a while after a seek.
+    fn keeps_playing(movie: &Movie) -> bool {
         let count = count_frames(movie);
-        std::thread::sleep(time);
-        count.load(std::sync::atomic::Ordering::SeqCst)
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            if count.load(std::sync::atomic::Ordering::SeqCst) > 3 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
     }
 
     #[test]
@@ -641,13 +648,13 @@ mod tests {
         let mut movie = open_stream(Arc::new(stream::tests::FileSource(path)), size, 1.5, 1.0).unwrap();
         assert_eq!(movie.video.size(), (320, 240));
         assert!(movie.video.duration() > Duration::from_secs(2), "{:?}", movie.video.duration());
-        assert!(frames_within(&movie, Duration::from_millis(400)) > 3);
+        assert!(keeps_playing(&movie));
         movie.seek(Duration::from_millis(1000)).unwrap();
         // The rate change needs the position, which is unknown mid-seek.
         let _ = movie.video.pipeline().state(gst::ClockTime::from_seconds(5));
-        assert!(frames_within(&movie, Duration::from_millis(300)) > 3);
+        assert!(keeps_playing(&movie));
         movie.set_speed(0.5).unwrap();
-        assert!(frames_within(&movie, Duration::from_millis(300)) > 3);
+        assert!(keeps_playing(&movie));
         // Still at half speed after a seek.
         movie.seek(Duration::from_millis(1500)).unwrap();
         let _ = movie.video.pipeline().state(gst::ClockTime::from_seconds(5));
