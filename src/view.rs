@@ -996,7 +996,9 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
     if let Some(presence) = app.presence(open.id).map(fmt_presence).filter(|p| !p.is_empty()) {
         details.push(presence);
     }
-    if let Some(tag) = &open.tag {
+    if open.pins_only() {
+        details.push("pinned only — Enter or Esc to the chat".into());
+    } else if let Some(tag) = &open.tag {
         details.push(format!("only {tag} — Esc for all"));
     }
     match (open.total, thread) {
@@ -1097,7 +1099,7 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
         pane = pane.push(bar);
     }
     let mut pane = pane.push(header).push(rule::horizontal(1));
-    if let Some((index, pinned)) = open.shown_pin() {
+    if let Some((index, pinned)) = open.shown_pin().filter(|_| !open.pins_only()) {
         pane = pane.push(pinned_bar(pinned, open.pins.len() - index, open.pins.len())).push(rule::horizontal(1));
     }
     let messages: Element<_> = mouse_area(messages)
@@ -1266,7 +1268,7 @@ fn pinned_bar(pinned: &Msg, number: usize, total: usize) -> Element<'_, Message>
     let summary: String = pinned.summary().split_whitespace().collect::<Vec<_>>().join(" ");
     let summary: String = summary.chars().take(400).collect();
     let (title, counter) = if total > 1 {
-        (format!("Pinned message #{number}   gp, then n/N"), format!("{number} / {total}"))
+        (format!("Pinned message #{number}   gp, then n/N   gP all"), format!("{number} / {total}"))
     } else {
         ("Pinned message   gp".to_owned(), String::new())
     };
@@ -1284,7 +1286,10 @@ fn pinned_bar(pinned: &Msg, number: usize, total: usize) -> Element<'_, Message>
                 ]
                 .width(Length::Fill)
                 .spacing(1),
-                text(counter).size(12).style(muted_text),
+                // Its own click: the list of them all.
+                mouse_area(text(counter).size(12).style(muted_text))
+                    .on_press(Message::ListPinned)
+                    .interaction(Interaction::Pointer),
             ]
             .width(Length::Fill)
             .spacing(10)

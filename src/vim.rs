@@ -141,6 +141,8 @@ pub enum Action {
     Attach,
     /// Jump to the pinned message the bar shows, or the one before it (`gp`).
     Pinned,
+    /// Only the pinned messages (`gP`).
+    PinnedList,
     /// The original of a forwarded message, or the message replied to (`gf`).
     GoToSource,
     /// The comments of a channel post (`gc`).
@@ -193,6 +195,7 @@ impl Pending {
             (Some('g'), NKey::Char('T')) => Some(Action::PrevFolder),
             (Some('g'), NKey::Char('a')) => Some(Action::Attach),
             (Some('g'), NKey::Char('p')) => Some(Action::Pinned),
+            (Some('g'), NKey::Char('P')) => Some(Action::PinnedList),
             (Some('g'), NKey::Char('f')) => Some(Action::GoToSource),
             (Some('g'), NKey::Char('c')) => Some(Action::Comments),
             (Some('g'), NKey::Char('x')) => Some(Action::OpenLink(explicit.unwrap_or(1))),
@@ -452,7 +455,7 @@ mod tests {
         assert_eq!(feed("gTJK"), vec![Action::PrevFolder, Action::NextFolder, Action::PrevFolder]);
         assert_eq!(feed("cce"), vec![Action::Edit, Action::Edit]);
         assert_eq!(feed("ddnN"), vec![Action::Delete, Action::SearchNext, Action::SearchPrev]);
-        assert_eq!(feed("gagp"), vec![Action::Attach, Action::Pinned]);
+        assert_eq!(feed("gagpgP"), vec![Action::Attach, Action::Pinned, Action::PinnedList]);
         assert_eq!(feed("ge"), vec![Action::Emoji]);
         assert_eq!(feed("gv"), vec![Action::JumpPlaying]);
         assert_eq!(feed("rR"), vec![Action::Reply, Action::React]);

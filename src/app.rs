@@ -60,11 +60,13 @@ pub const TALL_ID: &str = "tall-message";
 pub const COMPOSE_ID: &str = "compose";
 /// Link of a spoiler in a message's text: this prefix and the message id.
 pub const SPOILER_LINK: &str = "spoiler:";
+/// `OpenChat::tag` of the list of pinned messages (`gP`), not a hashtag.
+pub const PINNED_TAG: &str = "📌";
 
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes  J/K gt/gT Alt-N folders  \
                     Enter open/play  i insert  q record  r reply  R react  cc/e edit  f forward  v visual  dd delete  \
                     yy/Y copy  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  { } volume  H/L seek  m mute  U leave/join  gc comments  \
-                    / search chats, Telegram or messages  :posts public posts  n/N next/prev match or pinned  ga attach  gp pinned  gf original/reply  gx link  ^o back  \
+                    / search chats, Telegram or messages  :posts public posts  n/N next/prev match or pinned  ga attach  gp pinned  gP all pinned  gf original/reply  gx link  ^o back  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
                     :folder  :theme  :autostart  :cleancache  :q";
 
@@ -154,6 +156,8 @@ pub enum Message {
         result: Result<Vec<Msg>, String>,
     },
     JumpPinned,
+    /// Only the pinned messages (`gP`, a click on the bar's counter).
+    ListPinned,
     Picked(Vec<PathBuf>),
     Exported(Result<(PathBuf, usize), String>),
     WindowEvent(window::Event),
@@ -479,6 +483,10 @@ struct Shown {
 
 impl Shown {
     fn keeps(&self, m: &Msg) -> bool {
+        // The pinned ones are all there: they come from `OpenChat::pins`.
+        if self.tag.as_deref() == Some(PINNED_TAG) {
+            return false;
+        }
         // A comment answers the post, should its thread be missing.
         let in_thread = self.thread == 0 || m.thread == self.thread || m.reply_to == Some(self.thread);
         self.tag.as_ref().is_none_or(|tag| tg::has_hashtag(&m.text, tag)) && in_thread
@@ -508,6 +516,22 @@ impl OpenChat {
             tag: self.tag.clone(),
             thread: self.thread_root(),
         }
+    }
+
+    /// Showing the list of pinned messages (`gP`).
+    pub fn pins_only(&self) -> bool {
+        self.tag.as_deref() == Some(PINNED_TAG)
+    }
+
+    /// The list of pinned messages, oldest first, the cursor on `at`.
+    fn fill_pins(&mut self, at: Option<i64>) {
+        self.retag(Some(PINNED_TAG.to_owned()));
+        let pins = self.pins.clone();
+        self.edit(|msgs| msgs.extend(pins.into_iter().rev()));
+        self.exhausted = true;
+        self.total = Some(self.pins.len() as i32);
+        self.cursor = at.and_then(|id| self.position(id)).unwrap_or(self.msgs.len().saturating_sub(1));
+        self.bottom = self.msgs.len().saturating_sub(1);
     }
 
     pub fn thread_root(&self) -> i64 {
@@ -1155,7 +1179,7 @@ impl App {
 
     /// Size of the message list, which shrinks with the compose box.
     pub fn viewport(&self) -> (f32, f32) {
-        let pinned = self.open.as_ref().is_some_and(|o| !o.pins.is_empty());
+        let pinned = self.open.as_ref().is_some_and(|o| !o.pins.is_empty() && !o.pins_only());
         // A channel you can't post in has a one-line bar instead.
         let read_only = self.open.as_ref().is_some_and(|o| self.read_only(o.id));
         let empty = Input::default();
@@ -1407,6 +1431,10 @@ impl App {
             Message::Pinned { chat_id, result } => {
                 if let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id) {
                     open.pins = result.unwrap_or_default();
+                    if open.pins_only() {
+                        let at = open.current().map(|m| m.id);
+                        open.fill_pins(at);
+                    }
                     let ids: Vec<i64> = open.pins.iter().map(|p| p.id).collect();
                     // Going through them with n/N: through the new ones.
                     if let Some(found) = self.found.as_mut().filter(|f| f.pins) {
@@ -1423,6 +1451,7 @@ impl App {
                 Task::none()
             }
             Message::JumpPinned => self.jump_pinned(),
+            Message::ListPinned => self.list_pinned(),
             Message::Picked(paths) => {
                 self.attach(paths);
                 Task::none()
@@ -2382,7 +2411,7 @@ impl App {
         let Some(open) = self.open.as_mut() else {
             return Task::none();
         };
-        if open.loading || (older && open.exhausted) {
+        if open.loading || (older && open.exhausted) || open.pins_only() {
             return Task::none();
         }
         open.loading = true;
@@ -2471,6 +2500,32 @@ impl App {
             result: result.map(|(_, total)| total),
         });
         Task::batch([count, self.load_history(false)])
+    }
+
+    /// `gP`: the open chat shows only its pinned messages, the cursor on
+    /// the one the bar shows; Esc (or Enter) shows all, at the one under it.
+    fn list_pinned(&mut self) -> Task<Message> {
+        let Some(open) = self.open.as_mut() else {
+            self.error("Open a chat first (Enter)");
+            return Task::none();
+        };
+        if open.pins.is_empty() {
+            self.error("No pinned messages");
+            return Task::none();
+        }
+        if open.thread.is_some() {
+            self.error("Not in the comments (Esc back to the post first)");
+            return Task::none();
+        }
+        let at = open.shown_pin().map(|(_, p)| p.id);
+        open.fill_pins(at);
+        self.focus = Focus::Messages;
+        self.visual = None;
+        self.found = None;
+        self.reset_tall();
+        self.scroll_messages();
+        self.info("Pinned messages: Enter or Esc goes to the one under the cursor in the chat");
+        self.scroll_tall()
     }
 
     /// Back to all messages; returns the task counting them.
@@ -3933,6 +3988,7 @@ impl App {
             },
             ("export", path) => return self.export(path),
             ("pin" | "pinned", _) => return self.handle(Message::JumpPinned),
+            ("pins", _) => return self.handle(Message::ListPinned),
             ("s" | "search", Some(query)) => {
                 self.search_messages = true;
                 return self.search_chat(query.to_owned());
@@ -4071,6 +4127,7 @@ impl App {
                     });
                     match target {
                         Some((msg_id, item)) => self.activate_media(msg_id, item),
+                        None if self.open.as_ref().is_some_and(OpenChat::pins_only) => self.leave_tag(),
                         None => Task::none(),
                     }
                 }
@@ -4127,6 +4184,7 @@ impl App {
                 }
             },
             Action::Pinned => self.handle(Message::JumpPinned),
+            Action::PinnedList => self.handle(Message::ListPinned),
             Action::GoToSource => self.go_to_source(),
             Action::OpenLink(n) => {
                 let url = self.focused_message().map(|m| m.links.get(n.saturating_sub(1)).map(|l| l.url.clone()));
@@ -4998,6 +5056,12 @@ mod tests {
         assert_eq!(shown(2), Some((2, 2)));
         // Above all of them: the oldest.
         assert_eq!(shown(1), Some((2, 2)));
+
+        chat.fill_pins(Some(5));
+        assert!(chat.pins_only());
+        assert_eq!(chat.msgs.iter().map(|m| m.id).collect::<Vec<_>>(), [2, 5, 8]);
+        assert_eq!(chat.cursor, 1);
+        assert!(!chat.shown().keeps(&msg(11, 0)));
     }
 
     #[test]
