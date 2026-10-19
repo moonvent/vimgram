@@ -4114,6 +4114,9 @@ impl App {
                 let ids: Vec<i64> =
                     self.targets().iter().filter(|m| !m.deleted).flat_map(|m| m.members.iter().copied()).collect();
                 match self.open.as_ref().map(|o| o.id) {
+                    Some(chat_id) if self.read_only(chat_id) => {
+                        self.error("Only the channel's admins delete its posts");
+                    }
                     Some(chat_id) if !ids.is_empty() => {
                         self.visual = None;
                         self.confirm = Some(Confirm::Delete { chat_id, ids });

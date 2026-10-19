@@ -1607,8 +1607,11 @@ fn reply_quote<'a>(app: &'a App, reply_to: i64) -> Element<'a, Message> {
 
 /// Keys that act on the message under the cursor, shown on its header.
 fn message_keys(app: &App, m: &Msg) -> String {
+    // Only the channel's admins delete its posts.
+    let read_only = app.read_only(m.chat_id);
     if app.visual.is_some() {
-        return format!("{} selected  f forward  y copy  d delete  Esc cancel", fmt_count(app.visual_len()));
+        let delete = if read_only { "" } else { "  d delete" };
+        return format!("{} selected  f forward  y copy{delete}  Esc cancel", fmt_count(app.visual_len()));
     }
     let channel = app.chats.get(&m.chat_id).is_some_and(|c| c.kind == ChatKind::Channel);
     let mut keys = Vec::new();
@@ -1644,7 +1647,7 @@ fn message_keys(app: &App, m: &Msg) -> String {
     if !m.text.is_empty() {
         keys.push("yy copy");
     }
-    if !m.deleted {
+    if !m.deleted && !read_only {
         keys.push("dd delete");
     }
     keys.join("  ")
