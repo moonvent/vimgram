@@ -1847,11 +1847,19 @@ fn media_viewer(app: &App) -> Option<Element<'_, Message>> {
             }
         }
         Media::Video { .. } => match app.video.as_ref().and_then(VideoPlayback::video) {
+            // The player says it shrinks, so a column would lay it out
+            // first, at the video's own height, at the top: in a filling
+            // container it gets all the room left above the progress bar,
+            // and draws the picture in the middle of it.
             Some(video) => column![
-                VideoPlayer::new(video)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .content_fit(ContentFit::Contain),
+                container(
+                    VideoPlayer::new(video)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .content_fit(ContentFit::Contain),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill),
                 video_progress(app, video),
             ]
             .spacing(10)
