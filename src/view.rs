@@ -98,10 +98,23 @@ pub fn chat_rows(size: Size) -> usize {
     (((size.height - STATUS_H - HEADER_H) / CHAT_ROW_H).floor() as usize).max(1)
 }
 
+/// Photos and videos beside the chat: half of the room right of the
+/// chat list.
+pub fn side_width(size: Size) -> f32 {
+    ((size.width - FOLDER_W - SIDEBAR_W) / 2.0).floor().max(0.0)
+}
+
+/// Width of the chat pane: what the chat list and the viewer beside it
+/// (`side`) leave.
+fn pane_width(size: Size, side: bool) -> f32 {
+    let side = if side { side_width(size) + 1.0 } else { 0.0 };
+    size.width - FOLDER_W - SIDEBAR_W - 1.0 - side
+}
+
 /// Width of the compose text, between the pane's padding and the 😀 button.
-pub fn compose_text_width(size: Size, emoji: bool) -> f32 {
+pub fn compose_text_width(size: Size, emoji: bool, side: bool) -> f32 {
     let panel = if emoji { EMOJI_W } else { 0.0 };
-    size.width - FOLDER_W - SIDEBAR_W - 1.0 - 2.0 * MSG_PAD_X - COMPOSE_BUTTON - COMPOSE_GAP - panel
+    pane_width(size, side) - 2.0 * MSG_PAD_X - COMPOSE_BUTTON - COMPOSE_GAP - panel
 }
 
 /// Lines `text` takes wrapped at `width`. An estimate from an average
@@ -124,12 +137,13 @@ pub fn messages_viewport(
     pinned: bool,
     emoji: bool,
     player: bool,
+    side: bool,
 ) -> (f32, f32) {
     let panel = if emoji { EMOJI_W } else { 0.0 };
-    let width = size.width - FOLDER_W - SIDEBAR_W - 1.0 - 2.0 * MSG_PAD_X - MSG_AVATAR - MSG_AVATAR_GAP - panel;
+    let width = pane_width(size, side) - 2.0 * MSG_PAD_X - MSG_AVATAR - MSG_AVATAR_GAP - panel;
     let pinned = if pinned { PINNED_H + 1.0 } else { 0.0 };
     let player = if player { PLAYER_H + 1.0 } else { 0.0 };
-    let compose = compose_height(compose, compose_text_width(size, emoji), banner);
+    let compose = compose_height(compose, compose_text_width(size, emoji, side), banner);
     let height = size.height - STATUS_H - HEADER_H - 2.0 - pinned - player - compose - LIST_BOTTOM;
     (width.max(100.0), height.max(LINE_H))
 }
@@ -394,18 +408,21 @@ pub fn bottom_for_top(msgs: &[Msg], top: usize, width: f32, height: f32) -> usiz
 pub fn view(app: &App, _window: iced::window::Id) -> Element<'_, Message> {
     let body: Element<_> = if app.auth != Auth::Ready {
         auth_screen(app)
-    } else if let Some(viewer) = media_viewer(app) {
+    } else if let Some(viewer) = media_viewer(app).filter(|_| !app.viewer_side) {
         viewer
     } else {
-        row![
+        let main = row![
             // The folder strip's own background separates it from the list.
             folder_strip(app),
             chat_list(app),
             rule::vertical(1),
             chat_pane(app)
         ]
-        .height(Length::Fill)
-        .into()
+        .height(Length::Fill);
+        match media_viewer(app) {
+            Some(viewer) => main.push(rule::vertical(1)).push(side_viewer(app, viewer)).into(),
+            None => main.into(),
+        }
     };
     column![body, status_line(app)].into()
 }
@@ -1884,6 +1901,22 @@ fn media_viewer(app: &App) -> Option<Element<'_, Message>> {
     )
 }
 
+/// The viewer beside the chat: a click gives it the keys, a line on top
+/// shows it has them.
+fn side_viewer<'a>(app: &App, viewer: Element<'a, Message>) -> Element<'a, Message> {
+    let focused = app.viewer_focused;
+    let accent = container(space::horizontal())
+        .width(Length::Fill)
+        .height(2)
+        .style(move |t: &Theme| container::Style {
+            background: focused.then(|| t.palette().primary.into()),
+            ..Default::default()
+        });
+    mouse_area(column![accent, viewer].width(side_width(app.size)).height(Length::Fill))
+        .on_press(Message::FocusViewer)
+        .into()
+}
+
 /// Under a video in the viewer: time played, progress, length.
 fn video_progress<'a>(app: &App, video: &iced_video_player::Video) -> Element<'a, Message> {
     let total = video.duration().as_secs_f64();
@@ -1989,7 +2022,7 @@ fn compose(app: &App) -> Element<'_, Message> {
         return channel_bar(app, chat);
     }
     let editing = app.mode == Mode::Insert;
-    let width = compose_text_width(app.size, app.emoji.is_some());
+    let width = compose_text_width(app.size, app.emoji.is_some(), app.side_viewer());
     let lines = compose_lines(app.input.as_str(), width).clamp(1, MAX_COMPOSE_LINES);
     let content: Element<_> = if app.input.is_empty() && !editing {
         let hint = if app.forward.is_some() {
@@ -2154,10 +2187,15 @@ fn status_line(app: &App) -> Element<'_, Message> {
         });
 
     let viewer_hint = match app.viewer_media() {
-        Some(Media::Video { .. }) => {
-            Some("Space pause   h/l ±5s   H/L ±30s   [ ] speed   = 1x   { } volume   j/k next/prev   Esc close")
-        }
-        Some(_) => Some("j/k — next/previous   Esc — close"),
+        _ if !app.viewer_keys() => None,
+        Some(Media::Video { .. }) if app.viewer_side => Some(
+            "Space pause   h/l ±5s   H/L ±30s   [ ] speed   = 1x   { } volume   j/k next/prev   Tab messages   s full screen   Esc close",
+        ),
+        Some(Media::Video { .. }) => Some(
+            "Space pause   h/l ±5s   H/L ±30s   [ ] speed   = 1x   { } volume   j/k next/prev   s beside the chat   Esc close",
+        ),
+        Some(_) if app.viewer_side => Some("j/k — next/previous   Tab — messages   s — full screen   Esc — close"),
+        Some(_) => Some("j/k — next/previous   s — beside the chat   Esc — close"),
         None => None,
     };
 
@@ -2251,6 +2289,16 @@ mod tests {
         assert!(long.ends_with('…'));
         // Site line plus three of the description.
         assert_eq!(preview_height(&preview(&"x".repeat(100)), width), 4.0 * PREVIEW_LINE_H + 2.0 * PREVIEW_PAD + MEDIA_GAP);
+    }
+
+    #[test]
+    fn side_viewer_takes_half_of_the_chat_pane() {
+        let size = Size::new(1416.0, 800.0);
+        let input = Input::default();
+        let (full, _) = messages_viewport(size, &input, false, false, false, false, false);
+        let (side, _) = messages_viewport(size, &input, false, false, false, false, true);
+        assert_eq!(side_width(size), 500.0);
+        assert_eq!(full - side, 501.0);
     }
 
     #[test]

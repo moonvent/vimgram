@@ -213,6 +213,8 @@ pub enum Message {
     ToggleReaction { msg_id: i64, kind: ReactionKind },
     ClickFolder(usize),
     ClickChat(i64),
+    /// Click on the photo or video beside the chat: the keys go to it.
+    FocusViewer,
     /// A message found by the chat filter was clicked.
     ClickHit(usize),
     SelectMsg(i64),
@@ -657,6 +659,10 @@ pub struct App {
     pub chat_top: usize,
     pub open: Option<OpenChat>,
     pub viewer: Option<Viewer>,
+    /// Photos and videos open beside the chat instead of full screen.
+    pub viewer_side: bool,
+    /// The viewer beside the chat has the keys, not the chat.
+    pub viewer_focused: bool,
     pub video: Option<VideoPlayback>,
     pub voice: Option<VoicePlayback>,
     /// A progress slider being dragged: what it seeks and where to.
@@ -762,6 +768,7 @@ impl App {
     /// `hidden`: start in the tray (autostart) instead of opening the window.
     pub fn new(cfg: Config, hidden: bool) -> (Self, Task<Message>) {
         let theme = find_theme(&cfg.theme).unwrap_or(Theme::TokyoNight);
+        let viewer_side = cfg.viewer == config::ViewerMode::Side;
         clipboard::clean_old_pastes();
         let mut app = App {
             cfg,
@@ -790,6 +797,8 @@ impl App {
             chat_top: 0,
             open: None,
             viewer: None,
+            viewer_side,
+            viewer_focused: false,
             video: None,
             voice: None,
             scrub: None,
@@ -1139,7 +1148,18 @@ impl App {
             pinned,
             self.emoji.is_some(),
             self.playing_elsewhere().is_some(),
+            self.side_viewer(),
         )
+    }
+
+    /// A photo or video is open beside the chat.
+    pub fn side_viewer(&self) -> bool {
+        self.viewer_side && self.viewer_media().is_some()
+    }
+
+    /// Keys go to the photo or video viewer (always, when it is full screen).
+    pub fn viewer_keys(&self) -> bool {
+        self.viewer.is_some() && (self.viewer_focused || !self.viewer_side)
     }
 
     pub fn viewer_media(&self) -> Option<&Media> {
@@ -1172,7 +1192,7 @@ impl App {
             return Task::none();
         }
         self.compose_seen = seen;
-        let width = view::compose_text_width(self.size, self.emoji.is_some());
+        let width = view::compose_text_width(self.size, self.emoji.is_some(), self.side_viewer());
         let total = view::compose_lines(text, width);
         let shown = total.min(view::MAX_COMPOSE_LINES);
         if total <= shown {
@@ -1560,14 +1580,23 @@ impl App {
                 Task::none()
             }
             Message::Paste(text) => self.on_paste(text),
-            Message::ClickFolder(index) => self.switch_folder(index),
+            Message::ClickFolder(index) => {
+                self.viewer_focused = false;
+                self.switch_folder(index)
+            }
+            Message::FocusViewer => {
+                self.viewer_focused = true;
+                Task::none()
+            }
             Message::ClickChat(id) => {
+                self.viewer_focused = false;
                 self.selected = Some(id);
                 self.hit = None;
                 self.focus = Focus::Chats;
                 self.act(Action::Open)
             }
             Message::ClickHit(i) => {
+                self.viewer_focused = false;
                 self.hit = Some(i);
                 self.focus = Focus::Chats;
                 self.act(Action::Open)
@@ -3011,6 +3040,7 @@ impl App {
 
     fn open_viewer(&mut self, viewer: Viewer) -> Task<Message> {
         self.viewer = Some(viewer);
+        self.viewer_focused = true;
         let video_file = match self.viewer_media() {
             Some(Media::Video { video, round, .. }) => {
                 Some((video.id, if *round { SpeedKind::Round } else { SpeedKind::Video }))
@@ -3057,8 +3087,14 @@ impl App {
     }
 
     fn close_viewer(&mut self) {
+        let side = self.side_viewer();
         self.viewer = None;
+        self.viewer_focused = false;
         self.video = None;
+        // The messages get their width back.
+        if side {
+            self.scroll_messages();
+        }
     }
 
     fn poll_players(&mut self) -> Task<Message> {
@@ -3287,7 +3323,7 @@ impl App {
                 if self.confirm.is_some() {
                     return self.key_confirm(key);
                 }
-                if self.viewer.is_some() {
+                if self.viewer_keys() {
                     return self.key_viewer(key);
                 }
                 // Visual selection: one key acts, like Vim's `d` and `y`.
@@ -3526,6 +3562,19 @@ impl App {
             }
             NKey::Esc | NKey::Enter | NKey::Char('q' | 'o') => {
                 self.close_viewer();
+                None
+            }
+            // Full screen ↔ beside the chat, for the rest of the session.
+            NKey::Char('s') => {
+                self.viewer_side = !self.viewer_side;
+                self.viewer_focused = true;
+                self.scroll_messages();
+                None
+            }
+            // Beside the chat: the keys go to the messages, it plays on.
+            NKey::Tab | NKey::Ctrl('h') if self.viewer_side => {
+                self.viewer_focused = false;
+                self.focus = Focus::Messages;
                 None
             }
             _ => None,
@@ -3910,12 +3959,20 @@ impl App {
                 };
                 Task::none()
             }
+            Action::FocusMessages if self.focus == Focus::Messages && self.side_viewer() => {
+                self.viewer_focused = true;
+                Task::none()
+            }
             Action::FocusMessages => {
                 self.focus = match self.focus {
                     Focus::Folders => Focus::Chats,
                     Focus::Chats | Focus::Messages if self.open.is_some() => Focus::Messages,
                     other => other,
                 };
+                Task::none()
+            }
+            Action::ToggleFocus if self.focus == Focus::Messages && self.side_viewer() => {
+                self.viewer_focused = true;
                 Task::none()
             }
             Action::ToggleFocus => {
@@ -4212,6 +4269,10 @@ impl App {
                     self.clear_filter();
                     cancelled = true;
                 }
+                if !cancelled && self.side_viewer() {
+                    self.close_viewer();
+                    return Task::none();
+                }
                 if !cancelled && self.open.as_ref().is_some_and(|o| o.tag.is_some()) {
                     return self.leave_tag();
                 }
@@ -4389,6 +4450,7 @@ impl App {
         {
             open.cursor = i;
             self.focus = Focus::Messages;
+            self.viewer_focused = false;
             self.scroll_messages();
         }
     }

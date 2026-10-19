@@ -23,6 +23,18 @@ pub struct Config {
     /// Moving through the chat list opens the selected chat beside it.
     #[serde(default)]
     pub open_on_select: bool,
+    /// Where photos and videos open: over the whole window, or beside the
+    /// chat (`s` in the viewer switches).
+    #[serde(default)]
+    pub viewer: ViewerMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ViewerMode {
+    #[default]
+    Full,
+    Side,
 }
 
 fn default_theme() -> String {

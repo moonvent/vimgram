@@ -29,6 +29,7 @@ close_to_tray = true    # optional: closing the window keeps vimgram in the tray
 prefetch_mb = 50        # optional: auto-download media up to this size (see below)
 open_on_select = true   # optional: moving through the chat list opens the chat beside it
                         # (read only once you move into its messages)
+viewer = "side"         # optional: photos and videos open beside the chat, not full screen
 ```
 
 Never commit or share these: they identify your app to Telegram.
@@ -136,6 +137,9 @@ for another one (or for a video, or stopped with ✕) goes on where it was, 5 se
 
 Photo/video viewer: `j`/`k` next/previous, `h`/`l` seek ±5s, `H`/`L` ±30s, `Space` pause,
 `[` `]` `=` speed, `{` `}` volume, `Esc` close. Under a video: time played, progress and length.
+`s` switches between full screen and beside the chat (`viewer = "side"` starts there). Beside the
+chat `Tab` (or `Ctrl-h`) gives the keys back to the messages while it plays on, `Tab` or `l` there
+(or a click on it) returns to it, and `Esc` in the messages closes it.
 
 Mouse: click folders, chats, messages and media; the wheel moves the cursor.
 
