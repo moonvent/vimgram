@@ -985,6 +985,27 @@ impl Presence {
     }
 }
 
+/// What someone is doing in a chat, as in "typing"; `None` when it ends.
+pub fn action_label(action: &enums::ChatAction) -> Option<&'static str> {
+    use enums::ChatAction as A;
+    Some(match action {
+        A::Typing => "typing",
+        A::RecordingVoiceNote => "recording a voice message",
+        A::RecordingVideoNote => "recording a video message",
+        A::RecordingVideo => "recording a video",
+        A::UploadingVoiceNote(_) => "sending a voice message",
+        A::UploadingVideoNote(_) => "sending a video message",
+        A::UploadingVideo(_) => "sending a video",
+        A::UploadingPhoto(_) => "sending a photo",
+        A::UploadingDocument(_) => "sending a file",
+        A::ChoosingSticker => "choosing a sticker",
+        A::ChoosingLocation => "choosing a location",
+        A::ChoosingContact => "choosing a contact",
+        A::StartPlayingGame => "playing a game",
+        A::WatchingAnimations(_) | A::Cancel => return None,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct User {
     pub name: String,

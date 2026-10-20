@@ -544,6 +544,21 @@ fn fmt_full_date(unix: i32) -> String {
         .unwrap_or_default()
 }
 
+/// "typing…" in a private chat, "Alice is typing…" or "Alice and 2 more
+/// are typing…" in a group.
+fn fmt_activity(app: &App, chat_id: i64) -> Option<String> {
+    let acting = app.actions.get(&chat_id)?;
+    let &(sender, label) = acting.first()?;
+    if matches!(app.chats.get(&chat_id)?.kind, ChatKind::Private(_)) {
+        return Some(format!("{label}…"));
+    }
+    let name = app.sender_name(sender);
+    Some(match acting.len() {
+        1 => format!("{name} is {label}…"),
+        n => format!("{name} and {} more are {label}…", n - 1),
+    })
+}
+
 pub fn fmt_presence(presence: Presence) -> String {
     match presence {
         Presence::Online => "online".into(),
@@ -1006,13 +1021,17 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
         (Some(total), None) => details.push(format!("{} messages", fmt_count(total))),
         (None, _) => {}
     }
+    let activity = fmt_activity(app, open.id);
+    if let Some(activity) = &activity {
+        details.push(activity.clone());
+    }
     if thread.is_some() {
         details.push("Esc back to the post".into());
     }
     if !open.at_latest {
         details.push("viewing history — G for latest".into());
     }
-    let online = app.presence(open.id) == Some(Presence::Online);
+    let online = app.presence(open.id) == Some(Presence::Online) || activity.is_some();
     let header_avatar = match chat {
         Some(chat) => avatar_image(app, chat.avatar, chat.id, &chat.title, HEADER_AVATAR),
         None => space::horizontal().width(HEADER_AVATAR).into(),

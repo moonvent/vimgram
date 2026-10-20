@@ -671,6 +671,9 @@ pub struct App {
     pub focus: Focus,
     pub chats: HashMap<i64, Chat>,
     pub users: HashMap<i64, User>,
+    /// Who is typing or recording something, per chat; TDLib cancels
+    /// each action itself when it times out.
+    pub actions: HashMap<i64, Vec<(Sender, &'static str)>>,
     /// Your standing in each supergroup and channel, by supergroup id.
     memberships: HashMap<i64, Membership>,
     /// Supergroups holding the comments of a channel, by supergroup id.
@@ -819,6 +822,7 @@ impl App {
             focus: Focus::Chats,
             chats: HashMap::new(),
             users: HashMap::new(),
+            actions: HashMap::new(),
             memberships: HashMap::new(),
             discussions: HashSet::new(),
             archive: Archive::open(config::dirs().data_dir().join("archive.sqlite")).ok(),
@@ -1821,6 +1825,18 @@ impl App {
             Update::UserStatus(u) => {
                 if let Some(user) = self.users.get_mut(&u.user_id) {
                     user.presence = Presence::of(&u.status);
+                }
+            }
+            Update::ChatAction(u) => {
+                let sender = Sender::from(&u.sender_id);
+                let acting = self.actions.entry(u.chat_id).or_default();
+                acting.retain(|(s, _)| *s != sender);
+                match tg::action_label(&u.action) {
+                    Some(label) => acting.push((sender, label)),
+                    None if acting.is_empty() => {
+                        self.actions.remove(&u.chat_id);
+                    }
+                    None => {}
                 }
             }
             Update::MessageIsPinned(u) => {
