@@ -42,7 +42,7 @@ pub const MAX_COMPOSE_LINES: usize = 8;
 /// The 😀 button right of the compose line, and the space before it.
 const COMPOSE_BUTTON: f32 = 32.0;
 const COMPOSE_GAP: f32 = 8.0;
-const BANNER_H: f32 = 24.0;
+const BANNER_H: f32 = 36.0;
 const REPLY_H: f32 = 22.0;
 const PHOTO_MAX: Size = Size::new(420.0, 380.0);
 const VIDEO_MAX: Size = Size::new(420.0, 340.0);
@@ -2091,8 +2091,8 @@ fn compose_banner(app: &App) -> Option<Element<'_, Message>> {
 
 fn banner<'a>(label: String) -> Element<'a, Message> {
     row![
-        text(label).size(12).wrapping(Wrapping::None).style(primary_text).width(Length::Fill),
-        text("Esc — cancel").size(12).style(muted_text),
+        text(label).size(18).wrapping(Wrapping::None).style(primary_text).width(Length::Fill),
+        text("Esc — cancel").size(15).style(muted_text),
     ]
     .height(BANNER_H)
     .align_y(Alignment::Center)
