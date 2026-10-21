@@ -66,7 +66,7 @@ pub const PINNED_TAG: &str = "📌";
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes  J/K gt/gT Alt-N folders  \
                     Enter open/play  gu/gk unread private chat/channel  i/I/a/A insert  Esc then vim keys in the text  q record  r reply  R react  cc/e edit  f forward  v visual  dd delete  \
                     yy/Y copy  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  { } volume  H/L seek  m mute  U leave/join  gc comments  \
-                    / search chats, Telegram or messages  :posts public posts  n/N next/prev match or pinned  ga attach  gp pinned  gP all pinned  gf original/reply  gx link  ^o back  \
+                    / search chats, Telegram or messages  :posts public posts  n/N next/prev match or pinned  ga attach  gp pinned  gP all pinned  gf original/reply  gx link  ^o/^i back/forward between chats  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
                     :folder  :theme  :autostart  :cleancache  :q";
 
@@ -446,6 +446,8 @@ fn avatar_of(photo: Option<&ChatPhotoInfo>) -> Option<i32> {
 
 pub struct OpenChat {
     pub id: i64,
+    /// The folder it was opened in.
+    list: ListKey,
     /// Sorted by id, oldest first; album parts are merged.
     pub msgs: Vec<Msg>,
     pub cursor: usize,
@@ -502,6 +504,7 @@ impl OpenChat {
     fn new(id: i64) -> Self {
         OpenChat {
             id,
+            list: ListKey::Main,
             msgs: Vec::new(),
             cursor: 0,
             bottom: 0,
@@ -788,8 +791,15 @@ pub struct App {
     pub revealed: HashSet<i64>,
     pub compose: Compose,
     pub forward: Option<Forward>,
-    /// Where `gf` jumped from (chat, message), newest last; `Ctrl-o` goes back.
+    /// Where `gf`, `gu` or opening another chat jumped from (chat,
+    /// message), newest last; `Ctrl-o` goes back.
     jumps: Vec<(i64, i64)>,
+    /// Where `Ctrl-o` went back from; `Ctrl-i` goes forward again.
+    jumps_ahead: Vec<(i64, i64)>,
+    /// The folder each chat left for another was open in, to go back there.
+    jump_lists: HashMap<i64, ListKey>,
+    /// Going along the jumps: opening the chat is no new jump.
+    jumping: bool,
     /// Visual selection in the open chat: the message it started at.
     pub visual: Option<i64>,
     /// Chats marked with `v` to forward to, in the order marked.
@@ -918,6 +928,9 @@ impl App {
             compose: Compose::New,
             forward: None,
             jumps: Vec::new(),
+            jumps_ahead: Vec::new(),
+            jump_lists: HashMap::new(),
+            jumping: false,
             visual: None,
             forward_marks: Vec::new(),
             found: None,
@@ -1359,6 +1372,49 @@ impl App {
         Task::perform(tray.clone().set_unread(unread), |()| Message::Done(Ok(())))
     }
 
+    /// The open chat and the message under the cursor, as a jump.
+    fn here(&self) -> Option<(i64, i64)> {
+        let open = self.open.as_ref().filter(|o| o.thread.is_none())?;
+        Some((open.id, open.current()?.id))
+    }
+
+    /// A new jump from `from`: `Ctrl-o` comes back to it.
+    fn remember_jump(&mut self, from: (i64, i64)) {
+        if self.jumps.last() != Some(&from) {
+            self.jumps.push(from);
+        }
+        self.jumps_ahead.clear();
+    }
+
+    /// `Ctrl-o` / `Ctrl-i`: to a chat and message of the jump list, in the
+    /// folder the chat was open in.
+    fn go_jump(&mut self, (chat_id, msg_id): (i64, i64)) -> Task<Message> {
+        if self.open.as_ref().is_some_and(|o| o.id == chat_id && o.thread.is_none()) {
+            return self.jump_to_message(msg_id);
+        }
+        let folder = self
+            .jump_lists
+            .get(&chat_id)
+            .filter(|&&list| self.chats.get(&chat_id).is_some_and(|c| c.order(list).is_some()))
+            .and_then(|&list| self.folders.iter().position(|f| f.key == list));
+        let load = match folder {
+            Some(folder) => {
+                self.clear_filter();
+                self.switch_folder(folder)
+            }
+            None => Task::none(),
+        };
+        if self.list.contains(&chat_id) {
+            self.hit = None;
+            self.selected = Some(chat_id);
+            self.scroll_chats();
+        }
+        self.jumping = true;
+        let open = self.open_chat_at(chat_id, Some(msg_id));
+        self.jumping = false;
+        Task::batch([load, open])
+    }
+
     /// `gu` / `gk`: the topmost private chat (or channel) with unread
     /// messages, in the folder it is in, at its first unread message.
     fn first_unread(&mut self, channel: bool) -> Task<Message> {
@@ -1795,7 +1851,9 @@ impl App {
             Message::ToLatest => self.to_latest(),
             Message::LinkResolved { from, result } => match result {
                 Ok((chat_id, msg_id)) => {
-                    self.jumps.extend(from);
+                    if let Some(from) = from {
+                        self.remember_jump(from);
+                    }
                     self.open_chat_at(chat_id, msg_id)
                 }
                 Err(e) => {
@@ -1809,7 +1867,7 @@ impl App {
             }
             Message::GoTo { from, msg_id, result } => match result {
                 Ok(chat_id) => {
-                    self.jumps.push(from);
+                    self.remember_jump(from);
                     self.open_chat_at(chat_id, msg_id)
                 }
                 Err(e) => {
@@ -2891,9 +2949,21 @@ impl App {
                 self.open = Some(prev);
                 return at.map_or_else(Task::none, |(msg, after)| self.jump_to(msg, after));
             }
+            // Only a chat really opened is worth coming back to, not one
+            // glanced at while moving through the list.
+            if !prev.preview && prev.thread.is_none() && !self.jumping
+                && let Some(msg) = prev.current()
+            {
+                self.remember_jump((prev.id, msg.id));
+            }
+            if prev.thread.is_none() {
+                self.jump_lists.insert(prev.id, prev.list);
+            }
             tasks.push(Task::perform(tg::close_chat(prev.id), Message::Done));
         }
-        tasks.push(self.switch_chat(OpenChat::new(id)));
+        let mut open = OpenChat::new(id);
+        open.list = self.current_list();
+        tasks.push(self.switch_chat(open));
         tasks.push(Task::perform(tg::message_count(id), move |result| Message::Count {
             chat_id: id,
             tag: None,
@@ -4410,12 +4480,26 @@ impl App {
             }
             Action::Comments => self.open_comments(),
             Action::JumpBack => match self.jumps.pop() {
-                Some((chat_id, msg_id)) if self.open.as_ref().is_some_and(|o| o.id == chat_id) => {
-                    self.jump_to_message(msg_id)
+                Some(to) => {
+                    if let Some(here) = self.here() {
+                        self.jumps_ahead.push(here);
+                    }
+                    self.go_jump(to)
                 }
-                Some((chat_id, msg_id)) => self.open_chat_at(chat_id, Some(msg_id)),
                 None => {
-                    self.error("Nowhere to go back to (gf jumps)");
+                    self.error("Nowhere to go back to");
+                    Task::none()
+                }
+            },
+            Action::JumpForward => match self.jumps_ahead.pop() {
+                Some(to) => {
+                    if let Some(here) = self.here() {
+                        self.jumps.push(here);
+                    }
+                    self.go_jump(to)
+                }
+                None => {
+                    self.error("Nowhere to go forward to");
                     Task::none()
                 }
             },
@@ -4656,7 +4740,7 @@ impl App {
         if let (Sender::Chat(chat_id), Some(msg_id)) = (chat, msg_id)
             && chat_id == from.0
         {
-            self.jumps.push(from);
+            self.remember_jump(from);
             return self.jump_to_message(msg_id);
         }
         let load = match chat {

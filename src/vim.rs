@@ -165,6 +165,8 @@ pub enum Action {
     OpenLink(usize),
     /// Back to where `gf` came from (`Ctrl-o`).
     JumpBack,
+    /// Forward again to where `Ctrl-o` came back from (`Ctrl-i`).
+    JumpForward,
     /// Emoji panel (`ge`).
     Emoji,
     /// Back to the voice message playing in another chat (`gv`).
@@ -236,6 +238,7 @@ impl Pending {
             (None, NKey::Ctrl('d')) => Some(Action::HalfDown),
             (None, NKey::Ctrl('u')) => Some(Action::HalfUp),
             (None, NKey::Ctrl('o')) => Some(Action::JumpBack),
+            (None, NKey::Ctrl('i')) => Some(Action::JumpForward),
             // Ctrl-h/l like moving between Vim windows; Ctrl+arrows arrive as arrows.
             (None, NKey::Char('h') | NKey::Left | NKey::Ctrl('h')) => Some(Action::FocusChats),
             (None, NKey::Char('l') | NKey::Right | NKey::Ctrl('l')) => Some(Action::FocusMessages),
@@ -918,6 +921,8 @@ mod tests {
         let mut p = Pending::default();
         assert_eq!(p.feed(NKey::Ctrl('h')), Some(Action::FocusChats));
         assert_eq!(p.feed(NKey::Ctrl('l')), Some(Action::FocusMessages));
+        assert_eq!(p.feed(NKey::Ctrl('o')), Some(Action::JumpBack));
+        assert_eq!(p.feed(NKey::Ctrl('i')), Some(Action::JumpForward));
         assert_eq!(feed("][="), vec![Action::Faster, Action::Slower, Action::NormalSpeed]);
         assert_eq!(feed("}{"), vec![Action::Louder, Action::Quieter]);
         assert_eq!(feed("mU"), vec![Action::Mute, Action::Leave]);

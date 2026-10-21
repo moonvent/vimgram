@@ -98,7 +98,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `gx`, `2gx`, click on a link | open the (n-th) link of the message: t.me links and @mentions open here, at the post; web and e-mail links in the browser; a #hashtag shows only the chat's messages with it (`Esc` shows all again, at the message under the cursor) |
 | `gu`, `gk` | the first unread message of the topmost private chat (`gu`) or channel (`gk`) with unread ones, opened in the folder it is in |
 | `gc`, click on "💬 N comments" | the comments of a channel post: `i` comments, `r` answers a comment, `Esc` (or `Ctrl-o`) goes back to the post |
-| `Ctrl-o` | back to where `gf`, `gc` or a t.me link came from |
+| `Ctrl-o`, `Ctrl-i` | back to the chat (and message, and folder) you came from — by `gu`/`gk`, `gf`, `gc`, a t.me link or opening another chat — and forward again |
 | `ge`, `Ctrl-.` in insert mode, `:emoji`, the 😀 button | emoji panel: `h`/`j`/`k`/`l` move, `Enter` inserts, `Tab`/`[`/`]`/`1`–`0` groups, `/` search by name, `Esc` closes |
 | `yy`, `Y` | copy message text (or chat title) to the clipboard |
 | `p` / `P` | paste the clipboard at the end / start of the message; a copied image or file becomes an attachment |
