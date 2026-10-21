@@ -653,6 +653,44 @@ fn merge_albums(msgs: &mut Vec<Msg>) {
     *msgs = merged;
 }
 
+/// A file on its way to or from Telegram, from TDLib's file updates.
+#[derive(Debug, Clone, Copy)]
+struct Transfer {
+    done: i64,
+    /// Bytes in all, exact or expected; 0 when unknown.
+    total: i64,
+    upload: bool,
+}
+
+/// Downloads smaller than this (avatars, thumbnails) come and go too fast
+/// to be worth showing.
+const SHOWN_DOWNLOAD: i64 = 256 * 1024;
+
+/// What the status line shows while something loads.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Busy {
+    /// Files going up (`up`), down (`down`) or both; how far they all
+    /// are, if their sizes are known.
+    Files { count: usize, up: bool, down: bool, progress: Option<f32> },
+    /// Chats, messages or search results being fetched.
+    Loading,
+}
+
+fn files_busy<'a>(transfers: impl Iterator<Item = &'a Transfer>) -> Option<Busy> {
+    let shown: Vec<&Transfer> = transfers.filter(|t| t.upload || t.total >= SHOWN_DOWNLOAD).collect();
+    if shown.is_empty() {
+        return None;
+    }
+    let known = shown.iter().all(|t| t.total > 0);
+    let (done, total) = shown.iter().fold((0, 0), |(d, t), x| (d + x.done.min(x.total), t + x.total));
+    Some(Busy::Files {
+        count: shown.len(),
+        up: shown.iter().any(|t| t.upload),
+        down: shown.iter().any(|t| !t.upload),
+        progress: known.then(|| done as f32 / total.max(1) as f32),
+    })
+}
+
 #[derive(Default)]
 struct ListLoad {
     loading: bool,
@@ -696,6 +734,8 @@ pub struct App {
     /// Remembered selection of folders that are not shown.
     folder_selection: HashMap<ListKey, i64>,
     list_load: HashMap<ListKey, ListLoad>,
+    /// Files being downloaded or uploaded, by file id.
+    transfers: HashMap<i32, Transfer>,
     /// Chat ids shown in the sidebar: current folder, filtered, sorted.
     pub list: Vec<i64>,
     list_dirty: bool,
@@ -873,6 +913,7 @@ impl App {
             cmdline: Input::default(),
             filter: String::new(),
             global: Global::default(),
+            transfers: HashMap::new(),
             hit: None,
             pending: Pending::default(),
             text_pending: TextPending::default(),
@@ -931,6 +972,7 @@ impl App {
 
     pub fn subscription(&self) -> Subscription<Message> {
         let ticking = self.animating
+            || self.busy().is_some()
             || self.recorder.is_some()
             || self.voice.is_some()
             || self.video.is_some();
@@ -953,6 +995,18 @@ impl App {
             },
             tick,
         ])
+    }
+
+    /// Files on their way and their progress, else whether anything else
+    /// is being fetched.
+    pub fn busy(&self) -> Option<Busy> {
+        if let Some(files) = files_busy(self.transfers.values()) {
+            return Some(files);
+        }
+        let loading = self.open.as_ref().is_some_and(|o| o.loading)
+            || self.list_load.get(&self.current_list()).is_some_and(|l| l.loading)
+            || self.global.loading;
+        loading.then_some(Busy::Loading)
     }
 
     pub fn current_list(&self) -> ListKey {
@@ -1994,6 +2048,16 @@ impl App {
             }
             Update::File(u) => {
                 let file = u.file;
+                let total = file.size.max(file.expected_size);
+                if file.remote.is_uploading_active {
+                    let done = file.remote.uploaded_size;
+                    self.transfers.insert(file.id, Transfer { done, total, upload: true });
+                } else if file.local.is_downloading_active {
+                    let done = file.local.downloaded_size;
+                    self.transfers.insert(file.id, Transfer { done, total, upload: false });
+                } else {
+                    self.transfers.remove(&file.id);
+                }
                 if file.local.is_downloading_completed
                     && let Some((chat_id, msg_id)) = self.file_owner.get(&file.id).copied()
                     && let Some(archive) = &self.archive
@@ -5044,6 +5108,25 @@ fn parse_when(arg: &str, now: chrono::DateTime<chrono::Local>) -> Option<i32> {
 mod tests {
     use super::*;
     use chrono::NaiveDate;
+
+    #[test]
+    fn busy_files_sum_progress_and_skip_small_downloads() {
+        let t = |done, total, upload| Transfer { done, total, upload };
+        assert_eq!(files_busy([t(10, 1000, false)].iter()), None);
+        let mb = 1 << 20;
+        assert_eq!(
+            files_busy([t(mb, 4 * mb, false), t(0, 1000, false)].iter()),
+            Some(Busy::Files { count: 1, up: false, down: true, progress: Some(0.25) })
+        );
+        assert_eq!(
+            files_busy([t(mb, 2 * mb, false), t(500, 1000, true)].iter()),
+            Some(Busy::Files { count: 2, up: true, down: true, progress: Some((mb + 500) as f32 / (2 * mb + 1000) as f32) })
+        );
+        assert_eq!(
+            files_busy([t(5, 0, true)].iter()),
+            Some(Busy::Files { count: 1, up: true, down: false, progress: None })
+        );
+    }
 
     #[test]
     fn schedule_times() {

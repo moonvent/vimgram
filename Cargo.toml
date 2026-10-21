@@ -1,6 +1,6 @@
 [package]
 name = "vimgram"
-version = "1.0.37"
+version = "1.0.38"
 edition = "2024"
 description = "Keyboard-only, Vim-style Telegram client"
 license = "MIT"
@@ -16,7 +16,7 @@ gstreamer = "0.23"
 gstreamer-app = "0.23"
 gstreamer-pbutils = "0.23"
 gstreamer-video = "0.23"
-iced = { version = "0.14", features = ["tokio", "image", "advanced"] }
+iced = { version = "0.14", features = ["tokio", "image", "advanced", "canvas"] }
 iced_video_player = "0.6"
 image = "0.25"
 notify-rust = "4.18.2"

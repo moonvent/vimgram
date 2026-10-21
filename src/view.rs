@@ -5,14 +5,14 @@ use chrono::{DateTime, Local};
 use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Column, Row, center, column, container, image, mouse_area, progress_bar, rich_text, row, rule, scrollable,
+    Column, Row, canvas, center, column, container, image, mouse_area, progress_bar, rich_text, row, rule, scrollable,
     slider, space, span, stack, text, tooltip,
 };
 use iced::mouse::Interaction;
 use iced::{Alignment, Color, ContentFit, Element, Font, Length, Size, Theme, font};
 use iced_video_player::VideoPlayer;
 
-use crate::app::{App, Auth, Chat, Compose, Confirm, Focus, Message, Pane, COMPOSE_ID, SPOILER_LINK, TALL_ID, VideoPlayback, VoicePlayback};
+use crate::app::{App, Auth, Busy, Chat, Compose, Confirm, Focus, Message, Pane, COMPOSE_ID, SPOILER_LINK, TALL_ID, VideoPlayback, VoicePlayback};
 use crate::config;
 use crate::emoji::{self, Picker};
 use crate::fonts::{self, EMOJI};
@@ -2283,6 +2283,83 @@ fn playback_status(app: &App) -> Option<String> {
     ))
 }
 
+/// Something loading, right of the mode: a ring filling up with the
+/// progress of the files on their way, or spinning when it's not known.
+fn busy_indicator<'a>(app: &App, busy: Busy) -> Element<'a, Message> {
+    let spin = app.now.saturating_duration_since(app.clock).as_secs_f32();
+    let (progress, label) = match busy {
+        Busy::Files { count, up, down, progress } => {
+            let arrow = match (up, down) {
+                (true, true) => "⇅",
+                (true, false) => "↑",
+                _ => "↓",
+            };
+            let what = if count > 1 { format!("{arrow} {} files", fmt_count(count)) } else { arrow.to_owned() };
+            let label = match progress {
+                Some(p) => format!("{what} {}%", (p * 100.0).floor() as u32),
+                None => what,
+            };
+            (progress, label)
+        }
+        Busy::Loading => (None, "Loading".to_owned()),
+    };
+    row![
+        canvas(Ring { progress, spin }).width(BUSY_RING).height(BUSY_RING),
+        text(label).size(12).style(primary_text).wrapping(Wrapping::None),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+const BUSY_RING: f32 = 16.0;
+
+/// A progress ring: an arc from the top as far as `progress` goes, or a
+/// quarter turning round when it's `None`.
+struct Ring {
+    progress: Option<f32>,
+    /// Seconds since the app started, for the turning arc.
+    spin: f32,
+}
+
+impl canvas::Program<Message> for Ring {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &iced::Renderer,
+        theme: &Theme,
+        bounds: iced::Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        use std::f32::consts::{FRAC_PI_2, TAU};
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let center = frame.center();
+        let width = 2.5;
+        let radius = bounds.width.min(bounds.height) / 2.0 - width;
+        let accent = theme.palette().primary;
+        let stroke = |color| canvas::Stroke::default().with_width(width).with_color(color).with_line_cap(canvas::LineCap::Round);
+        frame.stroke(&canvas::Path::circle(center, radius), stroke(accent.scale_alpha(0.25)));
+        let (start, sweep) = match self.progress {
+            Some(p) => (-FRAC_PI_2, p.clamp(0.0, 1.0) * TAU),
+            None => ((self.spin * TAU) % TAU, TAU / 4.0),
+        };
+        if sweep > 0.0 {
+            let arc = canvas::Path::new(|b| {
+                b.arc(canvas::path::Arc {
+                    center,
+                    radius,
+                    start_angle: iced::Radians(start),
+                    end_angle: iced::Radians(start + sweep),
+                })
+            });
+            frame.stroke(&arc, stroke(accent));
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
 fn status_line(app: &App) -> Element<'_, Message> {
     let mode = app.mode;
     let visual = app.visual.is_some() && mode == Mode::Normal;
@@ -2304,6 +2381,8 @@ fn status_line(app: &App) -> Element<'_, Message> {
                 ..Default::default()
             }
         });
+
+    let busy = app.busy().map(|busy| busy_indicator(app, busy));
 
     let viewer_hint = match app.viewer_media() {
         _ if !app.viewer_keys() => None,
@@ -2362,7 +2441,7 @@ fn status_line(app: &App) -> Element<'_, Message> {
             .unwrap_or_default(),
     };
 
-    let mut line = row![badge, container(middle).width(Length::Fill).clip(true)]
+    let mut line = row![badge].push(busy).push(container(middle).width(Length::Fill).clip(true))
         .spacing(12)
         .align_y(Alignment::Center);
     if let Some(playback) = playback_status(app) {
