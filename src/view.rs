@@ -43,7 +43,7 @@ pub const MAX_COMPOSE_LINES: usize = 8;
 const COMPOSE_BUTTON: f32 = 32.0;
 const COMPOSE_GAP: f32 = 8.0;
 const BANNER_H: f32 = 24.0;
-const REPLY_H: f32 = 33.0;
+const REPLY_H: f32 = 28.0;
 const PHOTO_MAX: Size = Size::new(420.0, 380.0);
 const VIDEO_MAX: Size = Size::new(420.0, 340.0);
 const ROUND_VIDEO: f32 = 220.0;
@@ -1625,9 +1625,9 @@ fn reply_quote<'a>(app: &'a App, reply_to: i64) -> Element<'a, Message> {
         }
         None => "↪ reply".to_owned(),
     };
-    container(emoji_text(&label).size(18).wrapping(Wrapping::None).style(muted_text))
+    container(emoji_text(&label).size(15).wrapping(Wrapping::None).style(muted_text))
         .height(REPLY_H - 4.0)
-        .padding([0, 12])
+        .padding([0, 10])
         .align_y(Alignment::Center)
         .clip(true)
         .style(|t: &Theme| container::Style {
