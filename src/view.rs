@@ -1974,18 +1974,55 @@ fn video_progress<'a>(app: &App, video: &iced_video_player::Video) -> Element<'a
         .into()
 }
 
-/// Line editor contents with a cursor bar when it is being edited.
-fn input_text<'a>(input: &Input, editing: bool, mask: bool, prefix: &str) -> Element<'a, Message> {
+/// Line editor contents with a cursor bar when it is being edited, the
+/// text wrapped at `width`. The bar is drawn over the text instead of
+/// being a character in it, so it takes no room: a `▏` glyph is a whole
+/// cell wide and left what looked like a space after the cursor.
+fn input_text<'a>(input: &Input, editing: bool, mask: bool, prefix: &str, width: f32) -> Element<'a, Message> {
     let (before, after) = input.split();
     let show = |s: &str| if mask { "•".repeat(s.chars().count()) } else { s.to_owned() };
-    let content = if editing {
-        // A left-aligned bar hugs the previous character instead of floating
-        // in the middle of a cell like `│`, which looked like a space.
-        format!("{prefix}{}▏{}", show(before), show(after))
-    } else {
-        format!("{prefix}{}", show(input.as_str()))
-    };
-    emoji_text(&content).size(TEXT).into()
+    let before = format!("{prefix}{}", show(before));
+    let content = format!("{before}{}", show(after));
+    let shown = emoji_text(&content).size(TEXT);
+    if !editing {
+        return shown.into();
+    }
+    let (x, y, height) = caret(&content, before.len(), width);
+    let bar = container(space::horizontal().width(2).height(height))
+        .style(|t: &Theme| container::background(t.palette().primary));
+    stack![shown, container(bar).padding(iced::Padding { top: y, left: (x - 1.0).max(0.0), ..Default::default() })]
+        .into()
+}
+
+/// Where the cursor at byte `at` of `content` falls once it is laid out
+/// like the compose text: x, top of its line, line height.
+fn caret(content: &str, at: usize, width: f32) -> (f32, f32, f32) {
+    use iced::advanced::graphics::text::Paragraph;
+    use iced::advanced::text::{self as core_text, Paragraph as _};
+    let spans: Vec<text::Span<'_, ()>> = emoji_spans(content).collect();
+    let paragraph = Paragraph::with_spans(core_text::Text {
+        content: spans.as_slice(),
+        bounds: Size::new(width, f32::INFINITY),
+        size: TEXT.into(),
+        line_height: text::LineHeight::default(),
+        font: Font::DEFAULT,
+        align_x: core_text::Alignment::Default,
+        align_y: iced::alignment::Vertical::Top,
+        shaping: text::Shaping::Advanced,
+        wrapping: Wrapping::Word,
+    });
+    // cosmic-text counts bytes from the start of each paragraph line.
+    let line = content[..at].matches('\n').count();
+    let offset = at - content[..at].rfind('\n').map_or(0, |i| i + 1);
+    let fallback = text::LineHeight::default().to_absolute(TEXT.into()).0;
+    let mut last = None;
+    for run in paragraph.buffer().layout_runs().filter(|r| r.line_i == line) {
+        if let Some(glyph) = run.glyphs.iter().find(|g| g.start >= offset) {
+            return (glyph.x, run.line_top, run.line_height);
+        }
+        last = Some((run.line_w, run.line_top, run.line_height));
+    }
+    last.unwrap_or((0.0, line as f32 * fallback, fallback))
 }
 
 /// "📎 photo.png" or "📎 3 files: a.png, b.mp4, …"
@@ -2071,7 +2108,7 @@ fn compose(app: &App) -> Element<'_, Message> {
             .into()
     } else {
         // Longer than the box: scrolled to the cursor by the app.
-        scrollable(input_text(&app.input, editing, false, ""))
+        scrollable(input_text(&app.input, editing, false, "", width))
             .id(COMPOSE_ID)
             .direction(Direction::Vertical(Scrollbar::hidden()))
             .width(Length::Fill)
@@ -2129,7 +2166,7 @@ fn auth_screen(app: &App) -> Element<'_, Message> {
 
     if asks_input {
         form = form.push(
-            container(input_text(&app.input, editing, mask, ""))
+            container(input_text(&app.input, editing, mask, "", 380.0 - 24.0))
                 .padding([8, 12])
                 .width(Length::Fill)
                 .style(move |t: &Theme| {
@@ -2249,8 +2286,8 @@ fn status_line(app: &App) -> Element<'_, Message> {
                 .style(|t: &Theme| text::Style { color: Some(t.palette().danger) })
                 .into()
         }
-        Mode::Command => input_text(&app.cmdline, true, false, ":"),
-        Mode::Search => input_text(&app.cmdline, true, false, "/"),
+        Mode::Command => input_text(&app.cmdline, true, false, ":", f32::INFINITY),
+        Mode::Search => input_text(&app.cmdline, true, false, "/", f32::INFINITY),
         Mode::Record => recording_status(app),
         _ => match (&app.status, viewer_hint) {
             (Some(status), _) => {
@@ -2334,6 +2371,27 @@ mod tests {
         let (side, _) = messages_viewport(size, &input, false, false, false, false, true);
         assert_eq!(side_width(size), 500.0);
         assert_eq!(full - side, 501.0);
+    }
+
+    #[test]
+    fn caret_sits_between_letters_and_follows_wrapping() {
+        let wide = f32::INFINITY;
+        let (start, top, height) = caret("hello world", 0, wide);
+        assert_eq!((start, top), (0.0, 0.0));
+        assert!(height > TEXT);
+        let (mid, _, _) = caret("hello world", 5, wide);
+        let (end, _, _) = caret("hello world", 11, wide);
+        assert!(0.0 < mid && mid < end);
+        // The letters before the cursor are where they are without it.
+        assert_eq!(caret("hello", 5, wide).0, mid);
+        let (x, y, _) = caret("hello\nworld", 9, wide);
+        assert_eq!(y, height);
+        assert_eq!(x, caret("wor", 3, wide).0);
+        // A word that no longer fits goes to the next line, the cursor in it too.
+        let narrow = caret("hello wor", 9, wide).0;
+        let (x, y, _) = caret("hello world", 9, narrow);
+        assert_eq!(y, height);
+        assert_eq!(x, caret("wor", 3, wide).0);
     }
 
     #[test]
