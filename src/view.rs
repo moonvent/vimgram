@@ -43,7 +43,7 @@ pub const MAX_COMPOSE_LINES: usize = 8;
 const COMPOSE_BUTTON: f32 = 32.0;
 const COMPOSE_GAP: f32 = 8.0;
 const BANNER_H: f32 = 36.0;
-const REPLY_H: f32 = 22.0;
+const REPLY_H: f32 = 33.0;
 const PHOTO_MAX: Size = Size::new(420.0, 380.0);
 const VIDEO_MAX: Size = Size::new(420.0, 340.0);
 const ROUND_VIDEO: f32 = 220.0;
@@ -83,7 +83,7 @@ pub fn emoji_rows(height: f32) -> usize {
 /// Date separator above the first message of each day.
 const DAY_H: f32 = 30.0;
 /// "Forwarded from …" line above a forwarded message.
-const FORWARD_H: f32 = 18.0;
+const FORWARD_H: f32 = 27.0;
 /// Reactions under a message: one chip, a line of chips with the space
 /// between lines, and a pessimistic chip width.
 const REACTION_CHIP_H: f32 = 24.0;
@@ -1625,9 +1625,9 @@ fn reply_quote<'a>(app: &'a App, reply_to: i64) -> Element<'a, Message> {
         }
         None => "↪ reply".to_owned(),
     };
-    container(emoji_text(&label).size(12).wrapping(Wrapping::None).style(muted_text))
+    container(emoji_text(&label).size(18).wrapping(Wrapping::None).style(muted_text))
         .height(REPLY_H - 4.0)
-        .padding([0, 8])
+        .padding([0, 12])
         .align_y(Alignment::Center)
         .clip(true)
         .style(|t: &Theme| container::Style {
@@ -1731,7 +1731,7 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
         };
         body = body.push(
             mouse_area(
-                container(text(format!("Forwarded from {from}")).size(12).wrapping(Wrapping::None).style(primary_text))
+                container(text(format!("Forwarded from {from}")).size(18).wrapping(Wrapping::None).style(primary_text))
                     .height(FORWARD_H - 2.0)
                     .align_y(Alignment::Center)
                     .clip(true),
