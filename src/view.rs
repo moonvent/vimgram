@@ -884,7 +884,8 @@ fn list_row<'a>(
     .into()
 }
 
-/// Selected row: a tint of the accent color when the pane has focus, a
+/// Selected row: a strong tint of the accent color with a solid accent
+/// outline when the pane has focus, so the active pane stands out; only a
 /// neutral lift otherwise. The text keeps the theme's own colors, so it
 /// stays readable either way.
 fn selection_style(t: &Theme, selected: bool, focused: bool) -> container::Style {
@@ -894,24 +895,28 @@ fn selection_style(t: &Theme, selected: bool, focused: bool) -> container::Style
     let p = t.extended_palette();
     if focused {
         container::Style {
-            background: Some(p.primary.base.color.scale_alpha(0.22).into()),
-            border: iced::border::width(1).color(p.primary.base.color.scale_alpha(0.5)),
+            background: Some(p.primary.base.color.scale_alpha(0.35).into()),
+            border: iced::border::width(2).color(p.primary.base.color).rounded(4),
             ..Default::default()
         }
     } else {
         container::Style {
-            background: Some(p.background.weak.color.scale_alpha(0.7).into()),
+            background: Some(p.background.weak.color.scale_alpha(0.5).into()),
             ..Default::default()
         }
     }
 }
 
-/// The message under the cursor: a neutral lift with a thin accent
-/// outline, so sender colors, times and ticks stay readable.
-fn message_style(t: &Theme, selected: bool) -> container::Style {
+/// The message under the cursor: a neutral lift with a solid accent
+/// outline, so sender colors, times and ticks stay readable. Messages taken
+/// in by visual mode only get the lift and a faint outline.
+fn message_style(t: &Theme, selected: bool, visual: bool) -> container::Style {
     let mut style = container::Style::default();
+    let p = t.extended_palette();
     if selected {
-        let p = t.extended_palette();
+        style.background = Some(p.background.weak.color.scale_alpha(0.7).into());
+        style.border = style.border.width(2).color(p.primary.base.color).rounded(4);
+    } else if visual {
         style.background = Some(p.background.weak.color.scale_alpha(0.6).into());
         style.border = style.border.width(1).color(p.primary.base.color.scale_alpha(0.45));
     }
@@ -1772,11 +1777,11 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
         );
     }
 
-    let highlighted = selected || app.in_visual(m.id);
+    let visual = app.in_visual(m.id);
     let bubble = container(body)
         .padding(iced::Padding { top: 6.0, bottom: 10.0, left: 10.0, right: 10.0 })
         .width(Length::Fill)
-        .style(move |t: &Theme| message_style(t, highlighted));
+        .style(move |t: &Theme| message_style(t, selected, visual));
     let channel = app.chats.get(&m.chat_id).is_some_and(|c| c.kind == ChatKind::Channel);
     let face: Element<_> = if show_avatar && !channel {
         let name = app.sender_name(sender);
