@@ -1778,6 +1778,10 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
     }
 
     let visual = app.in_visual(m.id);
+    // While writing, the compose box is what stands out; the message
+    // replied to or edited only keeps a faint outline.
+    let typing = matches!(app.mode, Mode::Insert | Mode::Text);
+    let (selected, visual) = (selected && !typing, visual || selected && typing);
     let bubble = container(body)
         .padding(iced::Padding { top: 6.0, bottom: 10.0, left: 10.0, right: 10.0 })
         .width(Length::Fill)
@@ -2163,7 +2167,22 @@ fn compose(app: &App) -> Element<'_, Message> {
         .width(Length::Fill)
         .max_height(compose_height(&app.input, width, has_banner(app)))
         .clip(true)
+        .style(move |t: &Theme| compose_style(t, editing))
         .into()
+}
+
+/// The compose box being written in: a tint and a solid outline of the
+/// accent color, like the selected row of the focused pane.
+fn compose_style(t: &Theme, editing: bool) -> container::Style {
+    if !editing {
+        return container::Style::default();
+    }
+    let p = t.extended_palette();
+    container::Style {
+        background: Some(p.primary.base.color.scale_alpha(0.12).into()),
+        border: iced::border::width(2).color(p.primary.base.color).rounded(4),
+        ..Default::default()
+    }
 }
 
 fn auth_screen(app: &App) -> Element<'_, Message> {
