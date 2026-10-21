@@ -64,7 +64,7 @@ pub const SPOILER_LINK: &str = "spoiler:";
 pub const PINNED_TAG: &str = "📌";
 
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes  J/K gt/gT Alt-N folders  \
-                    Enter open/play  i/I/a/A insert  Esc then vim keys in the text  q record  r reply  R react  cc/e edit  f forward  v visual  dd delete  \
+                    Enter open/play  gu/gk unread private chat/channel  i/I/a/A insert  Esc then vim keys in the text  q record  r reply  R react  cc/e edit  f forward  v visual  dd delete  \
                     yy/Y copy  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  { } volume  H/L seek  m mute  U leave/join  gc comments  \
                     / search chats, Telegram or messages  :posts public posts  n/N next/prev match or pinned  ga attach  gp pinned  gP all pinned  gf original/reply  gx link  ^o back  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
@@ -96,6 +96,9 @@ pub enum Message {
     Window {
         chat_id: i64,
         target: i64,
+        /// The cursor goes to the first message after `target`: the last
+        /// one read, for `gu` / `gk`.
+        after: bool,
         result: Result<Vec<Msg>, String>,
     },
     Count {
@@ -404,6 +407,8 @@ pub struct Chat {
     pub unread: i32,
     /// Outgoing messages up to this id were read by the other side.
     pub read_outbox: i64,
+    /// Incoming messages up to this id you have read.
+    read_inbox: i64,
     mute: Mute,
     /// All of its notification settings, to change one keeping the rest.
     notify: ChatNotificationSettings,
@@ -557,6 +562,16 @@ impl OpenChat {
     /// Index of the message with this id, also when it is part of an album.
     pub fn position(&self, id: i64) -> Option<usize> {
         self.msgs.iter().rposition(|m| m.contains(id))
+    }
+
+    /// The first loaded message newer than `id`, if `id` itself is loaded
+    /// or older ones are: otherwise what comes after it is not known yet.
+    fn first_after(&self, id: i64) -> Option<usize> {
+        let newest = |m: &Msg| m.members.iter().copied().fold(m.id, i64::max);
+        if self.msgs.first().is_none_or(|m| m.id > id) {
+            return None;
+        }
+        self.msgs.iter().position(|m| newest(m) > id)
     }
 
     pub fn current(&self) -> Option<&Msg> {
@@ -1344,6 +1359,41 @@ impl App {
         Task::perform(tray.clone().set_unread(unread), |()| Message::Done(Ok(())))
     }
 
+    /// `gu` / `gk`: the topmost private chat (or channel) with unread
+    /// messages, in the folder it is in, at its first unread message.
+    fn first_unread(&mut self, channel: bool) -> Task<Message> {
+        let found = self
+            .chats
+            .values()
+            .filter(|c| c.unread > 0 && matches!(c.kind, ChatKind::Channel) == channel)
+            .filter(|c| channel || matches!(c.kind, ChatKind::Private(_)))
+            .filter_map(|c| Some((c.order(ListKey::Main)?, c.id, c.read_inbox)))
+            .max();
+        let Some((_, chat_id, read)) = found else {
+            self.info(if channel { "No unread channels" } else { "No unread private chats" });
+            return Task::none();
+        };
+        // Its own folder rather than all chats; the open one if it's there.
+        let chat = &self.chats[&chat_id];
+        let folder = if chat.order(self.current_list()).is_some() {
+            self.folder
+        } else {
+            self.folders
+                .iter()
+                .position(|f| matches!(f.key, ListKey::Folder(_)) && chat.order(f.key).is_some())
+                .or_else(|| self.folders.iter().position(|f| f.key == ListKey::Main))
+                .unwrap_or(self.folder)
+        };
+        self.clear_filter();
+        let load = self.switch_folder(folder);
+        self.hit = None;
+        self.selected = Some(chat_id);
+        self.scroll_chats();
+        // Never read: from the latest messages.
+        let open = self.open_chat_near(chat_id, (read != 0).then_some((read, true)));
+        Task::batch([load, open])
+    }
+
     /// Select a chat in the sidebar, switching to the main list if the
     /// current folder doesn't have it.
     fn select_chat(&mut self, chat_id: i64) {
@@ -1397,7 +1447,7 @@ impl App {
                 self.select_message(msg_id);
                 self.open_comments()
             }
-            Message::Window { chat_id, target, result } => self.on_window(chat_id, target, result),
+            Message::Window { chat_id, target, after, result } => self.on_window(chat_id, target, after, result),
             Message::Count { chat_id, tag, result } => {
                 if let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id && o.tag == tag) {
                     open.total = result.ok();
@@ -1822,6 +1872,7 @@ impl App {
                     last,
                     unread: c.unread_count,
                     read_outbox: c.last_read_outbox_message_id,
+                    read_inbox: c.last_read_inbox_message_id,
                     mute: Mute::of(&c.notification_settings),
                     notify: c.notification_settings.clone(),
                     supergroup: ChatKind::supergroup(&c.r#type),
@@ -1903,6 +1954,7 @@ impl App {
             Update::ChatReadInbox(u) => {
                 if let Some(chat) = self.chats.get_mut(&u.chat_id) {
                     chat.unread = u.unread_count;
+                    chat.read_inbox = u.last_read_inbox_message_id;
                     self.list_dirty = true;
                 }
                 // Read here or on another device: its notifications go away.
@@ -2534,11 +2586,17 @@ impl App {
 
     /// Put the cursor on a message, loading the history around it if needed.
     fn jump_to_message(&mut self, id: i64) -> Task<Message> {
+        self.jump_to(id, false)
+    }
+
+    /// To message `id`, or with `after` to the first one after it.
+    fn jump_to(&mut self, id: i64, after: bool) -> Task<Message> {
         let Some(open) = self.open.as_mut() else {
             return Task::none();
         };
         self.focus = Focus::Messages;
-        if let Some(i) = open.position(id) {
+        let loaded = if after { open.first_after(id) } else { open.position(id) };
+        if let Some(i) = loaded {
             open.cursor = i;
             self.scroll_messages();
             return Task::none();
@@ -2557,7 +2615,7 @@ impl App {
         open.loading = true;
         let half = HISTORY_PAGE / 2;
         let window = Task::perform(tg::history(chat_id, id, -half, HISTORY_PAGE), move |result| {
-            Message::Window { chat_id, target: id, result }
+            Message::Window { chat_id, target: id, after, result }
         });
         Task::batch([count, window])
     }
@@ -2655,7 +2713,7 @@ impl App {
         Task::batch([count, load])
     }
 
-    fn on_window(&mut self, chat_id: i64, target: i64, result: Result<Vec<Msg>, String>) -> Task<Message> {
+    fn on_window(&mut self, chat_id: i64, target: i64, after: bool, result: Result<Vec<Msg>, String>) -> Task<Message> {
         let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id && o.tag.is_none()) else {
             return Task::none();
         };
@@ -2680,7 +2738,9 @@ impl App {
         open.exhausted = false;
         open.at_latest = false;
         open.edit(|msgs| msgs.extend(batch));
-        open.cursor = open.position(target).unwrap_or(0);
+        let found = if after { open.first_after(target) } else { open.position(target) };
+        // Nothing after the last one read: the newest there is.
+        open.cursor = found.unwrap_or(if after { open.msgs.len().saturating_sub(1) } else { 0 });
         open.bottom = open.cursor;
         self.reset_tall();
         self.scroll_messages();
@@ -2818,12 +2878,18 @@ impl App {
 
     /// Open a chat at its latest messages, or around message `at`.
     fn open_chat_at(&mut self, id: i64, at: Option<i64>) -> Task<Message> {
+        self.open_chat_near(id, at.map(|msg| (msg, false)))
+    }
+
+    /// Open a chat at its latest messages, or around message `at`, the
+    /// cursor on it or (`true`) on the one after it.
+    fn open_chat_near(&mut self, id: i64, at: Option<(i64, bool)>) -> Task<Message> {
         self.focus = Focus::Messages;
         let mut tasks = Vec::new();
         if let Some(prev) = self.open.take() {
             if prev.id == id && prev.thread.is_none() {
                 self.open = Some(prev);
-                return at.map_or_else(Task::none, |msg| self.jump_to_message(msg));
+                return at.map_or_else(Task::none, |(msg, after)| self.jump_to(msg, after));
             }
             tasks.push(Task::perform(tg::close_chat(prev.id), Message::Done));
         }
@@ -2836,7 +2902,7 @@ impl App {
         tasks.push(Self::load_pinned(id));
         self.reset_tall();
         tasks.push(match at {
-            Some(msg) => self.jump_to_message(msg),
+            Some((msg, after)) => self.jump_to(msg, after),
             None => self.load_history(false),
         });
         Task::batch(tasks)
@@ -4188,6 +4254,7 @@ impl App {
             Action::NextFolder => self.cycle_folder(1),
             Action::PrevFolder => self.cycle_folder(-1),
             Action::Folder(index) => self.switch_folder(index),
+            Action::FirstUnread { channel } => self.first_unread(channel),
             // h / l: one pane left / right (folders, chats, messages).
             Action::FocusChats => {
                 self.focus = match self.focus {
@@ -5169,6 +5236,19 @@ mod tests {
             comments: None,
             thread: 0,
         }
+    }
+
+    #[test]
+    fn first_message_after_the_last_read() {
+        let mut open = OpenChat::new(1);
+        open.msgs = vec![msg(10, 0), msg(12, 0), Msg { members: vec![13, 14], ..msg(13, 5) }, msg(20, 0)];
+        assert_eq!(open.first_after(10), Some(1));
+        assert_eq!(open.first_after(11), Some(1));
+        assert_eq!(open.first_after(13), Some(2));
+        assert_eq!(open.first_after(14), Some(3));
+        assert_eq!(open.first_after(20), None);
+        // Older than what is loaded: what follows it may not be loaded.
+        assert_eq!(open.first_after(5), None);
     }
 
     #[test]

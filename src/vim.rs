@@ -169,6 +169,9 @@ pub enum Action {
     Emoji,
     /// Back to the voice message playing in another chat (`gv`).
     JumpPlaying,
+    /// The first unread message of the topmost unread private chat (`gu`)
+    /// or channel (`gk`), in its folder.
+    FirstUnread { channel: bool },
     SearchNext,
     SearchPrev,
     Cancel,
@@ -212,6 +215,8 @@ impl Pending {
             (Some('g'), NKey::Char('x')) => Some(Action::OpenLink(explicit.unwrap_or(1))),
             (Some('g'), NKey::Char('e')) => Some(Action::Emoji),
             (Some('g'), NKey::Char('v')) => Some(Action::JumpPlaying),
+            (Some('g'), NKey::Char('u')) => Some(Action::FirstUnread { channel: false }),
+            (Some('g'), NKey::Char('k')) => Some(Action::FirstUnread { channel: true }),
             (Some('y'), NKey::Char('y')) => Some(Action::Yank),
             // `cc` changes the line in Vim; here it edits the message.
             (Some('c'), NKey::Char('c')) => Some(Action::Edit),
@@ -904,6 +909,7 @@ mod tests {
         assert_eq!(feed("gagpgP"), vec![Action::Attach, Action::Pinned, Action::PinnedList]);
         assert_eq!(feed("ge"), vec![Action::Emoji]);
         assert_eq!(feed("gv"), vec![Action::JumpPlaying]);
+        assert_eq!(feed("gugk"), vec![Action::FirstUnread { channel: false }, Action::FirstUnread { channel: true }]);
         assert_eq!(feed("rR"), vec![Action::Reply, Action::React]);
         assert_eq!(feed("gf"), vec![Action::GoToSource]);
         assert_eq!(feed("gccc"), vec![Action::Comments, Action::Edit]);
