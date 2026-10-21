@@ -84,7 +84,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `Tab` | switch between chat list and messages |
 | `J` / `K`, `gt` / `gT`, `3gt`, `Alt-1…9` | next / previous / n-th folder |
 | `Enter`, `o` | open chat (a channel opens beside the list, focus stays there; `Enter` again goes to the posts); view photo or video; play voice message or music; show a spoiler (text or media; clicking it does too) |
-| `i`, `a` | insert mode (write message / login field) |
+| `i`, `I`, `a`, `A` | insert mode (write message / login field); `I` starts at the beginning of the message, `a`/`A` at its end |
 | `r` | reply to the message under the cursor |
 | `R` | react to the message: `h`/`j`/`k`/`l` + `Enter` or `1`–`9` picks, `/` searches, the same reaction again takes it back; clicking a reaction under a message toggles it too |
 | `cc`, `e` | edit your message |
@@ -129,7 +129,14 @@ starting with what you typed; the history survives restarts.
 
 Insert mode: `Enter` sends, `Shift+Enter` new line, `Ctrl-v` paste (text, or a copied
 image / files as attachments), `Ctrl-w` delete word, `Ctrl-u` delete to start, `↑` in an empty line edits your last
-message. Two to ten photos and videos go as an album. Music files (mp3, m4a, flac, ogg, opus,
+message. `Esc` with some text written goes to Text mode instead of the message list.
+
+Text mode (`TEXT` in the status line): Vim keys inside the message being written. `h`/`l`,
+`w`/`b`/`e` (`W`/`B`/`E`), `0`/`^`/`$`, `j`/`k` between lines, `gg`/`G` move; `d`, `c`, `y`
+take a motion (`dw`, `cw`, `d$`, `y2w`), doubled for the whole line (`dd`, `cc`, `yy`);
+`x`/`X`, `D`, `C`, `s`/`S`, `Y`, `~`; `i`/`a`/`I`/`A`/`o`/`O` go back to typing; `p`/`P`
+paste; `u` undo, `Ctrl-r` redo; counts work (`3w`, `2dd`). `Enter` sends, `Esc` goes to the
+message list, the text stays. Two to ten photos and videos go as an album. Music files (mp3, m4a, flac, ogg, opus,
 wav) go as music, with title and artist from their tags; several of them as an album too.
 
 When a voice or round video message ends and the very next message is one too, it plays

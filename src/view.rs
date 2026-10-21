@@ -1979,29 +1979,46 @@ fn video_progress<'a>(app: &App, video: &iced_video_player::Video) -> Element<'a
         .into()
 }
 
-/// Line editor contents with a cursor bar when it is being edited, the
-/// text wrapped at `width`. The bar is drawn over the text instead of
-/// being a character in it, so it takes no room: a `▏` glyph is a whole
-/// cell wide and left what looked like a space after the cursor.
-fn input_text<'a>(input: &Input, editing: bool, mask: bool, prefix: &str, width: f32) -> Element<'a, Message> {
+/// How the cursor of a line editor shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Caret {
+    Hidden,
+    /// Typing: a bar between two letters.
+    Bar,
+    /// Text mode: a block over the letter under the cursor, like Vim.
+    Block,
+}
+
+/// Line editor contents with its cursor, the text wrapped at `width`. The
+/// cursor is drawn over the text instead of being a character in it, so it
+/// takes no room: a `▏` glyph is a whole cell wide and left what looked like
+/// a space after the cursor.
+fn input_text<'a>(input: &Input, shown_caret: Caret, mask: bool, prefix: &str, width: f32) -> Element<'a, Message> {
     let (before, after) = input.split();
     let show = |s: &str| if mask { "•".repeat(s.chars().count()) } else { s.to_owned() };
     let before = format!("{prefix}{}", show(before));
     let content = format!("{before}{}", show(after));
     let shown = emoji_text(&content).size(TEXT);
-    if !editing {
+    if shown_caret == Caret::Hidden {
         return shown.into();
     }
-    let (x, y, height) = caret(&content, before.len(), width);
-    let bar = container(space::horizontal().width(2).height(height))
-        .style(|t: &Theme| container::background(t.palette().primary));
-    stack![shown, container(bar).padding(iced::Padding { top: y, left: (x - 1.0).max(0.0), ..Default::default() })]
-        .into()
+    let (x, y, height, letter) = caret(&content, before.len(), width);
+    let (left, bar_width, alpha) = match shown_caret {
+        Caret::Block => (x, if letter > 0.0 { letter } else { TEXT * 0.55 }, 0.45),
+        _ => ((x - 1.0).max(0.0), 2.0, 1.0),
+    };
+    let bar = container(space::horizontal().width(bar_width).height(height))
+        .style(move |t: &Theme| container::background(t.palette().primary.scale_alpha(alpha)));
+    // The text's layer sets the size of the stack, and an empty text has
+    // none: a full-width line keeps the cursor from being cut off.
+    let base = row![space::vertical().width(0).height(height), shown].width(Length::Fill);
+    stack![base, container(bar).padding(iced::Padding { top: y, left, ..Default::default() })].into()
 }
 
 /// Where the cursor at byte `at` of `content` falls once it is laid out
-/// like the compose text: x, top of its line, line height.
-fn caret(content: &str, at: usize, width: f32) -> (f32, f32, f32) {
+/// like the compose text: x, top of its line, line height, and the width of
+/// the letter under it (0 at the end of a line).
+fn caret(content: &str, at: usize, width: f32) -> (f32, f32, f32, f32) {
     use iced::advanced::graphics::text::Paragraph;
     use iced::advanced::text::{self as core_text, Paragraph as _};
     let spans: Vec<text::Span<'_, ()>> = emoji_spans(content).collect();
@@ -2023,11 +2040,11 @@ fn caret(content: &str, at: usize, width: f32) -> (f32, f32, f32) {
     let mut last = None;
     for run in paragraph.buffer().layout_runs().filter(|r| r.line_i == line) {
         if let Some(glyph) = run.glyphs.iter().find(|g| g.start >= offset) {
-            return (glyph.x, run.line_top, run.line_height);
+            return (glyph.x, run.line_top, run.line_height, glyph.w);
         }
-        last = Some((run.line_w, run.line_top, run.line_height));
+        last = Some((run.line_w, run.line_top, run.line_height, 0.0));
     }
-    last.unwrap_or((0.0, line as f32 * fallback, fallback))
+    last.unwrap_or((0.0, line as f32 * fallback, fallback, 0.0))
 }
 
 /// "📎 photo.png" or "📎 3 files: a.png, b.mp4, …"
@@ -2098,7 +2115,12 @@ fn compose(app: &App) -> Element<'_, Message> {
     if let Some(chat) = app.open.as_ref().filter(|o| app.read_only(o.id)).and_then(|o| app.chats.get(&o.id)) {
         return channel_bar(app, chat);
     }
-    let editing = app.mode == Mode::Insert;
+    let caret = match app.mode {
+        Mode::Insert => Caret::Bar,
+        Mode::Text => Caret::Block,
+        _ => Caret::Hidden,
+    };
+    let editing = caret != Caret::Hidden;
     let width = compose_text_width(app.size, app.emoji.is_some(), app.side_viewer());
     let lines = compose_lines(app.input.as_str(), width).clamp(1, MAX_COMPOSE_LINES);
     let content: Element<_> = if app.input.is_empty() && !editing {
@@ -2113,7 +2135,7 @@ fn compose(app: &App) -> Element<'_, Message> {
             .into()
     } else {
         // Longer than the box: scrolled to the cursor by the app.
-        scrollable(input_text(&app.input, editing, false, "", width))
+        scrollable(input_text(&app.input, caret, false, "", width))
             .id(COMPOSE_ID)
             .direction(Direction::Vertical(Scrollbar::hidden()))
             .width(Length::Fill)
@@ -2171,7 +2193,7 @@ fn auth_screen(app: &App) -> Element<'_, Message> {
 
     if asks_input {
         form = form.push(
-            container(input_text(&app.input, editing, mask, "", 380.0 - 24.0))
+            container(input_text(&app.input, if editing { Caret::Bar } else { Caret::Hidden }, mask, "", 380.0 - 24.0))
                 .padding([8, 12])
                 .width(Length::Fill)
                 .style(move |t: &Theme| {
@@ -2253,6 +2275,7 @@ fn status_line(app: &App) -> Element<'_, Message> {
                 Mode::Normal if visual => p.secondary.strong,
                 Mode::Normal => p.primary.strong,
                 Mode::Insert => p.success.base,
+                Mode::Text => p.success.strong,
                 Mode::Command | Mode::Search => p.warning.base,
                 Mode::Record => p.danger.base,
             };
@@ -2291,8 +2314,8 @@ fn status_line(app: &App) -> Element<'_, Message> {
                 .style(|t: &Theme| text::Style { color: Some(t.palette().danger) })
                 .into()
         }
-        Mode::Command => input_text(&app.cmdline, true, false, ":", f32::INFINITY),
-        Mode::Search => input_text(&app.cmdline, true, false, "/", f32::INFINITY),
+        Mode::Command => input_text(&app.cmdline, Caret::Bar, false, ":", f32::INFINITY),
+        Mode::Search => input_text(&app.cmdline, Caret::Bar, false, "/", f32::INFINITY),
         Mode::Record => recording_status(app),
         _ => match (&app.status, viewer_hint) {
             (Some(status), _) => {
@@ -2327,7 +2350,7 @@ fn status_line(app: &App) -> Element<'_, Message> {
         line = line.push(text(playback).size(13).style(primary_text));
     }
     line = line
-        .push(text(app.pending.display()).size(13))
+        .push(text(if mode == Mode::Text { app.text_pending.display() } else { app.pending.display() }).size(13))
         .push(text(position).size(13));
 
     container(line)
@@ -2381,22 +2404,23 @@ mod tests {
     #[test]
     fn caret_sits_between_letters_and_follows_wrapping() {
         let wide = f32::INFINITY;
-        let (start, top, height) = caret("hello world", 0, wide);
+        let x = |content: &str, at: usize, width: f32| caret(content, at, width).0;
+        let (start, top, height, letter) = caret("hello world", 0, wide);
         assert_eq!((start, top), (0.0, 0.0));
-        assert!(height > TEXT);
-        let (mid, _, _) = caret("hello world", 5, wide);
-        let (end, _, _) = caret("hello world", 11, wide);
+        assert!(height > TEXT && letter > 0.0);
+        let (mid, end) = (x("hello world", 5, wide), x("hello world", 11, wide));
         assert!(0.0 < mid && mid < end);
+        assert_eq!(caret("hello world", 11, wide).3, 0.0);
         // The letters before the cursor are where they are without it.
-        assert_eq!(caret("hello", 5, wide).0, mid);
-        let (x, y, _) = caret("hello\nworld", 9, wide);
+        assert_eq!(x("hello", 5, wide), mid);
+        let (at, y, _, _) = caret("hello\nworld", 9, wide);
         assert_eq!(y, height);
-        assert_eq!(x, caret("wor", 3, wide).0);
+        assert_eq!(at, x("wor", 3, wide));
         // A word that no longer fits goes to the next line, the cursor in it too.
-        let narrow = caret("hello wor", 9, wide).0;
-        let (x, y, _) = caret("hello world", 9, narrow);
+        let narrow = x("hello wor", 9, wide);
+        let (at, y, _, _) = caret("hello world", 9, narrow);
         assert_eq!(y, height);
-        assert_eq!(x, caret("wor", 3, wide).0);
+        assert_eq!(at, x("wor", 3, wide));
     }
 
     #[test]

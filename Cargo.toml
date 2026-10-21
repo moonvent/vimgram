@@ -1,6 +1,6 @@
 [package]
 name = "vimgram"
-version = "1.0.34"
+version = "1.0.35"
 edition = "2024"
 description = "Keyboard-only, Vim-style Telegram client"
 license = "MIT"

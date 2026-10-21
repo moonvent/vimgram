@@ -21,7 +21,7 @@ use crate::tg::{
     self, ChatKind, Folder, ListKey, Media, Membership, Msg, Presence, ReactionKind, Scope, SendOptions, Sender, User,
 };
 use crate::view;
-use crate::vim::{Action, History, Input, Mode, NKey, Pending, normalize};
+use crate::vim::{Action, History, Input, Mode, NKey, Pending, TextAction, TextPending, normalize};
 use crate::voice::Recorder;
 
 const HISTORY_PAGE: i32 = 50;
@@ -64,7 +64,7 @@ pub const SPOILER_LINK: &str = "spoiler:";
 pub const PINNED_TAG: &str = "📌";
 
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes  J/K gt/gT Alt-N folders  \
-                    Enter open/play  i insert  q record  r reply  R react  cc/e edit  f forward  v visual  dd delete  \
+                    Enter open/play  i/I/a/A insert  Esc then vim keys in the text  q record  r reply  R react  cc/e edit  f forward  v visual  dd delete  \
                     yy/Y copy  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  { } volume  H/L seek  m mute  U leave/join  gc comments  \
                     / search chats, Telegram or messages  :posts public posts  n/N next/prev match or pinned  ga attach  gp pinned  gP all pinned  gf original/reply  gx link  ^o back  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
@@ -751,6 +751,7 @@ pub struct App {
     /// The cursor of the chat list is on this message of `global`.
     pub hit: Option<usize>,
     pub pending: Pending,
+    pub text_pending: TextPending,
     pub status: Option<Status>,
     pub theme: Theme,
     pub size: Size,
@@ -874,6 +875,7 @@ impl App {
             global: Global::default(),
             hit: None,
             pending: Pending::default(),
+            text_pending: TextPending::default(),
             status: None,
             theme,
             size: Size::new(1200.0, 800.0),
@@ -3422,11 +3424,12 @@ impl App {
     // ---- keyboard ------------------------------------------------------
 
     fn on_key(&mut self, key: &Key, physical: Physical, mods: Modifiers, text: Option<&str>) -> Task<Message> {
-        if self.emoji.is_some() && matches!(self.mode, Mode::Insert | Mode::Normal) {
+        if self.emoji.is_some() && matches!(self.mode, Mode::Insert | Mode::Text | Mode::Normal) {
             return self.key_emoji(key, physical, mods, text);
         }
         match self.mode {
             Mode::Insert => self.key_insert(key, physical, mods, text),
+            Mode::Text => self.key_text(key, physical, mods),
             Mode::Command | Mode::Search => self.key_cmdline(key, physical, mods, text),
             Mode::Record => match normalize(key, physical, mods) {
                 Some(NKey::Char('q') | NKey::Enter) => self.finish_recording(),
@@ -3488,7 +3491,7 @@ impl App {
     fn insert_emoji(&mut self, e: &str) {
         self.input.insert(e);
         emoji::remember(&mut self.recent_emoji, e);
-        if self.mode == Mode::Normal {
+        if matches!(self.mode, Mode::Normal | Mode::Text) {
             self.mode = Mode::Insert;
         }
     }
@@ -3737,12 +3740,56 @@ impl App {
         match edit(&mut self.input, key, physical, mods, text) {
             Edit::Submit if self.auth == Auth::Ready => self.send(),
             Edit::Submit => self.submit_auth(),
+            // A message being written stays under a Vim cursor: Text mode.
+            Edit::Cancel if self.auth == Auth::Ready && !self.input.is_empty() => {
+                self.input.leave_insert();
+                self.text_pending.clear();
+                self.mode = Mode::Text;
+                Task::none()
+            }
             Edit::Cancel => {
                 self.mode = Mode::Normal;
                 Task::none()
             }
             Edit::Paste => self.read_clipboard(PasteTarget::Input(None)),
             Edit::Changed | Edit::Ignored => Task::none(),
+        }
+    }
+
+    /// Text mode: Vim motions and operators in the message being written.
+    fn key_text(&mut self, key: &Key, physical: Physical, mods: Modifiers) -> Task<Message> {
+        let key = match key {
+            Key::Named(Named::Backspace) => Some(NKey::Left),
+            Key::Named(Named::Delete) => Some(NKey::Char('x')),
+            Key::Named(Named::Home) => Some(NKey::Char('0')),
+            Key::Named(Named::End) => Some(NKey::Char('$')),
+            _ => normalize(key, physical, mods),
+        };
+        let Some(key) = key else {
+            return Task::none();
+        };
+        match self.text_pending.feed(key, &mut self.input) {
+            TextAction::None => Task::none(),
+            TextAction::Insert => {
+                self.mode = Mode::Insert;
+                Task::none()
+            }
+            TextAction::Leave => {
+                self.mode = Mode::Normal;
+                Task::none()
+            }
+            TextAction::Submit => {
+                let task = self.send();
+                if self.input.is_empty() {
+                    self.mode = Mode::Normal;
+                }
+                task
+            }
+            TextAction::Paste => self.read_clipboard(PasteTarget::Input(None)),
+            TextAction::Yank(text) => {
+                self.info("Copied to clipboard");
+                iced::clipboard::write(text)
+            }
         }
     }
 
@@ -3923,6 +3970,10 @@ impl App {
                     None => {}
                 }
                 self.input.insert(&text);
+                if self.mode == Mode::Text {
+                    // Onto the last pasted char, like Vim's `p`.
+                    self.input.leave_insert();
+                }
                 self.scroll_messages();
             }
         }
@@ -4149,10 +4200,16 @@ impl App {
                 }
                 _ => Task::none(),
             },
-            Action::Insert => {
+            Action::Insert | Action::InsertStart | Action::Append => {
                 if self.auth == Auth::Ready && self.open.is_none() {
                     self.error("Open a chat first (Enter)");
                 } else if self.auth != Auth::Ready || self.may_post() {
+                    self.input.checkpoint();
+                    match action {
+                        Action::InsertStart => self.input.home(),
+                        Action::Append => self.input.end(),
+                        _ => {}
+                    }
                     self.mode = Mode::Insert;
                 }
                 Task::none()
