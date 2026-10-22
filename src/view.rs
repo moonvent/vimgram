@@ -2391,10 +2391,10 @@ fn status_line(app: &App) -> Element<'_, Message> {
     let viewer_hint = match app.viewer_media() {
         _ if !app.viewer_keys() => None,
         Some(Media::Video { .. }) if app.viewer_side => Some(
-            "Space pause   h/l ±5s   H/L ±30s   [ ] speed   = 1x   { } volume   j/k next/prev   Tab messages   s full screen   Esc close",
+            "Space pause   h/l ±5s   H/L ±30s   [ ] speed   = 1x   ↑/↓ volume   m mute   j/k next/prev   Tab messages   s full screen   Esc close",
         ),
         Some(Media::Video { .. }) => Some(
-            "Space pause   h/l ±5s   H/L ±30s   [ ] speed   = 1x   { } volume   j/k next/prev   s beside the chat   Esc close",
+            "Space pause   h/l ±5s   H/L ±30s   [ ] speed   = 1x   ↑/↓ volume   m mute   j/k next/prev   s beside the chat   Esc close",
         ),
         Some(_) if app.viewer_side => Some("j/k — next/previous   Tab — messages   s — full screen   Esc — close"),
         Some(_) => Some("j/k — next/previous   s — beside the chat   Esc — close"),

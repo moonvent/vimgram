@@ -776,6 +776,8 @@ pub struct App {
     speeds: Speeds,
     /// Of videos and voice messages, 0.0–1.0.
     volume: f64,
+    /// Sound off (`m` in the viewer); `volume` stays for when it is back on.
+    silent: bool,
     pub media: Store,
     /// Time base for animations: frame = (now - clock) / frame time.
     pub clock: Instant,
@@ -919,6 +921,7 @@ impl App {
             resume: HashMap::new(),
             speeds: Speeds::load(),
             volume: player::load_volume(),
+            silent: false,
             media: Store::default(),
             clock: Instant::now(),
             now: Instant::now(),
@@ -3255,8 +3258,9 @@ impl App {
         if chosen == Duration::ZERO && start > Duration::ZERO {
             self.info(format!("Going on from {}", tg::fmt_duration(start.as_secs() as i32)));
         }
+        let volume = self.sound();
         if let Some(voice) = self.voice.as_mut() {
-            match Audio::open(&path, self.speeds.get(voice.kind), self.volume, start) {
+            match Audio::open(&path, self.speeds.get(voice.kind), volume, start) {
                 Ok(audio) => voice.audio = Some(audio),
                 Err(e) => {
                     self.voice = None;
@@ -3395,7 +3399,7 @@ impl App {
                     movie: None,
                     speed_pending: false,
                 });
-                let (speed, volume) = (self.speeds.get(kind), self.volume);
+                let (speed, volume) = (self.speeds.get(kind), self.sound());
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || player::open_video(file_id, speed, volume).map(Shared::new))
@@ -3597,17 +3601,40 @@ impl App {
         self.speeds.get(self.speed_kind())
     }
 
-    /// One volume for videos and voice messages, kept across restarts.
+    /// One volume for videos and voice messages, kept across restarts;
+    /// changing it turns the sound back on.
     fn set_volume(&mut self, volume: f64) {
         self.volume = volume;
+        self.silent = false;
         player::save_volume(volume);
+        self.apply_sound();
+        self.info(format!("Volume {}", player::fmt_volume(volume)));
+    }
+
+    /// Sound off, or back on at the volume it had (`m` in the viewer).
+    fn toggle_silent(&mut self) {
+        self.silent = !self.silent;
+        self.apply_sound();
+        self.info(if self.silent {
+            "Sound off (m turns it back on)".to_owned()
+        } else {
+            format!("Sound on, volume {}", player::fmt_volume(self.volume))
+        });
+    }
+
+    /// The volume players get: none while the sound is off.
+    fn sound(&self) -> f64 {
+        if self.silent { 0.0 } else { self.volume }
+    }
+
+    fn apply_sound(&mut self) {
+        let volume = self.sound();
         if let Some(movie) = self.video.as_mut().and_then(VideoPlayback::movie_mut) {
             movie.set_volume(volume);
         }
         if let Some(audio) = self.voice.as_ref().and_then(|v| v.audio.as_ref()) {
             audio.set_volume(volume);
         }
-        self.info(format!("Volume {}", player::fmt_volume(volume)));
     }
 
     fn set_speed(&mut self, speed: f64) {
@@ -3848,8 +3875,8 @@ impl App {
             return Task::none();
         };
         let next = match key {
-            NKey::Char('j' | 'n') | NKey::Down => open.viewable_near(viewer, 1),
-            NKey::Char('k' | 'p') | NKey::Up => open.viewable_near(viewer, -1),
+            NKey::Char('j' | 'n') => open.viewable_near(viewer, 1),
+            NKey::Char('k' | 'p') => open.viewable_near(viewer, -1),
             NKey::Char('h') | NKey::Left => {
                 self.seek(-SEEK_SHORT);
                 None
@@ -3879,12 +3906,17 @@ impl App {
                 self.set_speed(1.0);
                 None
             }
-            NKey::Char('}') => {
+            // Like a video on a web page: arrows up and down, `m` mutes.
+            NKey::Up | NKey::Char('}') => {
                 self.set_volume(player::louder(self.volume));
                 None
             }
-            NKey::Char('{') => {
+            NKey::Down | NKey::Char('{') => {
                 self.set_volume(player::quieter(self.volume));
+                None
+            }
+            NKey::Char('m') => {
+                self.toggle_silent();
                 None
             }
             NKey::Esc | NKey::Enter | NKey::Char('q' | 'o') => {

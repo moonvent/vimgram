@@ -147,7 +147,7 @@ plays on the same way, track after track, but only into more music. A voice mess
 for another one (or for a video, or stopped with ✕) goes on where it was, 5 seconds earlier.
 
 Photo/video viewer: `j`/`k` next/previous, `h`/`l` seek ±5s, `H`/`L` ±30s, `Space` pause,
-`[` `]` `=` speed, `{` `}` volume, `Esc` close. Under a video: time played, progress and length.
+`[` `]` `=` speed, `↑`/`↓` (or `{` `}`) volume, `m` sound off / on, `Esc` close. Under a video: time played, progress and length.
 `s` switches between full screen and beside the chat (`viewer = "side"` starts there). Beside the
 chat `Tab` (or `Ctrl-h`) gives the keys back to the messages while it plays on, `Tab` or `l` there
 (or a click on it) returns to it, and `Esc` in the messages closes it.
