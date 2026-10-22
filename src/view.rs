@@ -1706,7 +1706,7 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
     if let Some(mark) = mark_text(delivery_mark(app, m)) {
         header = header.push(mark);
     }
-    // Marked with `t`, like a chat marked to forward to.
+    // Marked with `v`, like a chat marked to forward to.
     if app.is_marked(m.id) {
         header = header.push(text("✓").size(15).style(primary_text));
     }

@@ -64,7 +64,7 @@ pub const SPOILER_LINK: &str = "spoiler:";
 pub const PINNED_TAG: &str = "📌";
 
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes  J/K gt/gT Alt-N folders  \
-                    Enter open/play  gu/gk unread private chat/channel  i/I/a/A insert  Esc then vim keys in the text  q record  r reply  R react  cc/e edit  f forward  v visual  t mark  dd delete  \
+                    Enter open/play  gu/gk unread private chat/channel  i/I/a/A insert  Esc then vim keys in the text  q record  r reply  R react  cc/e edit  f forward  v mark  V visual  dd delete  \
                     yy/Y copy  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  { } volume  H/L seek  m mute  U leave/join  gc comments  \
                     / search chats, Telegram or messages  :posts public posts  n/N next/prev match or pinned  ga attach  gp pinned  gP all pinned  gf original/reply  gx link  ^o/^i back/forward between chats  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
@@ -802,7 +802,7 @@ pub struct App {
     jumping: bool,
     /// Visual selection in the open chat: the message it started at.
     pub visual: Option<i64>,
-    /// Messages of the open chat marked one by one with `t`, gaps allowed.
+    /// Messages of the open chat marked one by one with `v`, gaps allowed.
     pub marks: Vec<i64>,
     /// Chats marked with `v` to forward to, in the order marked.
     pub forward_marks: Vec<i64>,
@@ -4298,9 +4298,33 @@ impl App {
         self.visual.is_some() || !self.marks.is_empty()
     }
 
-    /// The message is marked with `t`.
+    /// The message is marked with `v`.
     pub fn is_marked(&self, id: i64) -> bool {
         self.marks.contains(&id)
+    }
+
+    /// Mark the message under the cursor, or the Visual range as a whole;
+    /// unmark them if they all were.
+    fn toggle_marks(&mut self) {
+        let ids: Vec<i64> = if self.visual.is_some() {
+            self.open.iter().flat_map(|o| &o.msgs).filter(|m| self.in_visual(m.id)).map(|m| m.id).collect()
+        } else {
+            self.focused_message().map(|m| m.id).into_iter().collect()
+        };
+        self.visual = None;
+        if ids.iter().all(|id| self.marks.contains(id)) {
+            self.marks.retain(|id| !ids.contains(id));
+        } else {
+            for id in ids {
+                if !self.marks.contains(&id) {
+                    self.marks.push(id);
+                }
+            }
+        }
+        self.info(match self.marks.len() {
+            0 => "No messages marked".to_owned(),
+            n => format!("{} marked: v marks more, f forward, y copy, d delete, Esc cancel", tg::fmt_count(n)),
+        });
     }
 
     fn end_selection(&mut self) {
@@ -4630,6 +4654,17 @@ impl App {
                 Task::none()
             }
             Action::Visual => {
+                if self.focus == Focus::Messages && self.open.as_ref().is_some_and(|o| !o.msgs.is_empty()) {
+                    if self.visual.take().is_none() {
+                        self.visual = self.focused_message().map(|m| m.id);
+                        self.info("Visual: j/k select, v mark, f forward, y copy, d delete, Esc cancel");
+                    }
+                } else {
+                    self.error("V selects messages (l to get there)");
+                }
+                Task::none()
+            }
+            Action::Mark => {
                 match self.focus {
                     Focus::Chats if self.forward.is_some() => {
                         if let Some(id) = self.selected {
@@ -4647,41 +4682,9 @@ impl App {
                             });
                         }
                     }
-                    Focus::Messages if self.open.as_ref().is_some_and(|o| !o.msgs.is_empty()) => {
-                        if self.visual.take().is_none() {
-                            self.visual = self.focused_message().map(|m| m.id);
-                            self.info("Visual: j/k select, t mark, f forward, y copy, d delete, Esc cancel");
-                        }
-                    }
-                    _ => self.error("v selects messages (l to get there), or marks chats while forwarding"),
+                    Focus::Messages if self.open.as_ref().is_some_and(|o| !o.msgs.is_empty()) => self.toggle_marks(),
+                    _ => self.error("v marks messages (l to get there), or chats while forwarding"),
                 }
-                Task::none()
-            }
-            Action::Mark => {
-                if self.focus != Focus::Messages || self.open.as_ref().is_none_or(|o| o.msgs.is_empty()) {
-                    self.error("t marks messages (l to get there)");
-                    return Task::none();
-                }
-                // A Visual range is marked as a whole, or unmarked if it all was.
-                let ids: Vec<i64> = if self.visual.is_some() {
-                    self.open.iter().flat_map(|o| &o.msgs).filter(|m| self.in_visual(m.id)).map(|m| m.id).collect()
-                } else {
-                    self.focused_message().map(|m| m.id).into_iter().collect()
-                };
-                self.visual = None;
-                if ids.iter().all(|id| self.marks.contains(id)) {
-                    self.marks.retain(|id| !ids.contains(id));
-                } else {
-                    for id in ids {
-                        if !self.marks.contains(&id) {
-                            self.marks.push(id);
-                        }
-                    }
-                }
-                self.info(match self.marks.len() {
-                    0 => "No messages marked".to_owned(),
-                    n => format!("{} marked: t marks more, f forward, y copy, d delete, Esc cancel", tg::fmt_count(n)),
-                });
                 Task::none()
             }
             Action::Cancel => {

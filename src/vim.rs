@@ -158,11 +158,10 @@ pub enum Action {
     GoToSource,
     /// The comments of a channel post (`gc`).
     Comments,
-    /// Messages: start / end a Visual selection. Picking chats to forward
-    /// to: mark / unmark the chat (`v`).
+    /// Messages: start / end a Visual selection (`V`).
     Visual,
     /// Mark / unmark the message, or the Visual range, to act on several
-    /// with gaps between them (`t`, like tagging in mutt).
+    /// with gaps between them; picking chats to forward to, the chat (`v`).
     Mark,
     /// Open the n-th (1-based) link of the message (`gx`, `2gx`).
     OpenLink(usize),
@@ -268,8 +267,8 @@ impl Pending {
             (None, NKey::Char('L')) => Some(Action::SeekForward),
             (None, NKey::Char('r')) => Some(Action::Reply),
             (None, NKey::Char('R')) => Some(Action::React),
-            (None, NKey::Char('v')) => Some(Action::Visual),
-            (None, NKey::Char('t')) => Some(Action::Mark),
+            (None, NKey::Char('v')) => Some(Action::Mark),
+            (None, NKey::Char('V')) => Some(Action::Visual),
             (None, NKey::Char('e')) => Some(Action::Edit),
             (None, NKey::Char('f')) => Some(Action::Forward),
             (None, NKey::Char('n')) => Some(Action::SearchNext),
@@ -920,8 +919,8 @@ mod tests {
         assert_eq!(feed("rR"), vec![Action::Reply, Action::React]);
         assert_eq!(feed("gf"), vec![Action::GoToSource]);
         assert_eq!(feed("gccc"), vec![Action::Comments, Action::Edit]);
-        assert_eq!(feed("vjf"), vec![Action::Visual, Action::Down(1), Action::Forward]);
-        assert_eq!(feed("tjtf"), vec![Action::Mark, Action::Down(1), Action::Mark, Action::Forward]);
+        assert_eq!(feed("Vjf"), vec![Action::Visual, Action::Down(1), Action::Forward]);
+        assert_eq!(feed("vjvf"), vec![Action::Mark, Action::Down(1), Action::Mark, Action::Forward]);
         assert_eq!(feed("gx2gx"), vec![Action::OpenLink(1), Action::OpenLink(2)]);
         let mut p = Pending::default();
         assert_eq!(p.feed(NKey::Ctrl('h')), Some(Action::FocusChats));

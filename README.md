@@ -89,7 +89,8 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `R` | react to the message: `h`/`j`/`k`/`l` + `Enter` or `1`–`9` picks, `/` searches, the same reaction again takes it back; clicking a reaction under a message toggles it too |
 | `cc`, `e` | edit your message |
 | `f` | forward: pick a chat, `Enter` sends; `v` marks several chats (✓), `Enter` then sends to all of them; `i` writes a comment that goes before the forwarded messages (`Enter` in it sends too) |
-| `v` | Visual: select messages with `j`/`k`/`gg`/`G`, then `f` forward, `y` copy their text, `d` delete; `v`/`Esc` ends it |
+| `v` | mark / unmark the message (✓), with gaps between marked ones; then `f` forward, `y` copy their text, `d` delete all of them; `Esc` clears the marks |
+| `V` | Visual: select messages with `j`/`k`/`gg`/`G`, then `f` forward, `y` copy their text, `d` delete, `v` marks the whole range; `V`/`Esc` ends it |
 | `dd` | delete message: `y` for everyone, `m` only for me |
 | `ga`, `:attach [path]` | attach photos, videos or files (system file picker without a path); `Enter` sends, the text is the caption |
 | `gp`, click on the pinned bar, `:pin` | jump to the pinned message the bar shows (the newest one above the cursor; `3 / 5` on the right counts them, the oldest is 1); `gp` again goes to the one before it, round to the newest; after it `n` / `N` go to the older / newer pinned messages |
