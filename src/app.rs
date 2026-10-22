@@ -64,7 +64,7 @@ pub const SPOILER_LINK: &str = "spoiler:";
 pub const PINNED_TAG: &str = "📌";
 
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes  J/K gt/gT Alt-N folders  \
-                    Enter open/play  gu/gk unread private chat/channel  i/I/a/A insert  Esc then vim keys in the text  q record  r reply  R react  cc/e edit  f forward  v visual  dd delete  \
+                    Enter open/play  gu/gk unread private chat/channel  i/I/a/A insert  Esc then vim keys in the text  q record  r reply  R react  cc/e edit  f forward  v visual  t mark  dd delete  \
                     yy/Y copy  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  { } volume  H/L seek  m mute  U leave/join  gc comments  \
                     / search chats, Telegram or messages  :posts public posts  n/N next/prev match or pinned  ga attach  gp pinned  gP all pinned  gf original/reply  gx link  ^o/^i back/forward between chats  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
@@ -802,6 +802,8 @@ pub struct App {
     jumping: bool,
     /// Visual selection in the open chat: the message it started at.
     pub visual: Option<i64>,
+    /// Messages of the open chat marked one by one with `t`, gaps allowed.
+    pub marks: Vec<i64>,
     /// Chats marked with `v` to forward to, in the order marked.
     pub forward_marks: Vec<i64>,
     pub found: Option<Found>,
@@ -932,6 +934,7 @@ impl App {
             jump_lists: HashMap::new(),
             jumping: false,
             visual: None,
+            marks: Vec::new(),
             forward_marks: Vec::new(),
             found: None,
             search_messages: false,
@@ -2688,7 +2691,7 @@ impl App {
         let chat_id = open.id;
         open.retag(Some(tag.clone()));
         self.focus = Focus::Messages;
-        self.visual = None;
+        self.end_selection();
         self.found = None;
         self.reset_tall();
         self.info(format!("Only messages with {tag} (Esc shows all)"));
@@ -2718,7 +2721,7 @@ impl App {
         let at = open.shown_pin().map(|(_, p)| p.id);
         open.fill_pins(at);
         self.focus = Focus::Messages;
-        self.visual = None;
+        self.end_selection();
         self.found = None;
         self.reset_tall();
         self.scroll_messages();
@@ -2982,7 +2985,7 @@ impl App {
     fn switch_chat(&mut self, open: OpenChat) -> Task<Message> {
         let id = open.id;
         self.open = Some(open);
-        self.visual = None;
+        self.end_selection();
         self.close_viewer();
         self.compose = Compose::New;
         self.input.clear();
@@ -3651,7 +3654,7 @@ impl App {
                     return self.key_viewer(key);
                 }
                 // Visual selection: one key acts, like Vim's `d` and `y`.
-                if self.visual.is_some() && self.focus == Focus::Messages {
+                if self.selecting() && self.focus == Focus::Messages {
                     match key {
                         NKey::Char('d' | 'x') => return self.act(Action::Delete),
                         NKey::Char('y' | 'Y') => return self.act(Action::Yank),
@@ -4278,16 +4281,31 @@ impl App {
         Task::none()
     }
 
-    /// Messages an action applies to: the Visual selection, or the one
-    /// under the cursor.
+    /// Messages an action applies to: the Visual selection and the marked
+    /// ones, in chat order, or else the one under the cursor.
     fn targets(&self) -> Vec<&Msg> {
         let Some(open) = self.open.as_ref().filter(|_| self.focus == Focus::Messages) else {
             return Vec::new();
         };
-        match self.visual.and_then(|anchor| open.position(anchor)) {
-            Some(anchor) => open.msgs[anchor.min(open.cursor)..=anchor.max(open.cursor)].iter().collect(),
-            None => open.current().into_iter().collect(),
+        if !self.selecting() {
+            return open.current().into_iter().collect();
         }
+        open.msgs.iter().filter(|m| self.in_visual(m.id) || self.is_marked(m.id)).collect()
+    }
+
+    /// A Visual selection is going or messages are marked.
+    pub fn selecting(&self) -> bool {
+        self.visual.is_some() || !self.marks.is_empty()
+    }
+
+    /// The message is marked with `t`.
+    pub fn is_marked(&self, id: i64) -> bool {
+        self.marks.contains(&id)
+    }
+
+    fn end_selection(&mut self) {
+        self.visual = None;
+        self.marks.clear();
     }
 
     /// The message is in the Visual selection.
@@ -4298,9 +4316,9 @@ impl App {
         (anchor.min(cursor.id)..=anchor.max(cursor.id)).contains(&id)
     }
 
-    /// Number of messages in the Visual selection.
+    /// Number of messages selected: in Visual and marked.
     pub fn visual_len(&self) -> usize {
-        if self.visual.is_some() { self.targets().len() } else { 0 }
+        if self.selecting() { self.targets().len() } else { 0 }
     }
 
     /// The message under the cursor, when the message pane has focus.
@@ -4514,7 +4532,7 @@ impl App {
                         self.error("Only the channel's admins delete its posts");
                     }
                     Some(chat_id) if !ids.is_empty() => {
-                        self.visual = None;
+                        self.end_selection();
                         self.confirm = Some(Confirm::Delete { chat_id, ids });
                     }
                     _ => self.error("Select a message first (l)"),
@@ -4598,7 +4616,7 @@ impl App {
                             0 | 1 => "the message".to_owned(),
                             n => format!("{} messages", tg::fmt_count(n)),
                         };
-                        self.visual = None;
+                        self.end_selection();
                         self.end_forward();
                         let draft = std::mem::take(&mut self.input);
                         self.info(format!(
@@ -4632,16 +4650,48 @@ impl App {
                     Focus::Messages if self.open.as_ref().is_some_and(|o| !o.msgs.is_empty()) => {
                         if self.visual.take().is_none() {
                             self.visual = self.focused_message().map(|m| m.id);
-                            self.info("Visual: j/k select, f forward, y copy, d delete, Esc cancel");
+                            self.info("Visual: j/k select, t mark, f forward, y copy, d delete, Esc cancel");
                         }
                     }
                     _ => self.error("v selects messages (l to get there), or marks chats while forwarding"),
                 }
                 Task::none()
             }
+            Action::Mark => {
+                if self.focus != Focus::Messages || self.open.as_ref().is_none_or(|o| o.msgs.is_empty()) {
+                    self.error("t marks messages (l to get there)");
+                    return Task::none();
+                }
+                // A Visual range is marked as a whole, or unmarked if it all was.
+                let ids: Vec<i64> = if self.visual.is_some() {
+                    self.open.iter().flat_map(|o| &o.msgs).filter(|m| self.in_visual(m.id)).map(|m| m.id).collect()
+                } else {
+                    self.focused_message().map(|m| m.id).into_iter().collect()
+                };
+                self.visual = None;
+                if ids.iter().all(|id| self.marks.contains(id)) {
+                    self.marks.retain(|id| !ids.contains(id));
+                } else {
+                    for id in ids {
+                        if !self.marks.contains(&id) {
+                            self.marks.push(id);
+                        }
+                    }
+                }
+                self.info(match self.marks.len() {
+                    0 => "No messages marked".to_owned(),
+                    n => format!("{} marked: t marks more, f forward, y copy, d delete, Esc cancel", tg::fmt_count(n)),
+                });
+                Task::none()
+            }
             Action::Cancel => {
                 self.pending.clear();
                 if self.visual.take().is_some() {
+                    return Task::none();
+                }
+                if !self.marks.is_empty() {
+                    self.marks.clear();
+                    self.info("Marks cleared");
                     return Task::none();
                 }
                 // Attachments go one per Esc, newest first.
@@ -4823,7 +4873,7 @@ impl App {
             Focus::Messages => {
                 let texts: Vec<&str> = self.targets().iter().map(|m| m.text.as_str()).filter(|t| !t.is_empty()).collect();
                 let text = texts.join("\n\n");
-                self.visual = None;
+                self.end_selection();
                 Some(text)
             }
             Focus::Chats => self.selected.and_then(|id| self.chats.get(&id)).map(|c| c.title.clone()),

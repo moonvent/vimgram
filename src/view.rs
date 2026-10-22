@@ -1646,7 +1646,7 @@ fn reply_quote<'a>(app: &'a App, reply_to: i64) -> Element<'a, Message> {
 fn message_keys(app: &App, m: &Msg) -> String {
     // Only the channel's admins delete its posts.
     let read_only = app.read_only(m.chat_id);
-    if app.visual.is_some() {
+    if app.selecting() {
         let delete = if read_only { "" } else { "  d delete" };
         return format!("{} selected  f forward  y copy{delete}  Esc cancel", fmt_count(app.visual_len()));
     }
@@ -1705,6 +1705,10 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
     }
     if let Some(mark) = mark_text(delivery_mark(app, m)) {
         header = header.push(mark);
+    }
+    // Marked with `t`, like a chat marked to forward to.
+    if app.is_marked(m.id) {
+        header = header.push(text("✓").size(15).style(primary_text));
     }
     if m.deleted {
         header = header.push(
@@ -1777,7 +1781,7 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
         );
     }
 
-    let visual = app.in_visual(m.id);
+    let visual = app.in_visual(m.id) || app.is_marked(m.id);
     // While writing, the compose box is what stands out; the message
     // replied to or edited only keeps a faint outline.
     let typing = matches!(app.mode, Mode::Insert | Mode::Text);
