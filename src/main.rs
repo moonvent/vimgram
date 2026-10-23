@@ -10,6 +10,7 @@ mod emoji;
 mod export;
 mod fonts;
 mod icon;
+mod instance;
 mod media;
 mod notify;
 mod player;
@@ -41,6 +42,9 @@ fn main() -> iced::Result {
     };
     // `--hidden`: start in the tray (used by autostart).
     let hidden = std::env::args().any(|a| a == "--hidden");
+    if instance::another_runs(hidden) {
+        return Ok(());
+    }
     if let Err(e) = fonts::setup() {
         eprintln!("vimgram: emoji will be blank: {e}; run scripts/fetch-emoji.sh");
     }

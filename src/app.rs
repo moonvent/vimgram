@@ -14,7 +14,7 @@ use crate::archive::{Archive, Record};
 use crate::config::{self, Config};
 use crate::clipboard::{self, Clip};
 use crate::emoji::{self, Picker, React};
-use crate::{autostart, export, icon, notify, tray};
+use crate::{autostart, export, icon, instance, notify, tray};
 use crate::media::{self, Kind, Loaded, Shared, Store};
 use crate::player::{self, Audio, Movie, SpeedKind, Speeds};
 use crate::tg::{
@@ -168,6 +168,8 @@ pub enum Message {
     WindowClosed(window::Id),
     CloseRequested(window::Id),
     Tray(tray::Output),
+    /// vimgram was started again: show the window.
+    AnotherStart,
     /// A notification of this chat was clicked.
     NotificationClicked(i64),
     Autostart(Result<String, String>),
@@ -1025,6 +1027,7 @@ impl App {
             window::close_requests().map(Message::CloseRequested),
             window::close_events().map(Message::WindowClosed),
             window::events().map(|(_, event)| Message::WindowEvent(event)),
+            Subscription::run(instance::listen).map(|()| Message::AnotherStart),
             if self.cfg.tray {
                 Subscription::run(tray::run).map(Message::Tray)
             } else {
@@ -1691,6 +1694,12 @@ impl App {
                 tray::Event::Toggle | tray::Event::Show => self.open_window(),
                 tray::Event::Quit => self.handle(Message::Quit),
             },
+            Message::AnotherStart => {
+                if self.window.is_some() {
+                    instance::raise();
+                }
+                self.open_window()
+            }
             Message::NotificationClicked(chat_id) => {
                 let window = self.open_window();
                 if self.auth != Auth::Ready {

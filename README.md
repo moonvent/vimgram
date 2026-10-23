@@ -184,6 +184,8 @@ App menu (Linux): every start of a release build writes
 `~/.local/share/applications/vimgram.desktop` pointing at that executable, so
 launchers (`wofi --show drun`, rofi, fuzzel) and desktops list vimgram after the first
 `cargo run --release`.
+Starting vimgram again (Linux, macOS) shows the window of the one already running, on
+Hyprland also brought to the front, and exits; a second start with `--hidden` just exits.
 
 ## Where things are
 
