@@ -65,7 +65,7 @@ pub const PINNED_TAG: &str = "📌";
 
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes  J/K gt/gT Alt-N folders  \
                     Enter open/play  gu/gk unread private chat/channel  i/I/a/A insert  Esc then vim keys in the text  q record  r reply  R react  cc/e edit  f forward  v mark  V visual  dd delete  \
-                    yy/Y copy  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  { } volume  H/L seek  m mute  U leave/join  gc comments  \
+                    yy/Y copy  gy copy part  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  { } volume  H/L seek  m mute  U leave/join  gc comments  \
                     / search chats, Telegram or messages  :posts public posts  n/N next/prev match or pinned  ga attach  gp pinned  gP all pinned  gf original/reply  gx link  ^o/^i back/forward between chats  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
                     :folder  :theme  :autostart  :cleancache  :q";
@@ -821,6 +821,8 @@ pub struct App {
     pub hit: Option<usize>,
     pub pending: Pending,
     pub text_pending: TextPending,
+    /// Read mode: the message whose text has the cursor, and that text.
+    pub reading: Option<(i64, Input)>,
     pub status: Option<Status>,
     pub theme: Theme,
     pub size: Size,
@@ -951,6 +953,7 @@ impl App {
             hit: None,
             pending: Pending::default(),
             text_pending: TextPending::default(),
+            reading: None,
             status: None,
             theme,
             size: Size::new(1200.0, 800.0),
@@ -3660,6 +3663,7 @@ impl App {
         match self.mode {
             Mode::Insert => self.key_insert(key, physical, mods, text),
             Mode::Text => self.key_text(key, physical, mods),
+            Mode::Read => self.key_read(key, physical, mods),
             Mode::Command | Mode::Search => self.key_cmdline(key, physical, mods, text),
             Mode::Record => match normalize(key, physical, mods) {
                 Some(NKey::Char('q') | NKey::Enter) => self.finish_recording(),
@@ -3993,14 +3997,7 @@ impl App {
 
     /// Text mode: Vim motions and operators in the message being written.
     fn key_text(&mut self, key: &Key, physical: Physical, mods: Modifiers) -> Task<Message> {
-        let key = match key {
-            Key::Named(Named::Backspace) => Some(NKey::Left),
-            Key::Named(Named::Delete) => Some(NKey::Char('x')),
-            Key::Named(Named::Home) => Some(NKey::Char('0')),
-            Key::Named(Named::End) => Some(NKey::Char('$')),
-            _ => normalize(key, physical, mods),
-        };
-        let Some(key) = key else {
+        let Some(key) = text_key(key, physical, mods) else {
             return Task::none();
         };
         match self.text_pending.feed(key, &mut self.input) {
@@ -4026,6 +4023,62 @@ impl App {
                 iced::clipboard::write(text)
             }
         }
+    }
+
+    /// `gy`: a cursor in the text of the message under the cursor.
+    fn read_text(&mut self) {
+        let Some(m) = self.focused_message() else {
+            self.error("Go to a message first (l)");
+            return;
+        };
+        if m.text.is_empty() {
+            self.error("No text in this message");
+            return;
+        }
+        let mut input = Input::default();
+        input.set(&m.text);
+        input.home();
+        self.reading = Some((m.id, input));
+        self.end_selection();
+        self.text_pending = TextPending::read_only();
+        self.mode = Mode::Read;
+    }
+
+    /// Read mode: moving and Visual like Text mode; copying ends it.
+    fn key_read(&mut self, key: &Key, physical: Physical, mods: Modifiers) -> Task<Message> {
+        let Some(key) = text_key(key, physical, mods) else {
+            return Task::none();
+        };
+        // The message may have gone (deleted, another chat opened).
+        let gone = self
+            .reading
+            .as_ref()
+            .is_none_or(|(id, input)| self.focused_message().is_none_or(|m| m.id != *id || m.text != input.as_str()));
+        if gone {
+            self.leave_reading();
+            return Task::none();
+        }
+        let Some((_, input)) = self.reading.as_mut() else {
+            return Task::none();
+        };
+        match self.text_pending.feed(key, input) {
+            TextAction::Yank(text) => {
+                self.leave_reading();
+                self.info("Copied to clipboard");
+                iced::clipboard::write(text)
+            }
+            TextAction::Leave => {
+                self.leave_reading();
+                Task::none()
+            }
+            _ => Task::none(),
+        }
+    }
+
+    fn leave_reading(&mut self) {
+        self.reading = None;
+        self.text_pending.clear();
+        self.mode = Mode::Normal;
     }
 
     /// `↑` in an empty compose line: edit your last text message, like Telegram.
@@ -4377,6 +4430,14 @@ impl App {
         if self.selecting() { self.targets().len() } else { 0 }
     }
 
+    /// The text Text or Read mode works in.
+    pub fn text_input(&self) -> &Input {
+        match &self.reading {
+            Some((_, input)) if self.mode == Mode::Read => input,
+            _ => &self.input,
+        }
+    }
+
     /// The message under the cursor, when the message pane has focus.
     fn focused_message(&self) -> Option<&Msg> {
         match self.focus {
@@ -4553,6 +4614,10 @@ impl App {
                 }
             }
             Action::Comments => self.open_comments(),
+            Action::ReadText => {
+                self.read_text();
+                Task::none()
+            }
             Action::JumpBack => match self.jumps.pop() {
                 Some(to) => {
                     if let Some(here) = self.here() {
@@ -5234,6 +5299,18 @@ fn parse_date(arg: &str) -> Option<chrono::NaiveDate> {
     NaiveDate::from_ymd_opt(today.year(), month.parse().ok()?, day.parse().ok()?)
 }
 
+
+/// A key in Text and Read mode: Normal-mode keys, and the editing keys
+/// that move or delete.
+fn text_key(key: &Key, physical: Physical, mods: Modifiers) -> Option<NKey> {
+    match key {
+        Key::Named(Named::Backspace) => Some(NKey::Left),
+        Key::Named(Named::Delete) => Some(NKey::Char('x')),
+        Key::Named(Named::Home) => Some(NKey::Char('0')),
+        Key::Named(Named::End) => Some(NKey::Char('$')),
+        _ => normalize(key, physical, mods),
+    }
+}
 
 /// Hand a URL to the system (browser, mail client); doesn't wait for it.
 fn open_external(url: &str) -> Result<(), String> {

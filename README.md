@@ -102,6 +102,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `Ctrl-o`, `Ctrl-i` | back to the chat (and message, and folder) you came from — by `gu`/`gk`, `gf`, `gc`, a t.me link or opening another chat — and forward again |
 | `ge`, `Ctrl-.` in insert mode, `:emoji`, the 😀 button | emoji panel: `h`/`j`/`k`/`l` move, `Enter` inserts, `Tab`/`[`/`]`/`1`–`0` groups, `/` search by name, `Esc` closes |
 | `yy`, `Y` | copy message text (or chat title) to the clipboard |
+| `gy` | copy part of the message text: a cursor in it (`READ`), the moves of Text mode, then `yiw` (the word), `yw`, `ye`, `y$`, `yy`, or `v`/`V` to select and `y`; copying or `Esc` goes back |
 | `p` / `P` | paste the clipboard at the end / start of the message; a copied image or file becomes an attachment |
 | `q` | record a voice message; `q`/`Enter` sends, `Esc` discards |
 | `Space` | play / pause voice message, music or video |
@@ -135,10 +136,13 @@ message. `Esc` with some text written goes to Text mode instead of the message l
 
 Text mode (`TEXT` in the status line): Vim keys inside the message being written. `h`/`l`,
 `w`/`b`/`e` (`W`/`B`/`E`), `0`/`^`/`$`, `j`/`k` between lines, `gg`/`G` move; `d`, `c`, `y`
-take a motion (`dw`, `cw`, `d$`, `y2w`), doubled for the whole line (`dd`, `cc`, `yy`);
-`x`/`X`, `D`, `C`, `s`/`S`, `Y`, `~`; `i`/`a`/`I`/`A`/`o`/`O` go back to typing; `p`/`P`
-paste; `u` undo, `Ctrl-r` redo; counts work (`3w`, `2dd`). `Enter` sends, `Esc` goes to the
-message list, the text stays. Two to ten photos and videos go as an album. Music files (mp3, m4a, flac, ogg, opus,
+take a motion (`dw`, `cw`, `d$`, `y2w`) or a text object (`diw`, `ciw`, `yaw`, `daW`),
+doubled for the whole line (`dd`, `cc`, `yy`); `x`/`X`, `D`, `C`, `s`/`S`, `Y`, `~`;
+`i`/`a`/`I`/`A`/`o`/`O` go back to typing; `p`/`P` paste; `u` undo, `Ctrl-r` redo; counts
+work (`3w`, `2dd`). `v` selects chars, `V` whole lines (`VISUAL`, `V-LINE`): the moves and
+`iw`/`aw` widen it, `o` goes to its other end, then `d`/`x`, `c`/`s`, `y`, `~`/`u`/`U`
+(swap / lower / upper case) act on it, `D`, `C`, `Y` on its lines; `Esc` ends it. `Enter`
+sends, `Esc` goes to the message list, the text stays. Two to ten photos and videos go as an album. Music files (mp3, m4a, flac, ogg, opus,
 wav) go as music, with title and artist from their tags; several of them as an album too.
 
 When a voice or round video message ends and the very next message is one too, it plays

@@ -9,6 +9,8 @@ pub enum Mode {
     Insert,
     /// Normal mode inside the message being written: `Esc` from Insert.
     Text,
+    /// A Vim cursor in a message's text, to copy part of it (`gy`).
+    Read,
     Command,
     Search,
     /// Recording a voice message.
@@ -21,6 +23,7 @@ impl Mode {
             Mode::Normal => "NORMAL",
             Mode::Insert => "INSERT",
             Mode::Text => "TEXT",
+            Mode::Read => "READ",
             Mode::Command => "COMMAND",
             Mode::Search => "SEARCH",
             Mode::Record => "RECORD",
@@ -158,6 +161,8 @@ pub enum Action {
     GoToSource,
     /// The comments of a channel post (`gc`).
     Comments,
+    /// A cursor in the message's text, to copy part of it (`gy`).
+    ReadText,
     /// Messages: start / end a Visual selection (`V`).
     Visual,
     /// Mark / unmark the message, or the Visual range, to act on several
@@ -216,6 +221,7 @@ impl Pending {
             (Some('g'), NKey::Char('P')) => Some(Action::PinnedList),
             (Some('g'), NKey::Char('f')) => Some(Action::GoToSource),
             (Some('g'), NKey::Char('c')) => Some(Action::Comments),
+            (Some('g'), NKey::Char('y')) => Some(Action::ReadText),
             (Some('g'), NKey::Char('x')) => Some(Action::OpenLink(explicit.unwrap_or(1))),
             (Some('g'), NKey::Char('e')) => Some(Action::Emoji),
             (Some('g'), NKey::Char('v')) => Some(Action::JumpPlaying),
@@ -415,6 +421,8 @@ enum Motion {
     Through(usize),
     /// The whole lines from the cursor's to the byte's (`j`, `k`, `gg`, `G`).
     Lines(usize),
+    /// From the first byte up to the second, wherever the cursor is (`iw`).
+    Span(usize, usize),
 }
 
 /// Vim's word classes: blanks, letters and digits, other signs.
@@ -427,6 +435,14 @@ fn class(c: char, big: bool) -> u8 {
     }
 }
 
+/// A Visual selection: from the anchor to the cursor, both included, or
+/// the whole lines they are on (`V`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Visual {
+    anchor: usize,
+    lines: bool,
+}
+
 /// Count, operator and `g` typed so far in Text mode: `3w`, `d2w`, `gg`.
 #[derive(Debug, Default)]
 pub struct TextPending {
@@ -434,18 +450,35 @@ pub struct TextPending {
     /// Operator waiting for its motion, with the count typed before it.
     op: Option<(char, usize)>,
     g: bool,
+    /// `i` or `a` after an operator or in Visual: a text object follows
+    /// (`iw`). True for `i`.
+    object: Option<bool>,
+    visual: Option<Visual>,
+    /// A message's text: only moving, selecting and copying.
+    read_only: bool,
 }
 
 impl TextPending {
+    pub fn read_only() -> Self {
+        Self {
+            read_only: true,
+            ..Self::default()
+        }
+    }
+
     pub fn feed(&mut self, key: NKey, input: &mut Input) -> TextAction {
         if let NKey::Char(c @ '0'..='9') = key
             && (c != '0' || self.count.is_some())
+            && self.object.is_none()
         {
             let digit = c.to_digit(10).unwrap() as usize;
             self.count = Some(self.count.unwrap_or(0).saturating_mul(10).saturating_add(digit));
             return TextAction::None;
         }
         let count = self.count.take();
+        if let Some(inner) = self.object.take() {
+            return self.object(key, inner, input);
+        }
         if key == NKey::Char('g') && !self.g {
             self.g = true;
             self.count = count;
@@ -458,6 +491,13 @@ impl TextPending {
             if !g && key == NKey::Char(op) {
                 let last = input.line_down(input.cursor, n - 1);
                 return input.operate(op, Motion::Lines(last));
+            }
+            if let NKey::Char(c @ ('i' | 'a')) = key
+                && !g
+            {
+                self.op = Some((op, first));
+                self.object = Some(c == 'i');
+                return TextAction::None;
             }
             // `cw` changes up to the end of the word, like Vim.
             let key = match key {
@@ -473,7 +513,7 @@ impl TextPending {
         }
         if let Some(motion) = input.motion(key, n, g, false) {
             input.cursor = match motion {
-                Motion::To(at) | Motion::Through(at) | Motion::Lines(at) => at,
+                Motion::To(at) | Motion::Through(at) | Motion::Lines(at) | Motion::Span(at, _) => at,
             };
             input.settle();
             return TextAction::None;
@@ -481,8 +521,26 @@ impl TextPending {
         if g || count.is_some() && matches!(key, NKey::Esc) {
             return TextAction::None;
         }
+        if let Some(visual) = self.visual {
+            return self.visual_key(key, visual, input);
+        }
         let at = input.cursor;
         let end = input.line_end(at);
+        if let NKey::Char(c @ ('v' | 'V')) = key {
+            self.visual = Some(Visual { anchor: at, lines: c == 'V' });
+            return TextAction::None;
+        }
+        if self.read_only {
+            return match key {
+                NKey::Char('y') => {
+                    self.op = Some(('y', n));
+                    TextAction::None
+                }
+                NKey::Char('Y') => input.operate('y', Motion::Lines(at)),
+                NKey::Esc => TextAction::Leave,
+                _ => TextAction::None,
+            };
+        }
         match key {
             NKey::Char(op @ ('d' | 'c' | 'y')) => {
                 self.op = Some((op, n));
@@ -550,24 +608,94 @@ impl TextPending {
             }
             NKey::Char('~') => {
                 let to = input.chars_right(at, n);
-                if to > at {
-                    input.checkpoint();
-                    let swapped: String = input.text[at..to]
-                        .chars()
-                        .flat_map(|c| -> Vec<char> {
-                            if c.is_uppercase() { c.to_lowercase().collect() } else { c.to_uppercase().collect() }
-                        })
-                        .collect();
-                    input.text.replace_range(at..to, &swapped);
-                    input.cursor = at + swapped.len();
-                    input.settle();
-                }
+                input.change_case(at, to, '~');
+                input.cursor = to;
+                input.settle();
                 TextAction::None
             }
             NKey::Esc => TextAction::Leave,
             NKey::Enter => TextAction::Submit,
             _ => TextAction::None,
         }
+    }
+
+    /// The key after `i` or `a`: `w` for the word, `W` for the WORD.
+    fn object(&mut self, key: NKey, inner: bool, input: &mut Input) -> TextAction {
+        let op = self.op.take();
+        let big = match key {
+            NKey::Char('w') => false,
+            NKey::Char('W') => true,
+            _ => return TextAction::None,
+        };
+        let (start, end) = input.word_object(input.cursor, inner, big);
+        if start == end {
+            return TextAction::None;
+        }
+        if let Some(visual) = self.visual.as_mut() {
+            *visual = Visual { anchor: start, lines: false };
+            input.cursor = input.text[..end].char_indices().next_back().map_or(start, |(i, _)| i);
+            return TextAction::None;
+        }
+        match op {
+            Some((op, _)) => input.operate(op, Motion::Span(start, end)),
+            None => TextAction::None,
+        }
+    }
+
+    /// A key in Visual: an operator acts on the selection and ends it.
+    fn visual_key(&mut self, key: NKey, visual: Visual, input: &mut Input) -> TextAction {
+        let at = input.cursor;
+        let anchor = input.clamp(visual.anchor);
+        let selection = if visual.lines { Motion::Lines(anchor) } else { Motion::Through(anchor) };
+        let (op, motion) = match key {
+            NKey::Char('v') if !visual.lines => ('\0', selection),
+            NKey::Char('V') if visual.lines => ('\0', selection),
+            NKey::Char(c @ ('v' | 'V')) => {
+                self.visual = Some(Visual { anchor, lines: c == 'V' });
+                return TextAction::None;
+            }
+            NKey::Esc => ('\0', selection),
+            NKey::Char('o') => {
+                input.cursor = anchor;
+                self.visual = Some(Visual { anchor: at, ..visual });
+                return TextAction::None;
+            }
+            NKey::Char(c @ ('i' | 'a')) => {
+                self.object = Some(c == 'i');
+                return TextAction::None;
+            }
+            NKey::Char('y') => ('y', selection),
+            NKey::Char('Y') => ('y', Motion::Lines(anchor)),
+            NKey::Char('d' | 'x') => ('d', selection),
+            NKey::Char('D' | 'X') => ('d', Motion::Lines(anchor)),
+            NKey::Char('c' | 's') => ('c', selection),
+            NKey::Char('C' | 'S' | 'R') => ('c', Motion::Lines(anchor)),
+            NKey::Char(c @ ('~' | 'u' | 'U')) => (c, selection),
+            _ => return TextAction::None,
+        };
+        if self.read_only && !matches!(op, 'y' | '\0') {
+            return TextAction::None;
+        }
+        self.visual = None;
+        match op {
+            '\0' => TextAction::None,
+            '~' | 'u' | 'U' => {
+                let (start, end) = input.span(motion);
+                input.change_case(start, end, op);
+                input.cursor = start;
+                input.settle();
+                TextAction::None
+            }
+            _ => input.operate(op, motion),
+        }
+    }
+
+    /// The selected bytes while in Visual, and whether whole lines.
+    pub fn selection(&self, input: &Input) -> Option<(usize, usize, bool)> {
+        let visual = self.visual?;
+        let anchor = input.clamp(visual.anchor);
+        let (start, end) = input.span(if visual.lines { Motion::Lines(anchor) } else { Motion::Through(anchor) });
+        Some((start, end, visual.lines))
     }
 
     /// Keys typed so far, for the status line.
@@ -577,11 +705,15 @@ impl TextPending {
         if self.g {
             s.push('g');
         }
+        s.extend(self.object.map(|inner| if inner { 'i' } else { 'a' }));
         s
     }
 
     pub fn clear(&mut self) {
-        *self = Self::default();
+        *self = Self {
+            read_only: self.read_only,
+            ..Self::default()
+        };
     }
 }
 
@@ -612,10 +744,7 @@ impl Input {
     fn redo(&mut self) {
         if let Some((text, cursor)) = self.redo.pop() {
             self.undo.push((std::mem::replace(&mut self.text, text), self.cursor));
-            self.cursor = cursor.min(self.text.len());
-            while !self.text.is_char_boundary(self.cursor) {
-                self.cursor -= 1;
-            }
+            self.cursor = self.clamp(cursor);
             self.settle();
         }
     }
@@ -637,6 +766,87 @@ impl Input {
 
     fn char_at(&self, at: usize) -> Option<char> {
         self.text[at..].chars().next()
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Within the text and on a char boundary.
+    fn clamp(&self, at: usize) -> usize {
+        let mut at = at.min(self.text.len());
+        while !self.text.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    }
+
+    /// Where the run of chars of the class of the one at `at` ends,
+    /// within the line.
+    fn run_end(&self, at: usize, big: bool) -> usize {
+        let end = self.line_end(at);
+        let Some(kind) = self.char_at(at).filter(|_| at < end).map(|c| class(c, big)) else {
+            return at;
+        };
+        self.text[at..end]
+            .char_indices()
+            .find(|&(_, c)| class(c, big) != kind)
+            .map_or(end, |(i, _)| at + i)
+    }
+
+    /// Where the run of chars of `kind` ending at `at` starts, within the line.
+    fn run_start(&self, at: usize, kind: u8, big: bool) -> usize {
+        let start = self.line_start(at);
+        self.text[start..at]
+            .char_indices()
+            .rev()
+            .take_while(|&(_, c)| class(c, big) == kind)
+            .last()
+            .map_or(at, |(i, _)| start + i)
+    }
+
+    /// `iw` (`iW`): the word under the cursor, or the blanks. `aw` (`aW`)
+    /// takes the blanks after the word too, or before it at the end of the
+    /// line; on blanks, the word after them.
+    fn word_object(&self, at: usize, inner: bool, big: bool) -> (usize, usize) {
+        let Some(kind) = self.char_at(at).filter(|_| at < self.line_end(at)).map(|c| class(c, big)) else {
+            return (at, at);
+        };
+        let (start, end) = (self.run_start(at, kind, big), self.run_end(at, big));
+        if inner {
+            return (start, end);
+        }
+        if kind == 0 {
+            return (start, self.run_end(end, big));
+        }
+        let blanks = self.char_at(end).is_some_and(|c| c != '\n' && class(c, big) == 0);
+        if blanks {
+            (start, self.run_end(end, big))
+        } else {
+            (self.run_start(start, 0, big), end)
+        }
+    }
+
+    /// `~` swaps the case of the chars, `u` lowers it, `U` raises it.
+    fn change_case(&mut self, start: usize, end: usize, how: char) {
+        if start >= end {
+            return;
+        }
+        let changed: String = self.text[start..end]
+            .chars()
+            .flat_map(|c| -> Vec<char> {
+                match how {
+                    'u' => c.to_lowercase().collect(),
+                    'U' => c.to_uppercase().collect(),
+                    _ if c.is_uppercase() => c.to_lowercase().collect(),
+                    _ => c.to_uppercase().collect(),
+                }
+            })
+            .collect();
+        if changed != self.text[start..end] {
+            self.checkpoint();
+            self.text.replace_range(start..end, &changed);
+        }
     }
 
     fn line_start(&self, at: usize) -> usize {
@@ -774,17 +984,23 @@ impl Input {
         })
     }
 
-    /// `d`, `c` or `y` over what the motion covers.
-    fn operate(&mut self, op: char, motion: Motion) -> TextAction {
+    /// The bytes a motion from the cursor covers.
+    fn span(&self, motion: Motion) -> (usize, usize) {
         let at = self.cursor;
-        let (mut start, mut end) = match motion {
+        match motion {
             Motion::To(to) => (at.min(to), at.max(to)),
             Motion::Through(to) => {
                 let (a, b) = (at.min(to), at.max(to));
                 (a, b + self.char_at(b).map_or(0, char::len_utf8))
             }
             Motion::Lines(to) => (self.line_start(at.min(to)), self.line_end(at.max(to))),
-        };
+            Motion::Span(start, end) => (start, end),
+        }
+    }
+
+    /// `d`, `c` or `y` over what the motion covers.
+    fn operate(&mut self, op: char, motion: Motion) -> TextAction {
+        let (mut start, mut end) = self.span(motion);
         let lines = matches!(motion, Motion::Lines(_));
         if op == 'y' {
             if start == end {
@@ -935,17 +1151,26 @@ mod tests {
 
     /// Types `keys` in Text mode over `text` with the cursor at `|`.
     fn text(text: &str, keys: &str) -> (String, Vec<TextAction>) {
+        typed(text, keys, TextPending::default())
+    }
+
+    /// The same in a message's text, Read mode.
+    fn read(text: &str, keys: &str) -> (String, Vec<TextAction>) {
+        typed(text, keys, TextPending::read_only())
+    }
+
+    fn typed(text: &str, keys: &str, mut p: TextPending) -> (String, Vec<TextAction>) {
         let at = text.find('|').unwrap();
         let mut input = Input::default();
         input.insert(&text.replace('|', ""));
         input.cursor = at;
-        let mut p = TextPending::default();
         let actions = keys
             .chars()
             .map(|c| {
                 let key = match c {
                     '\u{1b}' => NKey::Esc,
                     '\u{12}' => NKey::Ctrl('r'),
+                    '\n' => NKey::Enter,
                     c => NKey::Char(c),
                 };
                 p.feed(key, &mut input)
@@ -1003,6 +1228,56 @@ mod tests {
         assert_eq!(text("|ab", "~").0, "A|b");
         assert_eq!(text("hello |big world", "\u{1b}").1, vec![TextAction::Leave]);
         assert_eq!(text("hello |big world", "d\u{1b}x").0, "hello |ig world");
+    }
+
+    #[test]
+    fn text_objects() {
+        assert_eq!(text("hello b|ig world", "yiw").1, vec![TextAction::Yank("big".into())]);
+        assert_eq!(text("hello b|ig world", "diw").0, "hello | world");
+        assert_eq!(text("hello b|ig world", "daw").0, "hello |world");
+        assert_eq!(text("hello b|ig world", "ciw"), ("hello | world".into(), vec![TextAction::Insert]));
+        assert_eq!(text("hello big wor|ld", "daw").0, "hello bi|g");
+        assert_eq!(text("foo.b|ar baz", "diw").0, "foo.| baz");
+        assert_eq!(text("foo.b|ar baz", "diW").0, "| baz");
+        assert_eq!(text("hello |  big", "diw").0, "hello|big");
+        assert_eq!(text("hello |  big", "daw").0, "hell|o");
+        assert_eq!(text("при|вет мир", "yiw").1, vec![TextAction::Yank("привет".into())]);
+        assert_eq!(text("a\n|\nb", "diw").0, "a\n|\nb");
+    }
+
+    #[test]
+    fn text_mode_visual() {
+        assert_eq!(text("|hello big world", "vey"), ("|hello big world".into(), vec![TextAction::Yank("hello".into())]));
+        assert_eq!(text("|hello big world", "wved").0, "hello | world");
+        assert_eq!(text("hello |big world", "vbd").0, "|ig world");
+        assert_eq!(text("|hello", "vllohd").0, "|lo");
+        assert_eq!(text("|hello world", "veU").0, "|HELLO world");
+        assert_eq!(text("|HELLO world", "veu").0, "|hello world");
+        assert_eq!(text("|hello World", "ve~").0, "|HELLO World");
+        assert_eq!(text("|hello", "vl\u{1b}x").0, "h|llo");
+        assert_eq!(text("hello b|ig world", "viwy").1, vec![TextAction::Yank("big".into())]);
+        assert_eq!(text("hello b|ig world", "viwc"), ("hello | world".into(), vec![TextAction::Insert]));
+        assert_eq!(text("one\nt|wo\nthree", "Vjd").0, "|one");
+        assert_eq!(text("one\nt|wo\nthree", "Vy").1, vec![TextAction::Yank("two".into())]);
+        assert_eq!(text("one\nt|wo\nthree", "Vkd").0, "|three");
+        assert_eq!(text("one\nt|wo\nthree", "vjd").0, "one\nt|ree");
+        assert_eq!(text("one\nt|wo", "Vc"), ("one\n|".into(), vec![TextAction::Insert]));
+        assert_eq!(text("|hello", "vVvx").0, "|ello");
+        assert_eq!(text("|hello", "vv\u{1b}").1, vec![TextAction::Leave]);
+    }
+
+    #[test]
+    fn read_mode_only_copies() {
+        assert_eq!(read("|hello big world", "dxDcsSCiaIAoOpPu~").0, "|hello big world");
+        assert_eq!(read("|hello big world", "dxDcsSCiaIAoOpPu~\n").1, vec![]);
+        assert_eq!(read("|hello big world", "vedcx~uU").0, "hell|o big world");
+        assert_eq!(read("hello b|ig world", "yiw").1, vec![TextAction::Yank("big".into())]);
+        assert_eq!(read("|hello big world", "wye").1, vec![TextAction::Yank("big".into())]);
+        assert_eq!(read("|hello big world", "y$").1, vec![TextAction::Yank("hello big world".into())]);
+        assert_eq!(read("|hello big world", "wvedy").1, vec![TextAction::Yank("big".into())]);
+        assert_eq!(read("one\nt|wo", "yy").1, vec![TextAction::Yank("two".into())]);
+        assert_eq!(read("|hello", "\u{1b}").1, vec![TextAction::Leave]);
+        assert_eq!(read("|hello", "v\u{1b}").1, vec![]);
     }
 
     #[test]

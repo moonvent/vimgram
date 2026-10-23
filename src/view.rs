@@ -31,6 +31,9 @@ const AVATAR: f32 = 42.0;
 pub const STATUS_H: f32 = 26.0;
 pub const HEADER_H: f32 = 44.0;
 const TEXT: f32 = 15.0;
+/// Behind Visual-selected text, and the Read-mode cursor.
+const SELECTION_ALPHA: f32 = 0.3;
+const READ_CURSOR_ALPHA: f32 = 0.55;
 const LINE_H: f32 = TEXT * 1.35;
 const MSG_PAD_X: f32 = 16.0;
 const MSG_SPACING: f32 = 2.0;
@@ -444,15 +447,22 @@ fn emoji_spans<'a, L>(s: &str) -> impl Iterator<Item = text::Span<'a, L>> {
 
 /// A message's text with its formatting: links underlined in the theme's
 /// color (clicking one opens it), bold, italic, code, and spoilers as solid
-/// blocks until shown.
+/// blocks until shown. In Read mode, the cursor and the Visual selection.
 fn message_text<'a>(app: &App, m: &Msg) -> Element<'a, Message> {
     let palette = app.theme.palette();
     let hidden = app.hides(m);
+    let reading = app.reading.as_ref().filter(|(id, _)| app.mode == Mode::Read && *id == m.id);
+    let cursor = reading.map(|(_, input)| {
+        let at = input.cursor();
+        (at, at + m.text[at..].chars().next().map_or(0, char::len_utf8))
+    });
+    let selection = reading.and_then(|(_, input)| app.text_pending.selection(input)).map(|(start, end, _)| (start, end));
     // Every place a link or a style starts or ends cuts the text into parts
     // shown alike.
     let mut cuts = vec![0, m.text.len()];
     cuts.extend(m.links.iter().flat_map(|l| [l.start, l.end]));
     cuts.extend(m.styles.iter().flat_map(|s| [s.start, s.end]));
+    cuts.extend(cursor.into_iter().chain(selection).flat_map(|(start, end)| [start, end]));
     cuts.retain(|&c| m.text.is_char_boundary(c));
     cuts.sort_unstable();
     cuts.dedup();
@@ -481,7 +491,14 @@ fn message_text<'a>(app: &App, m: &Msg) -> Element<'a, Message> {
             style: if has(Style::Italic) { font::Style::Italic } else { font::Style::Normal },
             ..if has(Style::Code) { Font::MONOSPACE } else { Font::DEFAULT }
         };
-        let code = has(Style::Code).then(|| palette.text.scale_alpha(0.12));
+        let within = |range: Option<(usize, usize)>| range.is_some_and(|(a, b)| a <= start && end <= b);
+        let code = if within(cursor) {
+            Some(palette.primary.scale_alpha(READ_CURSOR_ALPHA))
+        } else if within(selection) {
+            Some(palette.primary.scale_alpha(SELECTION_ALPHA))
+        } else {
+            has(Style::Code).then(|| palette.text.scale_alpha(0.12))
+        };
         for piece in emoji_spans(shown) {
             let mut piece = match piece.font {
                 Some(_) => piece,
@@ -1683,6 +1700,7 @@ fn message_keys(app: &App, m: &Msg) -> String {
     }
     if !m.text.is_empty() {
         keys.push("yy copy");
+        keys.push("gy copy part");
     }
     if !m.deleted && !read_only {
         keys.push("dd delete");
@@ -2001,12 +2019,30 @@ enum Caret {
 /// cursor is drawn over the text instead of being a character in it, so it
 /// takes no room: a `▏` glyph is a whole cell wide and left what looked like
 /// a space after the cursor.
-fn input_text<'a>(input: &Input, shown_caret: Caret, mask: bool, prefix: &str, width: f32) -> Element<'a, Message> {
+/// `selection`: the bytes of a Visual selection, and the tint behind them.
+fn input_text<'a>(
+    input: &Input,
+    shown_caret: Caret,
+    mask: bool,
+    prefix: &str,
+    width: f32,
+    selection: Option<(usize, usize, Color)>,
+) -> Element<'a, Message> {
     let (before, after) = input.split();
     let show = |s: &str| if mask { "•".repeat(s.chars().count()) } else { s.to_owned() };
     let before = format!("{prefix}{}", show(before));
     let content = format!("{before}{}", show(after));
-    let shown = emoji_text(&content).size(TEXT);
+    let shown = match selection {
+        Some((start, end, tint)) if !mask => {
+            let all = input.as_str();
+            let mut spans: Vec<text::Span<'a, ()>> = emoji_spans(&format!("{prefix}{}", &all[..start])).collect();
+            spans.extend(emoji_spans(&all[start..end]).map(|s| s.background(tint)));
+            spans.extend(emoji_spans(&all[end..]));
+            rich_text(spans)
+        }
+        _ => emoji_text(&content),
+    }
+    .size(TEXT);
     if shown_caret == Caret::Hidden {
         return shown.into();
     }
@@ -2143,7 +2179,13 @@ fn compose(app: &App) -> Element<'_, Message> {
             .into()
     } else {
         // Longer than the box: scrolled to the cursor by the app.
-        scrollable(input_text(&app.input, caret, false, "", width))
+        let tint = app.theme.palette().primary.scale_alpha(SELECTION_ALPHA);
+        let selection = app
+            .text_pending
+            .selection(&app.input)
+            .filter(|_| app.mode == Mode::Text)
+            .map(|(start, end, _)| (start, end, tint));
+        scrollable(input_text(&app.input, caret, false, "", width, selection))
             .id(COMPOSE_ID)
             .direction(Direction::Vertical(Scrollbar::hidden()))
             .width(Length::Fill)
@@ -2216,7 +2258,7 @@ fn auth_screen(app: &App) -> Element<'_, Message> {
 
     if asks_input {
         form = form.push(
-            container(input_text(&app.input, if editing { Caret::Bar } else { Caret::Hidden }, mask, "", 380.0 - 24.0))
+            container(input_text(&app.input, if editing { Caret::Bar } else { Caret::Hidden }, mask, "", 380.0 - 24.0, None))
                 .padding([8, 12])
                 .width(Length::Fill)
                 .style(move |t: &Theme| {
@@ -2367,7 +2409,13 @@ impl canvas::Program<Message> for Ring {
 fn status_line(app: &App) -> Element<'_, Message> {
     let mode = app.mode;
     let visual = app.visual.is_some() && mode == Mode::Normal;
-    let badge = container(text(if visual { "VISUAL" } else { mode.label() }).size(12))
+    let in_text = matches!(mode, Mode::Text | Mode::Read);
+    let label = match app.text_pending.selection(app.text_input()) {
+        Some((_, _, lines)) if in_text => if lines { "V-LINE" } else { "VISUAL" },
+        _ if visual => "VISUAL",
+        _ => mode.label(),
+    };
+    let badge = container(text(label).size(12))
         .padding([3, 10])
         .style(move |t: &Theme| {
             let p = t.extended_palette();
@@ -2376,6 +2424,7 @@ fn status_line(app: &App) -> Element<'_, Message> {
                 Mode::Normal => p.primary.strong,
                 Mode::Insert => p.success.base,
                 Mode::Text => p.success.strong,
+                Mode::Read => p.secondary.strong,
                 Mode::Command | Mode::Search => p.warning.base,
                 Mode::Record => p.danger.base,
             };
@@ -2416,8 +2465,8 @@ fn status_line(app: &App) -> Element<'_, Message> {
                 .style(|t: &Theme| text::Style { color: Some(t.palette().danger) })
                 .into()
         }
-        Mode::Command => input_text(&app.cmdline, Caret::Bar, false, ":", f32::INFINITY),
-        Mode::Search => input_text(&app.cmdline, Caret::Bar, false, "/", f32::INFINITY),
+        Mode::Command => input_text(&app.cmdline, Caret::Bar, false, ":", f32::INFINITY, None),
+        Mode::Search => input_text(&app.cmdline, Caret::Bar, false, "/", f32::INFINITY, None),
         Mode::Record => recording_status(app),
         _ => match (&app.status, viewer_hint) {
             (Some(status), _) => {
@@ -2431,6 +2480,13 @@ fn status_line(app: &App) -> Element<'_, Message> {
                     .into()
             }
             (None, Some(hint)) => text(hint).size(13).style(muted_text).into(),
+            (None, None) if mode == Mode::Read => text(
+                "h/j/k/l w/b/e 0/$ move   v/V select   yiw word   yw ye y$ yy copy   Esc back",
+            )
+            .size(13)
+            .wrapping(Wrapping::None)
+            .style(muted_text)
+            .into(),
             (None, None) => space::horizontal().into(),
         },
     };
@@ -2452,7 +2508,7 @@ fn status_line(app: &App) -> Element<'_, Message> {
         line = line.push(text(playback).size(13).style(primary_text));
     }
     line = line
-        .push(text(if mode == Mode::Text { app.text_pending.display() } else { app.pending.display() }).size(13))
+        .push(text(if in_text { app.text_pending.display() } else { app.pending.display() }).size(13))
         .push(text(position).size(13));
 
     container(line)
