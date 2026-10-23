@@ -6,6 +6,9 @@
 //! desktops like KDE and GNOME run.
 //!
 //! Windows: a value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+//!
+//! Also the Linux application menu entry, which launchers (wofi, rofi,
+//! fuzzel) and desktops list: written at every start of a release build.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -44,7 +47,7 @@ impl Method {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{current, disable, enable};
+pub use linux::{current, disable, enable, install_menu_entry};
 #[cfg(windows)]
 pub use windows::{current, disable, enable};
 
@@ -146,16 +149,26 @@ mod linux {
         )
     }
 
-    pub fn entry(exe: &Path, icon: Option<&Path>) -> String {
+    /// `hidden`: start in the tray (autostart) rather than with a window
+    /// (the application menu).
+    pub fn entry(exe: &Path, icon: Option<&Path>, hidden: bool) -> String {
         let mut entry = format!(
             "[Desktop Entry]\n\
              Type=Application\n\
              Name=vimgram\n\
              Comment=Vim-style Telegram client\n\
-             Exec={} --hidden\n\
+             Exec={}{}\n\
              Terminal=false\n",
-            quote(exe, "\\$")
+            quote(exe, "\\$"),
+            if hidden { " --hidden" } else { "" }
         );
+        if !hidden {
+            entry.push_str(
+                "Categories=Network;InstantMessaging;Chat;\n\
+                 Keywords=Telegram;tg;messenger;\n\
+                 StartupWMClass=vimgram\n",
+            );
+        }
         if let Some(icon) = icon {
             entry.push_str(&format!("Icon={}\n", icon.display()));
         }
@@ -180,9 +193,26 @@ mod linux {
             Ok(Method::Systemd)
         } else {
             let icon = crate::icon::png_path();
-            write(&entry_path().ok_or("no home directory")?, &entry(&exe, icon.as_deref()))?;
+            write(&entry_path().ok_or("no home directory")?, &entry(&exe, icon.as_deref(), true))?;
             Ok(Method::Xdg)
         }
+    }
+
+    /// Put vimgram into the application menu
+    /// (`~/.local/share/applications/vimgram.desktop`), pointing at this
+    /// executable. Left alone when already the same.
+    pub fn install_menu_entry() -> Result<(), String> {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let path = directories::BaseDirs::new()
+            .ok_or("no home directory")?
+            .data_dir()
+            .join("applications/vimgram.desktop");
+        let icon = crate::icon::png_path();
+        let contents = entry(&exe, icon.as_deref(), false);
+        if std::fs::read_to_string(&path).is_ok_and(|old| old == contents) {
+            return Ok(());
+        }
+        write(&path, &contents)
     }
 
     /// Disable autostart (blocking).
@@ -245,7 +275,8 @@ mod tests {
     #[test]
     fn quotes_the_executable() {
         let exe = Path::new("/home/u/my $dir/vim\"gram");
-        assert!(entry(exe, None).contains("Exec=\"/home/u/my \\$dir/vim\\\"gram\" --hidden\n"));
+        assert!(entry(exe, None, true).contains("Exec=\"/home/u/my \\$dir/vim\\\"gram\" --hidden\n"));
+        assert!(entry(exe, None, false).contains("Exec=\"/home/u/my \\$dir/vim\\\"gram\"\n"));
         assert!(unit(exe).contains("ExecStart=\"/home/u/my $$dir/vim\\\"gram\" --hidden\n"));
         assert!(unit(exe).contains("WantedBy=graphical-session.target"));
     }

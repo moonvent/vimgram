@@ -176,6 +176,11 @@ enables a systemd user service bound to `graphical-session.target` when the sess
 one (uwsm, or a Hyprland config starting such a target), otherwise an XDG autostart
 entry; both start vimgram with `--hidden`, in the tray.
 
+App menu (Linux): every start of a release build writes
+`~/.local/share/applications/vimgram.desktop` pointing at that executable, so
+launchers (`wofi --show drun`, rofi, fuzzel) and desktops list vimgram after the first
+`cargo run --release`.
+
 ## Where things are
 
 | Linux | Windows | What |

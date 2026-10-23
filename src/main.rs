@@ -44,6 +44,13 @@ fn main() -> iced::Result {
     if let Err(e) = fonts::setup() {
         eprintln!("vimgram: emoji will be blank: {e}; run scripts/fetch-emoji.sh");
     }
+    // Not from debug builds: the menu would start target/debug/vimgram.
+    #[cfg(target_os = "linux")]
+    if !cfg!(debug_assertions)
+        && let Err(e) = autostart::install_menu_entry()
+    {
+        eprintln!("vimgram: no application menu entry: {e}");
+    }
 
     // A daemon rather than an application: closing the window to the tray
     // must not end the program (Wayland can't hide a window, only close it).
