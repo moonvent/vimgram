@@ -847,6 +847,8 @@ pub struct App {
     /// The emoji panel, while open.
     pub emoji: Option<Picker>,
     pub recent_emoji: Vec<String>,
+    /// (chat, message) of the messages we sent without sound.
+    silent_sent: HashSet<(i64, i64)>,
 }
 
 fn window_settings(size: Size) -> window::Settings {
@@ -923,6 +925,8 @@ impl App {
         let scale = font_scale(cfg.font_size);
         config::set_clock(cfg.clock);
         clipboard::clean_old_pastes();
+        let archive = Archive::open(config::dirs().data_dir().join("archive.sqlite")).ok();
+        let silent_sent = archive.as_ref().and_then(|a| a.silent().ok()).unwrap_or_default();
         let mut app = App {
             cfg,
             auth: Auth::Starting,
@@ -933,7 +937,7 @@ impl App {
             actions: HashMap::new(),
             memberships: HashMap::new(),
             discussions: HashSet::new(),
-            archive: Archive::open(config::dirs().data_dir().join("archive.sqlite")).ok(),
+            archive,
             scope_mute: HashMap::new(),
             focused: true,
             search_history: load_history('/'),
@@ -1002,6 +1006,7 @@ impl App {
             folder_chosen: false,
             emoji: None,
             recent_emoji: emoji::load_recent(),
+            silent_sent,
         };
         if let Err(e) = theme {
             app.error(e);
@@ -2136,6 +2141,12 @@ impl App {
             }
             Update::MessageSendSucceeded(u) => {
                 let msg = Msg::from(u.message);
+                if tg::sent_silently(msg.chat_id, u.old_message_id) {
+                    self.silent_sent.insert((msg.chat_id, msg.id));
+                    if let Some(archive) = &self.archive {
+                        archive.mark_silent(msg.chat_id, msg.id);
+                    }
+                }
                 self.archive_save(std::slice::from_ref(&msg));
                 if let Some(open) = self.open.as_mut().filter(|o| o.id == msg.chat_id)
                     && (open.shown().keeps(&msg) || open.position(u.old_message_id).is_some())
@@ -2151,6 +2162,9 @@ impl App {
                         open.bottom = open.cursor;
                     }
                 }
+            }
+            Update::MessageSendFailed(u) => {
+                tg::sent_silently(u.message.chat_id, u.old_message_id);
             }
             Update::MessageContent(u) => {
                 if let Some(open) = self.open.as_mut().filter(|o| o.id == u.chat_id)
@@ -4456,6 +4470,11 @@ impl App {
     /// A Visual selection is going or messages are marked.
     pub fn selecting(&self) -> bool {
         self.visual.is_some() || !self.marks.is_empty()
+    }
+
+    /// Sent by us without sound (from this client).
+    pub fn sent_silently(&self, m: &Msg) -> bool {
+        self.silent_sent.contains(&(m.chat_id, m.id))
     }
 
     /// The message is marked with `v`.

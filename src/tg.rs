@@ -507,11 +507,33 @@ impl SendOptions {
     }
 }
 
+/// Messages on their way without sound, by temporary id, until Telegram
+/// gives them their own (`UpdateMessageSendSucceeded`). Nothing in a
+/// message says it went silently, so the client keeps track itself.
+static SENDING_SILENT: Mutex<Vec<(i64, i64)>> = Mutex::new(Vec::new());
+
+fn sending(options: SendOptions, chat_id: i64, ids: impl IntoIterator<Item = i64>) {
+    // A scheduled message gets another id once it goes out: not followed.
+    if options.silent && options.at.is_none() {
+        SENDING_SILENT.lock().unwrap().extend(ids.into_iter().map(|id| (chat_id, id)));
+    }
+}
+
+/// The message sent as `old_id` went without sound; asked once, when it
+/// is sent or fails.
+pub fn sent_silently(chat_id: i64, old_id: i64) -> bool {
+    let mut sending = SENDING_SILENT.lock().unwrap();
+    let found = sending.iter().position(|&m| m == (chat_id, old_id));
+    found.map(|i| sending.swap_remove(i)).is_some()
+}
+
 async fn send(chat_id: i64, content: InputMessageContent, options: SendOptions) -> Res<()> {
-    functions::send_message(chat_id, options.topic(), options.reply_to(), options.options(), content, client())
-        .await
-        .map(|_| ())
-        .map_err(err)
+    let enums::Message::Message(msg) =
+        functions::send_message(chat_id, options.topic(), options.reply_to(), options.options(), content, client())
+            .await
+            .map_err(err)?;
+    sending(options, chat_id, [msg.id]);
+    Ok(())
 }
 
 pub async fn send_text(chat_id: i64, text: String, options: SendOptions) -> Res<()> {
@@ -645,10 +667,12 @@ pub async fn send_files(chat_id: i64, paths: Vec<std::path::PathBuf>, caption: S
         })
         .collect();
     if album {
-        return functions::send_message_album(chat_id, options.topic(), options.reply_to(), options.options(), contents, client())
-            .await
-            .map(|_| ())
-            .map_err(err);
+        let enums::Messages::Messages(sent) =
+            functions::send_message_album(chat_id, options.topic(), options.reply_to(), options.options(), contents, client())
+                .await
+                .map_err(err)?;
+        sending(options, chat_id, sent.messages.into_iter().flatten().map(|m| m.id));
+        return Ok(());
     }
     for content in contents {
         send(chat_id, content, options).await?;
@@ -766,10 +790,12 @@ pub async fn forward(to_chat: i64, from_chat: i64, ids: Vec<i64>, comment: Strin
     if !comment.is_empty() {
         send_text(to_chat, comment, options).await?;
     }
-    functions::forward_messages(to_chat, None, from_chat, ids, options.options(), false, false, client())
-        .await
-        .map(|_| ())
-        .map_err(err)
+    let enums::Messages::Messages(sent) =
+        functions::forward_messages(to_chat, None, from_chat, ids, options.options(), false, false, client())
+            .await
+            .map_err(err)?;
+    sending(options, to_chat, sent.messages.into_iter().flatten().map(|m| m.id));
+    Ok(())
 }
 
 pub async fn send_voice(chat_id: i64, recording: Recording, options: SendOptions) -> Res<()> {
@@ -2014,6 +2040,21 @@ fn yes() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silent_sends_until_sent() {
+        let silent = SendOptions { silent: true, ..SendOptions::default() };
+        let at = SendOptions { silent: true, at: Some(1), ..SendOptions::default() };
+        sending(silent, -5, [1, 2]);
+        sending(SendOptions::default(), -5, [3]);
+        sending(at, -5, [4]);
+        assert!(sent_silently(-5, 2));
+        assert!(!sent_silently(-5, 2), "asked once");
+        assert!(sent_silently(-5, 1));
+        assert!(!sent_silently(-5, 3));
+        assert!(!sent_silently(-5, 4), "scheduled ones aren't followed");
+        assert!(!sent_silently(-6, 1));
+    }
 
     fn call(reason: enums::CallDiscardReason, duration: i32, is_video: bool) -> types::MessageCall {
         types::MessageCall { is_video, discard_reason: reason, duration }

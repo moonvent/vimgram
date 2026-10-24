@@ -121,7 +121,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `G`, the ↓ button | back to the latest messages (also after a search or date jump) |
 | `:q` | quit |
 | `:date 01.05.2024` (`01.05`, `2024-05-01`, `yesterday`) | jump to a day |
-| `:silent`, `Alt-Enter` in insert mode | send the composed message without sound |
+| `:silent`, `Alt-Enter` in insert mode | send the composed message without sound (marked `silent` once sent) |
 | `:later 21:00` (`+30m`, `+2h`, `01.11 09:00`) | schedule the composed message |
 | `:export [path]` | export the chat to PDF (default `~/Documents/vimgram/`) |
 | `:posts [query]` | also find posts of public channels for the chat filter (or `query`), below the other results; Telegram allows a few free searches a day, none paid |

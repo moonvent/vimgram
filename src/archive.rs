@@ -9,6 +9,7 @@
 //! Writes go through a background thread and are batched into one
 //! transaction; reads open their own connection (WAL allows both at once).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -54,6 +55,8 @@ impl Record {
 enum Command {
     Save(Vec<Record>),
     Delete { chat_id: i64, ids: Vec<i64>, at: i64 },
+    /// A message of ours went without sound.
+    Silent { chat_id: i64, id: i64 },
     /// Keep a downloaded file of a message.
     Link { chat_id: i64, msg_id: i64, file_id: i32, path: String },
     /// Reply once everything before it is committed.
@@ -90,6 +93,11 @@ fn connect(path: &Path) -> rusqlite::Result<Connection> {
             path TEXT NOT NULL,
             linked_at INTEGER NOT NULL,
             PRIMARY KEY (chat_id, msg_id, file_id)
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS silent (
+            chat_id INTEGER NOT NULL,
+            id INTEGER NOT NULL,
+            PRIMARY KEY (chat_id, id)
         ) WITHOUT ROWID;",
     )?;
     let has_data = conn
@@ -130,6 +138,18 @@ impl Archive {
         if !msgs.is_empty() {
             let _ = self.writer.send(Command::Save(msgs.iter().map(Record::of).collect()));
         }
+    }
+
+    pub fn mark_silent(&self, chat_id: i64, id: i64) {
+        let _ = self.writer.send(Command::Silent { chat_id, id });
+    }
+
+    /// (chat, message) of every message we sent without sound (blocking).
+    pub fn silent(&self) -> Result<HashSet<(i64, i64)>, String> {
+        let conn = connect(&self.path).map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare("SELECT chat_id, id FROM silent").map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))).map_err(|e| e.to_string())?;
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
     }
 
     pub fn mark_deleted(&self, chat_id: i64, ids: Vec<i64>) {
@@ -283,6 +303,10 @@ fn apply(tx: &rusqlite::Transaction<'_>, media: &Path, command: Command) -> rusq
                 .execute(params![chat_id, msg_id, file_id, kept.to_string_lossy(), chrono::Utc::now().timestamp()])?;
             }
         }
+        Command::Silent { chat_id, id } => {
+            tx.prepare_cached("INSERT OR IGNORE INTO silent (chat_id, id) VALUES (?1, ?2)")?
+                .execute(params![chat_id, id])?;
+        }
         Command::Delete { chat_id, ids, at } => {
             let mut stmt = tx.prepare_cached(
                 "UPDATE messages SET deleted_at = ?3
@@ -326,6 +350,19 @@ mod tests {
             comments: None,
             thread: 0,
         }
+    }
+
+    #[test]
+    fn keeps_silent_messages() {
+        let path = std::env::temp_dir().join(format!("vimgram-silent-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let archive = Archive::open(path.clone()).unwrap();
+        archive.mark_silent(1, 10);
+        archive.mark_silent(1, 10);
+        archive.mark_silent(2, 11);
+        archive.flush();
+        assert_eq!(archive.silent().unwrap(), HashSet::from([(1, 10), (2, 11)]));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

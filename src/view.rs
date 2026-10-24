@@ -1772,6 +1772,9 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
     if m.edited {
         header = header.push(text("edited").size(12).style(muted_text));
     }
+    if app.sent_silently(m) {
+        header = header.push(text("silent").size(12).style(muted_text));
+    }
     if let Some(mark) = mark_text(delivery_mark(app, m)) {
         header = header.push(mark);
     }
