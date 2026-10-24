@@ -1,7 +1,7 @@
 name: CI
 
 # Every push and pull request is built and tested. A push to main with a
-# version in Cargo.toml not released yet publishes it: tag `vX.Y.Z` and a
+# version in Cargo.toml not released yet publishes it: tag `vX.Y` and a
 # GitHub release with the Windows build attached. So does pushing a `v*` tag.
 on:
   push:
@@ -103,7 +103,9 @@ jobs:
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             tag=$GITHUB_REF_NAME
           else
-            tag=v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+            version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+            # 1.51.0 in Cargo.toml is released as v1.51.
+            tag=v${version%.0}
             # Released already: this push didn't bump the version.
             if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
               tag=

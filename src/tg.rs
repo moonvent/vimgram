@@ -75,7 +75,8 @@ pub async fn set_parameters(cfg: Config) -> Res<()> {
         "en".into(),
         "Desktop".into(),
         std::env::consts::OS.into(),
-        env!("CARGO_PKG_VERSION").into(),
+        // 1.51, without Cargo's trailing .0.
+        concat!(env!("CARGO_PKG_VERSION_MAJOR"), ".", env!("CARGO_PKG_VERSION_MINOR")).into(),
         client(),
     )
     .await

@@ -1,6 +1,8 @@
 [package]
 name = "vimgram"
-version = "1.0.51"
+# Shown as 1.51 (the trailing .0 only satisfies Cargo); each change raises
+# the middle number.
+version = "1.51.0"
 edition = "2024"
 description = "Keyboard-only, Vim-style Telegram client"
 license = "MIT"
