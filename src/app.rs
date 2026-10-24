@@ -46,6 +46,8 @@ const SEEK_LONG: f64 = 30.0;
 const RESUME_BACK: Duration = Duration::from_secs(5);
 /// Touchpad pixels per list step.
 const SCROLL_PIXELS: f32 = 40.0;
+/// While typing, Telegram gets the draft this often.
+const DRAFT_DELAY: Duration = Duration::from_secs(1);
 /// Messages kept visible above and below the cursor, like Vim's `scrolloff`.
 const SCROLLOFF: usize = 2;
 /// Pixels `j`/`k` scroll inside a message taller than the screen.
@@ -237,6 +239,8 @@ pub enum Message {
     Scroll(Pane, ScrollDelta),
     Tick(Instant),
     Done(Result<(), String>),
+    /// Time to give Telegram the draft being written.
+    SaveDraft,
     /// A theme made from a Neovim colorscheme (`:theme nvim`).
     Theme(Result<Theme, String>),
     Quit,
@@ -422,6 +426,8 @@ pub struct Chat {
     positions: HashMap<ListKey, i64>,
     /// File id of the small chat photo.
     pub avatar: Option<i32>,
+    /// What you were writing here, on any device.
+    draft: tg::Draft,
 }
 
 impl Chat {
@@ -849,6 +855,12 @@ pub struct App {
     pub recent_emoji: Vec<String>,
     /// (chat, message) of the messages we sent without sound.
     silent_sent: HashSet<(i64, i64)>,
+    /// The chat (not comments) whose draft the compose line holds, and
+    /// the draft Telegram was last given or had for it.
+    draft_chat: Option<i64>,
+    draft_sent: tg::Draft,
+    /// A `SaveDraft` is on its way.
+    draft_due: bool,
 }
 
 fn window_settings(size: Size) -> window::Settings {
@@ -1007,6 +1019,9 @@ impl App {
             emoji: None,
             recent_emoji: emoji::load_recent(),
             silent_sent,
+            draft_chat: None,
+            draft_sent: tg::Draft::default(),
+            draft_due: false,
         };
         if let Err(e) = theme {
             app.error(e);
@@ -1377,8 +1392,42 @@ impl App {
         let task = self.handle(message);
         let read = self.end_preview();
         let follow = self.follow_compose_cursor();
+        let draft = self.draft_changed();
         // Whatever changed, make sure what is on screen gets downloaded.
-        Task::batch([task, read, follow, self.fetch_visible(), self.sync_tray()])
+        Task::batch([task, read, follow, draft, self.fetch_visible(), self.sync_tray()])
+    }
+
+    /// The compose line as the chat's draft; not while it edits a message
+    /// or holds a forward's comment.
+    fn current_draft(&self) -> Option<tg::Draft> {
+        let reply_to = match self.compose {
+            _ if self.forward.is_some() => return None,
+            Compose::Edit(_) => return None,
+            Compose::New => None,
+            Compose::Reply(id) => Some(id),
+        };
+        Some(tg::Draft { text: self.input.as_str().to_owned(), reply_to })
+    }
+
+    /// A changed draft goes to Telegram `DRAFT_DELAY` after the change,
+    /// with whatever was written by then.
+    fn draft_changed(&mut self) -> Task<Message> {
+        if self.draft_due || self.draft_chat.is_none() || self.current_draft().is_none_or(|d| d == self.draft_sent) {
+            return Task::none();
+        }
+        self.draft_due = true;
+        Task::perform(tokio::time::sleep(DRAFT_DELAY), |()| Message::SaveDraft)
+    }
+
+    fn save_draft(&mut self) -> Task<Message> {
+        let (Some(chat_id), Some(draft)) = (self.draft_chat, self.current_draft()) else {
+            return Task::none();
+        };
+        if draft == self.draft_sent {
+            return Task::none();
+        }
+        self.draft_sent = draft.clone();
+        Task::perform(tg::set_draft(chat_id, draft), Message::Done)
     }
 
     /// Keep the cursor line in view when the compose text is longer than
@@ -1971,6 +2020,10 @@ impl App {
                 self.error(e);
                 Task::none()
             }
+            Message::SaveDraft => {
+                self.draft_due = false;
+                self.save_draft()
+            }
             Message::Theme(theme) => {
                 match theme {
                     Ok(theme) => self.theme = theme,
@@ -1988,7 +2041,9 @@ impl App {
                 self.video = None;
                 self.info("Closing…");
                 let window = self.window.take().map_or_else(Task::none, window::close);
-                Task::batch([window, Task::perform(tg::close(), |()| Message::Exit)])
+                // The last second of writing, before TDLib closes.
+                let close = self.save_draft().chain(Task::perform(tg::close(), |()| Message::Exit));
+                Task::batch([window, close])
             }
             Message::Exit => iced::exit(),
         }
@@ -2018,12 +2073,18 @@ impl App {
                     supergroup: ChatKind::supergroup(&c.r#type),
                     positions: HashMap::new(),
                     avatar: avatar_of(c.photo.as_ref()),
+                    draft: tg::Draft::of(c.draft_message.as_ref()),
                 };
                 for p in &c.positions {
                     chat.set_position(p);
                 }
                 self.chats.insert(c.id, chat);
                 self.list_dirty = true;
+            }
+            Update::ChatDraftMessage(u) => {
+                if let Some(chat) = self.chats.get_mut(&u.chat_id) {
+                    chat.draft = tg::Draft::of(u.draft_message.as_ref());
+                }
             }
             Update::ChatTitle(u) => {
                 if let Some(chat) = self.chats.get_mut(&u.chat_id) {
@@ -3072,13 +3133,25 @@ impl App {
     /// Show `open` in place of the open chat (closed by the caller).
     fn switch_chat(&mut self, open: OpenChat) -> Task<Message> {
         let id = open.id;
+        // What was written in the chat left stays its draft.
+        let saved = self.save_draft();
+        self.draft_chat = open.thread.is_none().then_some(id);
         self.open = Some(open);
         self.end_selection();
         self.close_viewer();
         self.compose = Compose::New;
         self.input.clear();
+        // And this one's draft comes back, from whichever device.
+        self.draft_sent = tg::Draft::default();
+        if let Some(draft) = self.draft_chat.and_then(|id| self.chats.get(&id)).map(|c| c.draft.clone()) {
+            self.input.set(&draft.text);
+            if let Some(reply_to) = draft.reply_to {
+                self.compose = Compose::Reply(reply_to);
+            }
+            self.draft_sent = draft;
+        }
         self.found = None;
-        Task::perform(tg::open_chat(id), Message::Done)
+        Task::batch([saved, Task::perform(tg::open_chat(id), Message::Done)])
     }
 
     /// `gc` on a channel post: find its comments.

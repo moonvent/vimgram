@@ -464,6 +464,48 @@ fn text_content(text: String) -> InputMessageContent {
     })
 }
 
+/// What Telegram keeps of a message being written in a chat, for all of
+/// your devices.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Draft {
+    pub text: String,
+    pub reply_to: Option<i64>,
+}
+
+impl Draft {
+    pub fn of(draft: Option<&types::DraftMessage>) -> Self {
+        let Some(draft) = draft else {
+            return Self::default();
+        };
+        let text = match &draft.input_message_text {
+            InputMessageContent::InputMessageText(t) => t.text.text.clone(),
+            _ => String::new(),
+        };
+        let reply_to = match &draft.reply_to {
+            Some(enums::InputMessageReplyTo::Message(r)) => Some(r.message_id),
+            _ => None,
+        };
+        Draft { text, reply_to }
+    }
+}
+
+/// A draft with no text clears the chat's.
+pub async fn set_draft(chat_id: i64, draft: Draft) -> Res<()> {
+    let options = SendOptions { reply_to: draft.reply_to, ..SendOptions::default() };
+    let draft_message = (!draft.text.trim().is_empty()).then(|| types::DraftMessage {
+        reply_to: options.reply_to(),
+        date: 0,
+        input_message_text: InputMessageContent::InputMessageText(types::InputMessageText {
+            text: types::FormattedText { text: draft.text, entities: Vec::new() },
+            link_preview_options: None,
+            clear_draft: false,
+        }),
+        effect_id: 0,
+        suggested_post_info: None,
+    });
+    functions::set_chat_draft_message(chat_id, None, draft_message, client()).await.map_err(err)
+}
+
 /// How a message is sent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SendOptions {
@@ -2040,6 +2082,19 @@ fn yes() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drafts_from_telegram() {
+        assert_eq!(Draft::of(None), Draft::default());
+        let draft = types::DraftMessage {
+            reply_to: SendOptions { reply_to: Some(42), ..SendOptions::default() }.reply_to(),
+            date: 1,
+            input_message_text: text_content("half a thought".into()),
+            effect_id: 0,
+            suggested_post_info: None,
+        };
+        assert_eq!(Draft::of(Some(&draft)), Draft { text: "half a thought".into(), reply_to: Some(42) });
+    }
 
     #[test]
     fn silent_sends_until_sent() {

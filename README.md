@@ -135,7 +135,9 @@ starting with what you typed; the history survives restarts.
 
 Insert mode: `Enter` sends, `Shift+Enter` new line, `Ctrl-v` paste (text, or a copied
 image / files as attachments), `Ctrl-w` delete word, `Ctrl-u` delete to start, `↑`/`↓` move a line up / down
-(as the text wraps on screen), `↑` in an empty line edits your last message. `Esc` with some text written goes to Text mode instead of the message list.
+(as the text wraps on screen), `↑` in an empty line edits your last message. `Esc` with some text
+written goes to Text mode instead of the message list. What you write is the chat's draft: Telegram gets it every second while you type, so it
+shows on your other devices, and opening the chat again (here or there) brings it back.
 
 Text mode (`TEXT` in the status line): Vim keys inside the message being written. `h`/`l`,
 `w`/`b`/`e` (`W`/`B`/`E`), `0`/`^`/`$`, `j`/`k` between lines as they wrap on screen (`3j`, `dj` take lines of the text), `gg`/`G` move; `d`, `c`, `y`
