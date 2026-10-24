@@ -30,7 +30,7 @@ const PREVIEW_H: f32 = 34.0;
 const AVATAR: f32 = 42.0;
 pub const STATUS_H: f32 = 26.0;
 pub const HEADER_H: f32 = 44.0;
-const TEXT: f32 = 15.0;
+pub const TEXT: f32 = 15.0;
 /// Behind Visual-selected text, and the Read-mode cursor.
 const SELECTION_ALPHA: f32 = 0.3;
 const READ_CURSOR_ALPHA: f32 = 0.55;

@@ -68,7 +68,7 @@ const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes 
                     yy/Y copy  gy copy part  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  { } volume  H/L seek  m mute  U leave/join  gc comments  \
                     / search chats, Telegram or messages  :posts public posts  n/N next/prev match or pinned  ga attach  gp pinned  gP all pinned  gf original/reply  gx link  ^o/^i back/forward between chats  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
-                    :folder  :theme  :autostart  :cleancache  :q";
+                    :folder  :theme  :font 20  :autostart  :cleancache  :q";
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -829,6 +829,8 @@ pub struct App {
     pub reading: Option<(i64, Input)>,
     pub status: Option<Status>,
     pub theme: Theme,
+    /// Of the whole window, from the font size (`:font`).
+    scale: f32,
     pub size: Size,
     /// The window, while it is open (closed to the tray otherwise).
     window: Option<window::Id>,
@@ -889,6 +891,12 @@ fn nvim_theme(scheme: &str) -> Task<Message> {
     )
 }
 
+const FONT_SIZES: std::ops::RangeInclusive<f32> = 8.0..=40.0;
+
+fn font_scale(size: f32) -> f32 {
+    size.clamp(*FONT_SIZES.start(), *FONT_SIZES.end()) / view::TEXT
+}
+
 /// Folder by name, ignoring case, spaces and punctuation ("личка" finds
 /// "Личка").
 pub fn find_folder(folders: &[Folder], name: &str) -> Option<usize> {
@@ -912,6 +920,7 @@ impl App {
             None => Ok(find_theme(&cfg.theme).unwrap_or(Theme::TokyoNight)),
         };
         let viewer_side = cfg.viewer == config::ViewerMode::Side;
+        let scale = font_scale(cfg.font_size);
         config::set_clock(cfg.clock);
         clipboard::clean_old_pastes();
         let mut app = App {
@@ -983,6 +992,7 @@ impl App {
             reading: None,
             status: None,
             theme: theme.clone().unwrap_or(Theme::TokyoNight),
+            scale,
             size: Size::new(1200.0, 800.0),
             window: None,
             tray: None,
@@ -1035,6 +1045,20 @@ impl App {
 
     pub fn theme(&self, _window: window::Id) -> Theme {
         self.theme.clone()
+    }
+
+    pub fn scale_factor(&self, _window: window::Id) -> f32 {
+        self.scale
+    }
+
+    /// Everything grows with the text. The window keeps its size on
+    /// screen, so it holds less of the bigger layout.
+    fn set_font_size(&mut self, size: f32) {
+        let scale = font_scale(size);
+        self.size = self.size * (self.scale / scale);
+        self.scale = scale;
+        self.scroll_chats();
+        self.scroll_messages();
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -4402,6 +4426,11 @@ impl App {
                 Ok(percent) if (0.0..=100.0).contains(&percent) => self.set_volume(percent / 100.0),
                 _ => self.error("Volume must be between 0 and 100"),
             },
+            ("font", Some(value)) => match value.parse::<f32>() {
+                Ok(size) if FONT_SIZES.contains(&size) => self.set_font_size(size),
+                _ => self.error("Font size must be between 8 and 40"),
+            },
+            ("font", None) => self.info(format!("Font size {}", (self.scale * view::TEXT).round())),
             ("volume", None) => self.info(format!("Volume {}", player::fmt_volume(self.volume))),
             (n, None) if n.parse::<usize>().is_ok() => {
                 let line = n.parse::<usize>().unwrap_or(1).max(1) - 1;

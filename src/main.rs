@@ -62,6 +62,7 @@ fn main() -> iced::Result {
     iced::daemon(move || App::new(cfg.clone(), hidden), App::update, view::view)
         .title(App::title)
         .theme(App::theme)
+        .scale_factor(App::scale_factor)
         .subscription(App::subscription)
         .run()
 }

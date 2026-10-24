@@ -32,6 +32,8 @@ open_on_select = true   # optional: moving through the chat list opens the chat 
                         # (read only once you move into its messages)
 viewer = "side"         # optional: photos and videos open beside the chat, not full screen
 clock = "12h"           # optional: times as 9:05 PM instead of 21:05
+font_size = 20          # optional: message text size (15 by default), the rest of
+                        # the window grows along with it; :font 20 tries one
 ```
 
 Never commit or share these: they identify your app to Telegram.

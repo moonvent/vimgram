@@ -28,6 +28,10 @@ pub struct Config {
     /// chat (`s` in the viewer switches).
     #[serde(default)]
     pub viewer: ViewerMode,
+    /// Size of message text; the rest of the window grows or shrinks
+    /// along with it.
+    #[serde(default = "default_font_size")]
+    pub font_size: f32,
     /// Times as 9:05 PM (`"12h"`) or 21:05 (`"24h"`).
     #[serde(default)]
     pub clock: Clock,
@@ -69,6 +73,10 @@ pub enum ViewerMode {
 
 fn default_theme() -> String {
     "Tokyo Night".into()
+}
+
+fn default_font_size() -> f32 {
+    crate::view::TEXT
 }
 
 fn yes() -> bool {
