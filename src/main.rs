@@ -13,6 +13,7 @@ mod icon;
 mod instance;
 mod media;
 mod notify;
+mod nvim;
 mod player;
 mod stream;
 mod tg;

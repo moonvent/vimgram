@@ -14,7 +14,7 @@ use crate::archive::{Archive, Record};
 use crate::config::{self, Config};
 use crate::clipboard::{self, Clip};
 use crate::emoji::{self, Picker, React};
-use crate::{autostart, export, icon, instance, notify, tray};
+use crate::{autostart, export, icon, instance, notify, nvim, tray};
 use crate::media::{self, Kind, Loaded, Shared, Store};
 use crate::player::{self, Audio, Movie, SpeedKind, Speeds};
 use crate::tg::{
@@ -237,6 +237,8 @@ pub enum Message {
     Scroll(Pane, ScrollDelta),
     Tick(Instant),
     Done(Result<(), String>),
+    /// A theme made from a Neovim colorscheme (`:theme nvim`).
+    Theme(Result<Theme, String>),
     Quit,
     Exit,
 }
@@ -868,6 +870,25 @@ pub fn find_theme(name: &str) -> Option<Theme> {
         .cloned()
 }
 
+/// `nvim` (the colorscheme Neovim starts with) or `nvim:name`: the
+/// colorscheme to take a theme from, empty for the first.
+fn nvim_scheme(name: &str) -> Option<&str> {
+    let rest = name.trim().strip_prefix("nvim")?;
+    (rest.is_empty() || rest.starts_with([':', ' '])).then(|| rest.trim_start_matches([':', ' ']).trim())
+}
+
+fn nvim_theme(scheme: &str) -> Task<Message> {
+    let scheme = scheme.to_owned();
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || nvim::theme(&scheme))
+                .await
+                .map_err(|e| e.to_string())?
+        },
+        Message::Theme,
+    )
+}
+
 /// Folder by name, ignoring case, spaces and punctuation ("личка" finds
 /// "Личка").
 pub fn find_folder(folders: &[Folder], name: &str) -> Option<usize> {
@@ -885,7 +906,11 @@ fn normalize_name(s: &str) -> String {
 impl App {
     /// `hidden`: start in the tray (autostart) instead of opening the window.
     pub fn new(cfg: Config, hidden: bool) -> (Self, Task<Message>) {
-        let theme = find_theme(&cfg.theme).unwrap_or(Theme::TokyoNight);
+        // Read before the window opens, so it never shows another theme.
+        let theme = match nvim_scheme(&cfg.theme) {
+            Some(scheme) => nvim::theme(scheme),
+            None => Ok(find_theme(&cfg.theme).unwrap_or(Theme::TokyoNight)),
+        };
         let viewer_side = cfg.viewer == config::ViewerMode::Side;
         config::set_clock(cfg.clock);
         clipboard::clean_old_pastes();
@@ -957,7 +982,7 @@ impl App {
             text_pending: TextPending::default(),
             reading: None,
             status: None,
-            theme,
+            theme: theme.clone().unwrap_or(Theme::TokyoNight),
             size: Size::new(1200.0, 800.0),
             window: None,
             tray: None,
@@ -968,6 +993,9 @@ impl App {
             emoji: None,
             recent_emoji: emoji::load_recent(),
         };
+        if let Err(e) = theme {
+            app.error(e);
+        }
         let window = if hidden && app.cfg.tray { Task::none() } else { app.open_window() };
         (app, Task::batch([Task::perform(tg::start(), Message::Done), window]))
     }
@@ -1912,6 +1940,13 @@ impl App {
             Message::Done(Ok(())) => Task::none(),
             Message::Done(Err(e)) => {
                 self.error(e);
+                Task::none()
+            }
+            Message::Theme(theme) => {
+                match theme {
+                    Ok(theme) => self.theme = theme,
+                    Err(e) => self.error(e),
+                }
                 Task::none()
             }
             Message::Quit => {
@@ -4290,12 +4325,14 @@ impl App {
             ("noh" | "nohl" | "nohlsearch", _) => self.clear_filter(),
             ("posts", arg) => return self.search_posts(arg),
             ("theme" | "colorscheme" | "colo", None) => {
-                let names: Vec<String> = Theme::ALL.iter().map(Theme::to_string).collect();
+                let mut names: Vec<String> = Theme::ALL.iter().map(Theme::to_string).collect();
+                names.push("nvim (its colorscheme), nvim:name".into());
                 self.info(names.join(", "));
             }
-            ("theme" | "colorscheme" | "colo", Some(name)) => match find_theme(name) {
-                Some(theme) => self.theme = theme,
-                None => self.error(format!("Unknown theme: {name}")),
+            ("theme" | "colorscheme" | "colo", Some(name)) => match (nvim_scheme(name), find_theme(name)) {
+                (Some(scheme), _) => return nvim_theme(scheme),
+                (None, Some(theme)) => self.theme = theme,
+                (None, None) => self.error(format!("Unknown theme: {name}")),
             },
             ("f" | "folder", None) => {
                 let names: Vec<&str> = self.folders.iter().map(|f| f.name.as_str()).collect();
@@ -5622,6 +5659,10 @@ mod tests {
         assert_eq!(find_theme("tokyo night"), Some(Theme::TokyoNight));
         assert_eq!(find_theme("Catppuccin-Mocha"), Some(Theme::CatppuccinMocha));
         assert_eq!(find_theme("nope"), None);
+        assert_eq!(nvim_scheme("nvim"), Some(""));
+        assert_eq!(nvim_scheme("nvim:solarized-osaka"), Some("solarized-osaka"));
+        assert_eq!(nvim_scheme("nvim catppuccin"), Some("catppuccin"));
+        assert_eq!(nvim_scheme("nvimx"), None);
     }
 
     #[test]

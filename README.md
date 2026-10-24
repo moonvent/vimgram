@@ -22,7 +22,8 @@ Every Telegram client needs its own `api_id` and `api_hash`: create an app at
 ```toml
 api_id = 123456
 api_hash = "..."
-theme = "Tokyo Night"   # optional, see :theme
+theme = "Tokyo Night"   # optional, see :theme; "nvim" takes Neovim's colorscheme,
+                        # "nvim:catppuccin" a given one (transparent = black)
 folder = "Личка"        # optional: folder to start in (by name, any case)
 tray = true             # optional: tray icon (waybar `tray` module)
 close_to_tray = true    # optional: closing the window keeps vimgram in the tray
