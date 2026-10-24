@@ -17,9 +17,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
       - name: Homebrew packages
-        run: brew install gstreamer pkgconf cmake ninja
+        id: brew
+        run: |
+          brew install gstreamer pkgconf cmake ninja
+          echo "gstreamer=$(brew list --versions gstreamer | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+      # The gstreamer crates' build scripts link against the Cellar path of
+      # the version they saw, and a cached build doesn't run them again: a
+      # new gstreamer (1.28.8 → 1.28.8_1) needs a new cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ steps.brew.outputs.gstreamer }}
       - name: TDLib
         run: ./scripts/fetch-tdlib.sh
       # rlottie-sys's own build of rlottie fails to link on macOS; it takes
