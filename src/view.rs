@@ -33,6 +33,8 @@ pub const HEADER_H: f32 = 44.0;
 pub const TEXT: f32 = 15.0;
 /// Behind Visual-selected text, and the Read-mode cursor.
 const SELECTION_ALPHA: f32 = 0.3;
+/// Between keys in a hint.
+const KEY_GAP: &str = "   ";
 const READ_CURSOR_ALPHA: f32 = 0.55;
 const LINE_H: f32 = TEXT * 1.35;
 const MSG_PAD_X: f32 = 16.0;
@@ -530,6 +532,34 @@ fn muted_text(theme: &Theme) -> text::Style {
     text::Style { color: Some(muted(theme)) }
 }
 
+/// Keys and what they do, like `[("gf", "original"), ("Esc", "cancel")]`:
+/// the keys italic in the theme's color, what they do dimmed after them.
+fn key_spans(app: &App, keys: &[(&str, &str)]) -> Vec<text::Span<'static>> {
+    let italic = Font { style: font::Style::Italic, ..Font::DEFAULT };
+    let mut spans = Vec::new();
+    for (i, &(key, what)) in keys.iter().enumerate() {
+        if i > 0 {
+            spans.push(span(KEY_GAP));
+        }
+        spans.push(span(key.to_owned()).color(app.theme.palette().primary).font(italic));
+        if !what.is_empty() {
+            spans.push(span(format!(" {what}")).color(muted(&app.theme)));
+        }
+    }
+    spans
+}
+
+fn keys_text<'a>(app: &App, keys: &[(&str, &str)]) -> text::Rich<'a, (), Message> {
+    rich_text(key_spans(app, keys))
+}
+
+/// Some words, then keys.
+fn with_keys<'a>(app: &App, words: String, color: Color, keys: &[(&str, &str)]) -> text::Rich<'a, (), Message> {
+    let mut spans = vec![span(words).color(color), span(KEY_GAP)];
+    spans.extend(key_spans(app, keys));
+    rich_text(spans)
+}
+
 fn primary_text(theme: &Theme) -> text::Style {
     text::Style { color: Some(theme.palette().primary) }
 }
@@ -704,7 +734,7 @@ fn chat_list(app: &App) -> Element<'_, Message> {
     let focused = app.focus == Focus::Chats;
     let folder = app.folders.get(app.folder).map_or("", |f| f.name.as_str());
     let title = if app.forward.is_some() {
-        "Forward to… (Enter, i — comment, Esc)".to_owned()
+        String::new()
     } else if app.filter.is_empty() {
         format!("{folder}  {}", fmt_count(app.list.len()))
     } else {
@@ -718,10 +748,13 @@ fn chat_list(app: &App) -> Element<'_, Message> {
         }
         title
     };
-    let forwarding = app.forward.is_some();
-    let header = container(text(title).size(13).style(move |t: &Theme| {
-        if forwarding { primary_text(t) } else { muted_text(t) }
-    }))
+    let title: Element<_> = if app.forward.is_some() {
+        let keys = [("Enter", "send"), ("i", "comment"), ("Esc", "cancel")];
+        with_keys(app, "Forward to…".into(), app.theme.palette().primary, &keys).size(13).into()
+    } else {
+        text(title).size(13).style(muted_text).into()
+    };
+    let header = container(title)
     .height(HEADER_H)
     .padding([0, 12])
     .align_y(Alignment::Center);
@@ -979,7 +1012,7 @@ fn player_bar(app: &App) -> Option<Element<'_, Message>> {
     let info = column![
         row![
             text(format!("{} {who}", playing_icon(voice))).size(13).wrapping(Wrapping::None).width(Length::Fill),
-            text(format!("{time}  {}  gv", player::fmt_speed(app.speed()))).size(12).style(muted_text),
+            with_keys(app, format!("{time}  {}", player::fmt_speed(app.speed())), muted(&app.theme), &[("gv", "")]).size(12),
         ]
         .spacing(8),
         progress_bar(0.0..=1.0, progress).girth(3),
@@ -1011,9 +1044,7 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
     let bar = player_bar(app);
     let Some(open) = &app.open else {
         let hint = center(
-            text("j/k — move, Enter — open chat, J/K — folders, :help — keys")
-                .size(14)
-                .style(muted_text),
+            keys_text(app, &[("j/k", "move"), ("Enter", "open chat"), ("J/K", "folders"), (":help", "keys")]).size(14),
         );
         return match bar {
             Some(bar) => column![bar, hint].into(),
@@ -1029,29 +1060,43 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
         Some(_) => format!("Comments · {title}"),
         None => title.to_owned(),
     };
-    let mut details: Vec<String> = Vec::new();
+    // Each a few words, keys after some.
+    let mut details: Vec<(String, &[(&str, &str)])> = Vec::new();
     if let Some(presence) = app.presence(open.id).map(fmt_presence).filter(|p| !p.is_empty()) {
-        details.push(presence);
+        details.push((presence, &[]));
     }
     if open.pins_only() {
-        details.push("pinned only — Enter or Esc to the chat".into());
+        details.push(("pinned only".into(), &[("Enter/Esc", "to the chat")]));
     } else if let Some(tag) = &open.tag {
-        details.push(format!("only {tag} — Esc for all"));
+        details.push((format!("only {tag}"), &[("Esc", "all")]));
     }
     match (open.total, thread) {
-        (Some(total), Some(_)) => details.push(format!("{} comments", fmt_count(total))),
-        (Some(total), None) => details.push(format!("{} messages", fmt_count(total))),
+        (Some(total), Some(_)) => details.push((format!("{} comments", fmt_count(total)), &[])),
+        (Some(total), None) => details.push((format!("{} messages", fmt_count(total)), &[])),
         (None, _) => {}
     }
     let activity = fmt_activity(app, open.id);
     if let Some(activity) = &activity {
-        details.push(activity.clone());
+        details.push((activity.clone(), &[]));
     }
     if thread.is_some() {
-        details.push("Esc back to the post".into());
+        details.push((String::new(), &[("Esc", "back to the post")]));
     }
     if !open.at_latest {
-        details.push("viewing history — G for latest".into());
+        details.push(("viewing history".into(), &[("G", "latest")]));
+    }
+    let mut detail_spans = Vec::new();
+    for (i, (words, keys)) in details.into_iter().enumerate() {
+        if i > 0 {
+            detail_spans.push(span(" · "));
+        }
+        if !words.is_empty() {
+            detail_spans.push(span(words));
+            if !keys.is_empty() {
+                detail_spans.push(span(" "));
+            }
+        }
+        detail_spans.extend(key_spans(app, keys));
     }
     let online = app.presence(open.id) == Some(Presence::Online) || activity.is_some();
     let header_avatar = match chat {
@@ -1063,7 +1108,7 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
             header_avatar,
             column![
                 emoji_text(&title).size(15).wrapping(Wrapping::None),
-                text(details.join(" · "))
+                rich_text(detail_spans)
                     .size(12)
                     .wrapping(Wrapping::None)
                     .style(move |t: &Theme| if online { primary_text(t) } else { muted_text(t) }),
@@ -1141,7 +1186,7 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
     }
     let mut pane = pane.push(header).push(rule::horizontal(1));
     if let Some((index, pinned)) = open.shown_pin().filter(|_| !open.pins_only()) {
-        pane = pane.push(pinned_bar(pinned, open.pins.len() - index, open.pins.len())).push(rule::horizontal(1));
+        pane = pane.push(pinned_bar(app, pinned, open.pins.len() - index, open.pins.len())).push(rule::horizontal(1));
     }
     let messages: Element<_> = mouse_area(messages)
         .on_scroll(|delta| Message::Scroll(Pane::Messages, delta))
@@ -1233,13 +1278,13 @@ fn emoji_panel<'a>(app: &'a App, picker: &'a Picker) -> Element<'a, Message> {
     };
 
     let search = if picker.searching {
-        format!("/{}▏", picker.query)
+        rich_text([span(format!("/{}▏", picker.query)).color(muted(&app.theme))])
     } else if !picker.query.is_empty() {
-        format!("/{}   Esc — close", picker.query)
+        with_keys(app, format!("/{}", picker.query), muted(&app.theme), &[("Esc", "close")])
     } else if picker.react.is_some() {
-        "/ search   1–9 or Enter react".to_owned()
+        keys_text(app, &[("/", "search"), ("1–9/Enter", "react")])
     } else {
-        "/ search   Tab groups   Enter insert".to_owned()
+        keys_text(app, &[("/", "search"), ("Tab", "groups"), ("Enter", "insert")])
     };
 
     let items = picker.items(&app.recent_emoji);
@@ -1283,7 +1328,7 @@ fn emoji_panel<'a>(app: &'a App, picker: &'a Picker) -> Element<'a, Message> {
         container(
             column![
                 tabs,
-                container(text(search).size(12).style(muted_text).wrapping(Wrapping::None))
+                container(search.size(12).wrapping(Wrapping::None))
                     .height(EMOJI_LINE_H)
                     .align_y(Alignment::Center)
                     .clip(true),
@@ -1305,20 +1350,22 @@ fn emoji_panel<'a>(app: &'a App, picker: &'a Picker) -> Element<'a, Message> {
 }
 
 /// The pinned message `number` (the oldest is 1) of `total`.
-fn pinned_bar(pinned: &Msg, number: usize, total: usize) -> Element<'_, Message> {
+fn pinned_bar<'a>(app: &App, pinned: &'a Msg, number: usize, total: usize) -> Element<'a, Message> {
     let summary: String = pinned.summary().split_whitespace().collect::<Vec<_>>().join(" ");
     let summary: String = summary.chars().take(400).collect();
+    let primary = app.theme.palette().primary;
     let (title, counter) = if total > 1 {
-        (format!("Pinned message #{number}   gp, then n/N   gP all"), format!("{number} / {total}"))
+        let keys = [("gp", "go"), ("n/N", "older/newer"), ("gP", "all")];
+        (with_keys(app, format!("Pinned message #{number}"), primary, &keys), format!("{number} / {total}"))
     } else {
-        ("Pinned message   gp".to_owned(), String::new())
+        (with_keys(app, "Pinned message".into(), primary, &[("gp", "go")]), String::new())
     };
     mouse_area(
         container(
             row![
                 text("📌").size(16),
                 column![
-                    text(title).size(11).style(primary_text),
+                    title.size(11),
                     // Two lines at most, wrapped within the pane.
                     container(emoji_text(&summary).size(13).wrapping(Wrapping::WordOrGlyph).width(Length::Fill))
                         .width(Length::Fill)
@@ -1660,52 +1707,56 @@ fn reply_quote<'a>(app: &'a App, reply_to: i64) -> Element<'a, Message> {
 }
 
 /// Keys that act on the message under the cursor, shown on its header.
-fn message_keys(app: &App, m: &Msg) -> String {
+fn message_keys<'a>(app: &App, m: &Msg) -> text::Rich<'a, (), Message> {
     // Only the channel's admins delete its posts.
     let read_only = app.read_only(m.chat_id);
     if app.selecting() {
-        let delete = if read_only { "" } else { "  d delete" };
-        return format!("{} selected  f forward  y copy{delete}  Esc cancel", fmt_count(app.visual_len()));
+        let mut keys = vec![("f", "forward"), ("y", "copy")];
+        if !read_only {
+            keys.push(("d", "delete"));
+        }
+        keys.push(("Esc", "cancel"));
+        return with_keys(app, format!("{} selected", fmt_count(app.visual_len())), muted(&app.theme), &keys);
     }
     let channel = app.chats.get(&m.chat_id).is_some_and(|c| c.kind == ChatKind::Channel);
     let mut keys = Vec::new();
     if app.hides(m) {
-        keys.push("Enter spoiler");
+        keys.push(("Enter", "spoiler"));
     }
     if !m.links.is_empty() {
-        keys.push("gx link");
+        keys.push(("gx", "link"));
     }
     if m.forward.is_some() {
-        keys.push("gf original");
+        keys.push(("gf", "original"));
     } else if m.reply_to.is_some() {
-        keys.push("gf reply");
+        keys.push(("gf", "reply"));
     }
     if m.comments.is_some() {
-        keys.push("gc comments");
+        keys.push(("gc", "comments"));
     }
     match m.media.first() {
-        Some(Media::Voice { .. } | Media::Audio { .. } | Media::Video { round: true, .. }) => keys.push("Enter play"),
-        Some(media) if media.viewable() => keys.push("Enter open"),
+        Some(Media::Voice { .. } | Media::Audio { .. } | Media::Video { round: true, .. }) => keys.push(("Enter", "play")),
+        Some(media) if media.viewable() => keys.push(("Enter", "open")),
         _ => {}
     }
     if !m.deleted {
         if !channel || m.outgoing {
-            keys.push("r reply");
+            keys.push(("r", "reply"));
         }
-        keys.push("R react");
+        keys.push(("R", "react"));
         if m.outgoing && m.media.is_empty() {
-            keys.push("e edit");
+            keys.push(("e", "edit"));
         }
-        keys.push("f forward");
+        keys.push(("f", "forward"));
     }
     if !m.text.is_empty() {
-        keys.push("yy copy");
-        keys.push("gy copy part");
+        keys.push(("yy", "copy"));
+        keys.push(("gy", "copy part"));
     }
     if !m.deleted && !read_only {
-        keys.push("dd delete");
+        keys.push(("dd", "delete"));
     }
-    keys.join("  ")
+    keys_text(app, &keys)
 }
 
 fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_avatar: bool) -> Element<'a, Message> {
@@ -1737,10 +1788,7 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
     }
     if selected {
         header = header.push(space::horizontal()).push(
-            text(message_keys(app, m))
-                .size(11)
-                .wrapping(Wrapping::None)
-                .style(|t: &Theme| text::Style { color: Some(muted(t).scale_alpha(0.8)) }),
+            message_keys(app, m).size(11).wrapping(Wrapping::None),
         );
     }
 
@@ -2105,7 +2153,7 @@ fn attachments_label(paths: &[std::path::PathBuf]) -> String {
 
 fn compose_banner(app: &App) -> Option<Element<'_, Message>> {
     if let Some(forward) = &app.forward {
-        return Some(banner(format!("↪ Forward {}, the text goes first as a comment", forward.what)));
+        return Some(banner(app, format!("↪ Forward {}, the text goes first as a comment", forward.what)));
     }
     let attached = (!app.attachments.is_empty()).then(|| attachments_label(&app.attachments));
     let label = match app.compose {
@@ -2126,13 +2174,13 @@ fn compose_banner(app: &App) -> Option<Element<'_, Message>> {
         (Compose::Reply(_), Some(attached)) => format!("{attached}  ·  {label}"),
         _ => label,
     };
-    Some(banner(label))
+    Some(banner(app, label))
 }
 
-fn banner<'a>(label: String) -> Element<'a, Message> {
+fn banner<'a>(app: &App, label: String) -> Element<'a, Message> {
     row![
         text(label).size(12).wrapping(Wrapping::None).style(primary_text).width(Length::Fill),
-        text("Esc — cancel").size(12).style(muted_text),
+        keys_text(app, &[("Esc", "cancel")]).size(12),
     ]
     .height(BANNER_H)
     .align_y(Alignment::Center)
@@ -2145,9 +2193,10 @@ pub fn has_banner(app: &App) -> bool {
 
 /// In place of the compose line in a channel you can't post in.
 fn channel_bar(app: &App, chat: &Chat) -> Element<'static, Message> {
-    let mute = if app.muted(chat) { "m — unmute" } else { "m — mute" };
-    let leave = if app.membership(chat) == Some(Membership::Left) { "U — subscribe" } else { "U — unsubscribe" };
-    container(text(format!("Channel   {mute}   {leave}   gc — comments")).size(TEXT).style(muted_text))
+    let mute = if app.muted(chat) { "unmute" } else { "mute" };
+    let leave = if app.membership(chat) == Some(Membership::Left) { "subscribe" } else { "unsubscribe" };
+    let keys = [("m", mute), ("U", leave), ("gc", "comments")];
+    container(with_keys(app, "Channel".into(), muted(&app.theme), &keys).size(TEXT))
         .padding([10.0, MSG_PAD_X])
         .width(Length::Fill)
         .height(20.0 + LINE_H)
@@ -2168,15 +2217,12 @@ fn compose(app: &App) -> Element<'_, Message> {
     let width = compose_text_width(app.size, app.emoji.is_some(), app.side_viewer());
     let lines = compose_lines(app.input.as_str(), width).clamp(1, MAX_COMPOSE_LINES);
     let content: Element<_> = if app.input.is_empty() && !editing {
-        let hint = if app.forward.is_some() {
-            "i — add a comment   Enter — send"
+        let hint: &[_] = if app.forward.is_some() {
+            &[("i", "add a comment"), ("Enter", "send")]
         } else {
-            "i — write a message   q — record voice   ga — attach file   ge — emoji"
+            &[("i", "write a message"), ("q", "record voice"), ("ga", "attach file"), ("ge", "emoji")]
         };
-        text(hint)
-            .size(TEXT)
-            .style(muted_text)
-            .into()
+        keys_text(app, hint).size(TEXT).into()
     } else {
         // Longer than the box: scrolled to the cursor by the app.
         let tint = app.theme.palette().primary.scale_alpha(SELECTION_ALPHA);
@@ -2271,9 +2317,7 @@ fn auth_screen(app: &App) -> Element<'_, Message> {
                 }),
         );
         form = form.push(
-            text("i — type   Enter — submit   Esc — normal mode   :q — quit")
-                .size(12)
-                .style(muted_text),
+            keys_text(app, &[("i", "type"), ("Enter", "submit"), ("Esc", "normal mode"), (":q", "quit")]).size(12),
         );
     }
 
@@ -2297,7 +2341,7 @@ fn recording_status(app: &App) -> Element<'_, Message> {
             .size(13)
             .style(|t: &Theme| text::Style { color: Some(t.palette().danger) }),
         text(meter).size(13),
-        text("q/Enter — send   Esc — discard").size(13).style(muted_text),
+        keys_text(app, &[("q/Enter", "send"), ("Esc", "discard")]).size(13),
     ]
     .spacing(12)
     .into()
@@ -2439,31 +2483,41 @@ fn status_line(app: &App) -> Element<'_, Message> {
 
     let viewer_hint = match app.viewer_media() {
         _ if !app.viewer_keys() => None,
-        Some(Media::Video { .. }) if app.viewer_side => Some(
-            "Space pause   h/l ±5s   H/L ±30s   [ ] speed   = 1x   ↑/↓ volume   m mute   j/k next/prev   Tab messages   s full screen   Esc close",
-        ),
-        Some(Media::Video { .. }) => Some(
-            "Space pause   h/l ±5s   H/L ±30s   [ ] speed   = 1x   ↑/↓ volume   m mute   j/k next/prev   s beside the chat   Esc close",
-        ),
-        Some(_) if app.viewer_side => Some("j/k — next/previous   Tab — messages   s — full screen   Esc — close"),
-        Some(_) => Some("j/k — next/previous   s — beside the chat   Esc — close"),
+        Some(Media::Video { .. }) => {
+            let mut keys = vec![
+                ("Space", "pause"),
+                ("h/l", "±5s"),
+                ("H/L", "±30s"),
+                ("[ ]", "speed"),
+                ("=", "1x"),
+                ("↑/↓", "volume"),
+                ("m", "mute"),
+                ("j/k", "next/prev"),
+            ];
+            if app.viewer_side {
+                keys.extend([("Tab", "messages"), ("s", "full screen")]);
+            } else {
+                keys.push(("s", "beside the chat"));
+            }
+            keys.push(("Esc", "close"));
+            Some(keys)
+        }
+        Some(_) if app.viewer_side => Some(vec![("j/k", "next/previous"), ("Tab", "messages"), ("s", "full screen"), ("Esc", "close")]),
+        Some(_) => Some(vec![("j/k", "next/previous"), ("s", "beside the chat"), ("Esc", "close")]),
         None => None,
     };
 
     let middle: Element<_> = match mode {
         _ if app.confirm.is_some() => {
-            let prompt = match &app.confirm {
+            let (question, keys): (String, &[_]) = match &app.confirm {
                 Some(Confirm::Delete { ids, .. }) => {
                     let what = if ids.len() > 1 { "these messages" } else { "this message" };
-                    format!("Delete {what}?   y — for everyone   m — only for me   n/Esc — cancel")
+                    (format!("Delete {what}?"), &[("y", "for everyone"), ("m", "only for me"), ("n/Esc", "cancel")])
                 }
-                Some(Confirm::Leave { title, .. }) => format!("Leave {title}?   y/Enter — leave   n/Esc — stay"),
-                _ => "Quit vimgram?   y/Enter — quit   n/Esc — stay".to_owned(),
+                Some(Confirm::Leave { title, .. }) => (format!("Leave {title}?"), &[("y/Enter", "leave"), ("n/Esc", "stay")]),
+                _ => ("Quit vimgram?".to_owned(), &[("y/Enter", "quit"), ("n/Esc", "stay")]),
             };
-            text(prompt)
-                .size(13)
-                .style(|t: &Theme| text::Style { color: Some(t.palette().danger) })
-                .into()
+            with_keys(app, question, app.theme.palette().danger, keys).size(13).into()
         }
         Mode::Command => input_text(&app.cmdline, Caret::Bar, false, ":", f32::INFINITY, None),
         Mode::Search => input_text(&app.cmdline, Caret::Bar, false, "/", f32::INFINITY, None),
@@ -2479,13 +2533,13 @@ fn status_line(app: &App) -> Element<'_, Message> {
                     })
                     .into()
             }
-            (None, Some(hint)) => text(hint).size(13).style(muted_text).into(),
-            (None, None) if mode == Mode::Read => text(
-                "h/j/k/l w/b/e 0/$ move   v/V select   yiw word   yw ye y$ yy copy   Esc back",
+            (None, Some(hint)) => keys_text(app, &hint).size(13).into(),
+            (None, None) if mode == Mode::Read => keys_text(
+                app,
+                &[("h/j/k/l w/b/e 0/$", "move"), ("v/V", "select"), ("yiw", "word"), ("yw ye y$ yy", "copy"), ("Esc", "back")],
             )
             .size(13)
             .wrapping(Wrapping::None)
-            .style(muted_text)
             .into(),
             (None, None) => space::horizontal().into(),
         },
