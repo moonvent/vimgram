@@ -533,7 +533,8 @@ fn muted_text(theme: &Theme) -> text::Style {
 }
 
 /// Keys and what they do, like `[("gf", "original"), ("Esc", "cancel")]`:
-/// the keys italic in the theme's color, what they do dimmed after them.
+/// the keys italic in the theme's color, a dash and what they do dimmed
+/// after them.
 fn key_spans(app: &App, keys: &[(&str, &str)]) -> Vec<text::Span<'static>> {
     let italic = Font { style: font::Style::Italic, ..Font::DEFAULT };
     let mut spans = Vec::new();
@@ -543,7 +544,7 @@ fn key_spans(app: &App, keys: &[(&str, &str)]) -> Vec<text::Span<'static>> {
         }
         spans.push(span(key.to_owned()).color(app.theme.palette().primary).font(italic));
         if !what.is_empty() {
-            spans.push(span(format!(" {what}")).color(muted(&app.theme)));
+            spans.push(span(format!(" — {what}")).color(muted(&app.theme)));
         }
     }
     spans
