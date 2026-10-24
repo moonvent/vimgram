@@ -11,15 +11,19 @@ use iced_video_player::Video;
 
 use crate::{stream, tg};
 
-/// Speeds reachable with `[` / `]`.
-pub const SPEEDS: [f64; 12] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0];
+/// `[` / `]` change the speed by this, between the two below.
+const SPEED_STEP: f64 = 0.25;
+const MIN_SPEED: f64 = 0.25;
+const MAX_SPEED: f64 = 5.0;
 
+/// The next step up; a speed between steps (`:speed 1.6`) goes to the
+/// nearest one above.
 pub fn faster(speed: f64) -> f64 {
-    SPEEDS.into_iter().find(|&s| s > speed + 1e-6).unwrap_or(SPEEDS[SPEEDS.len() - 1])
+    (((speed / SPEED_STEP + 1e-6).floor() + 1.0) * SPEED_STEP).min(MAX_SPEED)
 }
 
 pub fn slower(speed: f64) -> f64 {
-    SPEEDS.into_iter().rev().find(|&s| s < speed - 1e-6).unwrap_or(SPEEDS[0])
+    (((speed / SPEED_STEP - 1e-6).ceil() - 1.0) * SPEED_STEP).max(MIN_SPEED)
 }
 
 pub fn fmt_speed(speed: f64) -> String {
@@ -110,7 +114,7 @@ impl Speeds {
             let (Some(name), Some(value)) = (parts.next(), parts.next()) else { continue };
             if let (Some(kind), Ok(speed)) =
                 (SpeedKind::ALL.into_iter().find(|k| k.name() == name), value.parse::<f64>())
-                && (SPEEDS[0]..=SPEEDS[SPEEDS.len() - 1]).contains(&speed)
+                && (MIN_SPEED..=MAX_SPEED).contains(&speed)
             {
                 speeds.set(kind, speed);
             }
@@ -600,6 +604,11 @@ mod tests {
         assert_eq!(slower(1.0), 0.75);
         assert_eq!(faster(5.0), 5.0);
         assert_eq!(slower(0.25), 0.25);
+        assert_eq!(faster(2.0), 2.25);
+        assert_eq!(slower(3.0), 2.75);
+        assert_eq!(faster(4.75), 5.0);
+        assert_eq!(faster(1.6), 1.75);
+        assert_eq!(slower(1.6), 1.5);
         assert_eq!(fmt_speed(1.5), "1.5x");
         assert_eq!(fmt_speed(0.25), "0.25x");
     }
