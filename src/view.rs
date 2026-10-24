@@ -2110,14 +2110,12 @@ fn input_text<'a>(
     stack![base, container(bar).padding(iced::Padding { top: y, left, ..Default::default() })].into()
 }
 
-/// Where the cursor at byte `at` of `content` falls once it is laid out
-/// like the compose text: x, top of its line, line height, and the width of
-/// the letter under it (0 at the end of a line).
-fn caret(content: &str, at: usize, width: f32) -> (f32, f32, f32, f32) {
+/// `content` laid out like the compose text.
+fn compose_paragraph(content: &str, width: f32) -> iced::advanced::graphics::text::Paragraph {
     use iced::advanced::graphics::text::Paragraph;
     use iced::advanced::text::{self as core_text, Paragraph as _};
     let spans: Vec<text::Span<'_, ()>> = emoji_spans(content).collect();
-    let paragraph = Paragraph::with_spans(core_text::Text {
+    Paragraph::with_spans(core_text::Text {
         content: spans.as_slice(),
         bounds: Size::new(width, f32::INFINITY),
         size: TEXT.into(),
@@ -2127,19 +2125,56 @@ fn caret(content: &str, at: usize, width: f32) -> (f32, f32, f32, f32) {
         align_y: iced::alignment::Vertical::Top,
         shaping: text::Shaping::Advanced,
         wrapping: Wrapping::Word,
-    });
+    })
+}
+
+/// The screen line (cosmic-text's layout run) the cursor at byte `at` is
+/// on, its x there and the width of the letter under it (0 at the end of
+/// a line).
+fn caret_run(
+    runs: &[iced::advanced::graphics::text::cosmic_text::LayoutRun<'_>],
+    content: &str,
+    at: usize,
+) -> Option<(usize, f32, f32)> {
     // cosmic-text counts bytes from the start of each paragraph line.
     let line = content[..at].matches('\n').count();
     let offset = at - content[..at].rfind('\n').map_or(0, |i| i + 1);
-    let fallback = text::LineHeight::default().to_absolute(TEXT.into()).0;
     let mut last = None;
-    for run in paragraph.buffer().layout_runs().filter(|r| r.line_i == line) {
+    for (i, run) in runs.iter().enumerate().filter(|(_, r)| r.line_i == line) {
         if let Some(glyph) = run.glyphs.iter().find(|g| g.start >= offset) {
-            return (glyph.x, run.line_top, run.line_height, glyph.w);
+            return Some((i, glyph.x, glyph.w));
         }
-        last = Some((run.line_w, run.line_top, run.line_height, 0.0));
+        last = Some((i, run.line_w, 0.0));
     }
-    last.unwrap_or((0.0, line as f32 * fallback, fallback, 0.0))
+    last
+}
+
+/// Where the cursor at byte `at` of `content` falls once it is laid out
+/// like the compose text: x, top of its line, line height, and the width of
+/// the letter under it (0 at the end of a line).
+fn caret(content: &str, at: usize, width: f32) -> (f32, f32, f32, f32) {
+    let paragraph = compose_paragraph(content, width);
+    let runs: Vec<_> = paragraph.buffer().layout_runs().collect();
+    let fallback = text::LineHeight::default().to_absolute(TEXT.into()).0;
+    match caret_run(&runs, content, at) {
+        Some((i, x, letter)) => (x, runs[i].line_top, runs[i].line_height, letter),
+        None => (0.0, content[..at].matches('\n').count() as f32 * fallback, fallback, 0.0),
+    }
+}
+
+/// The byte of `content` a screen line above or below the cursor at `at`,
+/// as the compose box wraps it, as near its x as there is; `None` on the
+/// first or last line.
+pub fn compose_line_move(content: &str, at: usize, width: f32, down: bool) -> Option<usize> {
+    let paragraph = compose_paragraph(content, width);
+    let buffer = paragraph.buffer();
+    let runs: Vec<_> = buffer.layout_runs().collect();
+    let (current, x, _) = caret_run(&runs, content, at)?;
+    let target = runs.get(if down { current + 1 } else { current.checked_sub(1)? })?;
+    let hit = buffer.hit(x, target.line_top + target.line_height / 2.0)?;
+    let line_start = content.split_inclusive('\n').take(hit.line).map(str::len).sum::<usize>();
+    let to = (line_start + hit.index).min(content.len());
+    (content.is_char_boundary(to) && to != at).then_some(to)
 }
 
 /// "📎 photo.png" or "📎 3 files: a.png, b.mp4, …"
@@ -2636,6 +2671,21 @@ mod tests {
         let (at, y, _, _) = caret("hello world", 9, narrow);
         assert_eq!(y, height);
         assert_eq!(at, x("wor", 3, wide));
+    }
+
+    #[test]
+    fn compose_moves_by_screen_lines() {
+        // Lines of the text: the same column a line down and up.
+        assert_eq!(compose_line_move("ab\ncd", 1, 500.0, true), Some(4));
+        assert_eq!(compose_line_move("ab\ncd", 4, 500.0, false), Some(1));
+        assert_eq!(compose_line_move("ab\ncd", 1, 500.0, false), None);
+        assert_eq!(compose_line_move("ab\ncd", 4, 500.0, true), None);
+        // One long line wrapped into several: down and back up again.
+        let long = "word ".repeat(40);
+        let down = compose_line_move(&long, 0, 200.0, true).unwrap();
+        assert!(down > 0 && down < long.len(), "{down}");
+        assert_eq!(compose_line_move(&long, down, 200.0, false), Some(0));
+        assert_eq!(compose_line_move(&long, long.len(), 200.0, true), None);
     }
 
     #[test]

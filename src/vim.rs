@@ -691,6 +691,12 @@ impl TextPending {
     }
 
     /// The selected bytes while in Visual, and whether whole lines.
+    /// Nothing typed yet that the next key would finish (a count, an
+    /// operator, `g`, a text object).
+    pub fn idle(&self) -> bool {
+        self.count.is_none() && self.op.is_none() && !self.g && self.object.is_none()
+    }
+
     pub fn selection(&self, input: &Input) -> Option<(usize, usize, bool)> {
         let visual = self.visual?;
         let anchor = input.clamp(visual.anchor);
@@ -1103,6 +1109,11 @@ impl Input {
     pub fn set(&mut self, text: &str) {
         self.text = text.to_owned();
         self.cursor = self.text.len();
+    }
+
+    /// Cursor to byte `at` (or the char boundary before it).
+    pub fn set_cursor(&mut self, at: usize) {
+        self.cursor = self.clamp(at);
     }
 }
 

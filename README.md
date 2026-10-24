@@ -134,11 +134,11 @@ Command line: `↑`/`↓` (or `Ctrl-p`/`Ctrl-n`) recall earlier `/` searches and
 starting with what you typed; the history survives restarts.
 
 Insert mode: `Enter` sends, `Shift+Enter` new line, `Ctrl-v` paste (text, or a copied
-image / files as attachments), `Ctrl-w` delete word, `Ctrl-u` delete to start, `↑` in an empty line edits your last
-message. `Esc` with some text written goes to Text mode instead of the message list.
+image / files as attachments), `Ctrl-w` delete word, `Ctrl-u` delete to start, `↑`/`↓` move a line up / down
+(as the text wraps on screen), `↑` in an empty line edits your last message. `Esc` with some text written goes to Text mode instead of the message list.
 
 Text mode (`TEXT` in the status line): Vim keys inside the message being written. `h`/`l`,
-`w`/`b`/`e` (`W`/`B`/`E`), `0`/`^`/`$`, `j`/`k` between lines, `gg`/`G` move; `d`, `c`, `y`
+`w`/`b`/`e` (`W`/`B`/`E`), `0`/`^`/`$`, `j`/`k` between lines as they wrap on screen (`3j`, `dj` take lines of the text), `gg`/`G` move; `d`, `c`, `y`
 take a motion (`dw`, `cw`, `d$`, `y2w`) or a text object (`diw`, `ciw`, `yaw`, `daW`),
 doubled for the whole line (`dd`, `cc`, `yy`); `x`/`X`, `D`, `C`, `s`/`S`, `Y`, `~`;
 `i`/`a`/`I`/`A`/`o`/`O` go back to typing; `p`/`P` paste; `u` undo, `Ctrl-r` redo; counts

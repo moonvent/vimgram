@@ -4031,6 +4031,11 @@ impl App {
     }
 
     fn key_insert(&mut self, key: &Key, physical: Physical, mods: Modifiers, text: Option<&str>) -> Task<Message> {
+        if let Key::Named(arrow @ (Named::ArrowUp | Named::ArrowDown)) = key
+            && self.compose_line(*arrow == Named::ArrowDown)
+        {
+            return Task::none();
+        }
         if self.auth == Auth::Ready
             && mods.shift()
             && matches!(key, Key::Named(Named::Enter))
@@ -4082,6 +4087,17 @@ impl App {
         let Some(key) = text_key(key, physical, mods) else {
             return Task::none();
         };
+        // `j` and `k` by screen lines, as the box wraps the text; with a
+        // count or after an operator, by lines of the text.
+        let down = match key {
+            NKey::Char('j') | NKey::Down => Some(true),
+            NKey::Char('k') | NKey::Up => Some(false),
+            _ => None,
+        };
+        if let Some(down) = down.filter(|_| self.text_pending.idle()) {
+            self.compose_line(down);
+            return Task::none();
+        }
         match self.text_pending.feed(key, &mut self.input) {
             TextAction::None => Task::none(),
             TextAction::Insert => {
@@ -4104,6 +4120,19 @@ impl App {
                 self.info("Copied to clipboard");
                 iced::clipboard::write(text)
             }
+        }
+    }
+
+    /// The compose cursor a screen line up or down; false on the first or
+    /// last line.
+    fn compose_line(&mut self, down: bool) -> bool {
+        let width = view::compose_text_width(self.size, self.emoji.is_some(), self.side_viewer());
+        match view::compose_line_move(self.input.as_str(), self.input.cursor(), width, down) {
+            Some(at) => {
+                self.input.set_cursor(at);
+                true
+            }
+            None => false,
         }
     }
 
