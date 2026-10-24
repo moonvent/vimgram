@@ -2,7 +2,7 @@
 name = "vimgram"
 # Shown as 1.51 (the trailing .0 only satisfies Cargo); each change raises
 # the middle number.
-version = "1.53.0"
+version = "1.54.0"
 edition = "2024"
 description = "Keyboard-only, Vim-style Telegram client"
 license = "MIT"
