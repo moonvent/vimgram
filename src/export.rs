@@ -152,6 +152,7 @@ mod tests {
             preview: None,
             comments: None,
             thread: 0,
+            versions: Vec::new(),
         }
     }
 

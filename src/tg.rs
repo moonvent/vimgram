@@ -1374,6 +1374,17 @@ pub struct Msg {
     /// The comment thread this message is in (`Thread::root`); 0: none.
     #[serde(default)]
     pub thread: i64,
+    /// Every text it had, oldest first, while its history is shown (`gh`).
+    #[serde(skip)]
+    pub versions: Vec<Version>,
+}
+
+/// A text a message had, from the archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Version {
+    /// When it was written: sent, or the edit seen.
+    pub at: i64,
+    pub text: String,
 }
 
 /// A link preview: the page's site, title, description and picture.
@@ -1645,11 +1656,7 @@ pub fn reactions(info: Option<&types::MessageInteractionInfo>) -> Vec<Reaction> 
 impl From<types::Message> for Msg {
     fn from(m: types::Message) -> Self {
         let media = media(&m.content);
-        let text = if media.is_some() {
-            caption(&m.content)
-        } else {
-            content_text(&m.content, m.is_outgoing)
-        };
+        let text = message_text(&m.content, m.is_outgoing);
         let local_files = content_files(&m.content)
             .into_iter()
             .filter(|f| f.local.is_downloading_completed && !f.local.path.is_empty())
@@ -1686,6 +1693,7 @@ impl From<types::Message> for Msg {
                 _ => 0,
             },
             text,
+            versions: Vec::new(),
         }
     }
 }
@@ -1731,6 +1739,7 @@ impl From<Record> for Msg {
             preview: None,
             comments: None,
             thread: 0,
+            versions: Vec::new(),
         }
     }
 }
@@ -1815,6 +1824,21 @@ impl Msg {
 
 /// Smallest photo size at least this large is shown inline.
 const PREVIEW_MIN_SIDE: i32 = 640;
+
+/// `Msg::text`: the caption of rendered media, otherwise the text.
+pub fn message_text(content: &MessageContent, outgoing: bool) -> String {
+    if media(content).is_some() {
+        caption(content)
+    } else {
+        content_text(content, outgoing)
+    }
+}
+
+/// Its text can be edited, so a new one is an edit (a dice's value or a
+/// call's end change otherwise).
+pub fn editable(content: &MessageContent) -> bool {
+    matches!(content, MessageContent::MessageText(_)) || media(content).is_some()
+}
 
 fn caption(content: &MessageContent) -> String {
     match content {
@@ -2246,6 +2270,7 @@ mod tests {
             deleted_at: None,
             data: None,
             files: Vec::new(),
+            edited_text: None,
         });
         msg.styles = styles(&text);
         assert_eq!(msg.masked_text(), "жирный и ▒▒▒▒▒");

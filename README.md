@@ -104,6 +104,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `gc`, click on "💬 N comments" | the comments of a channel post: `i` comments, `r` answers a comment, `Esc` (or `Ctrl-o`) goes back to the post |
 | `Ctrl-o`, `Ctrl-i` | back to the chat (and message, and folder) you came from — by `gu`/`gk`, `gf`, `gc`, a t.me link or opening another chat — and forward again |
 | `ge`, `Ctrl-.` in insert mode, `:emoji`, the 😀 button | emoji panel: `h`/`j`/`k`/`l` move, `Enter` inserts, `Tab`/`[`/`]`/`1`–`0` groups, `/` search by name, `Esc` closes |
+| `gh`, click on "edited" | how the message was edited: its earlier texts under it, oldest first, each with when it was written; `gh` again hides them. Telegram keeps only the last text, so the client records every change it sees (from then on, in any chat, in the archive) |
 | `yy`, `Y` | copy message text (or chat title) to the clipboard |
 | `gy` | copy part of the message text: a cursor in it (`READ`), the moves of Text mode, then `yiw` (the word), `yw`, `ye`, `y$`, `yy`, or `v`/`V` to select and `y`; copying or `Esc` goes back |
 | `p` / `P` | paste the clipboard at the end / start of the message; a copied image or file becomes an attachment |
@@ -170,7 +171,8 @@ A message taller than the window scrolls with `j`/`k` before the cursor moves on
 Every message the client sees is kept whole in `~/.local/share/vimgram/archive.sqlite`,
 and every media file it downloads is hard-linked into `~/.local/share/vimgram/media/`
 (no extra space while TDLib has the file too). Messages deleted later stay visible with
-their photos, voice messages, stickers and videos, marked as deleted. TDLib removes the
+their photos, voice messages, stickers and videos, marked as deleted. Every text an edited
+message had is kept there too (`gh` shows them). TDLib removes the
 files of deleted messages, so media of incoming messages in private chats and groups is
 downloaded right away (up to `prefetch_mb`). Links of messages still alive after 30 days
 are dropped.

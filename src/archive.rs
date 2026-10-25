@@ -6,6 +6,9 @@
 //! deleted messages, the links keep them. Links of messages that were not
 //! deleted within `MEDIA_DAYS` are dropped again.
 //!
+//! Every text a message had is kept too (`edits`), so how it was edited
+//! can be shown: Telegram itself keeps only the last one.
+//!
 //! Writes go through a background thread and are batched into one
 //! transaction; reads open their own connection (WAL allows both at once).
 
@@ -14,9 +17,9 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::tg::{Msg, Sender};
+use crate::tg::{Msg, Sender, Version};
 
 /// What the archive keeps of a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +37,9 @@ pub struct Record {
     pub data: Option<String>,
     /// Archived copies of the media files: (file id, path).
     pub files: Vec<(i32, String)>,
+    /// The text of a message Telegram says was edited, unless it is an
+    /// album's (merged from several messages): a version to keep.
+    pub edited_text: Option<String>,
 }
 
 impl Record {
@@ -48,6 +54,7 @@ impl Record {
             deleted_at: None,
             data: serde_json::to_string(msg).ok(),
             files: Vec::new(),
+            edited_text: (msg.edited && msg.album == 0).then(|| msg.text.clone()),
         }
     }
 }
@@ -57,6 +64,8 @@ enum Command {
     Delete { chat_id: i64, ids: Vec<i64>, at: i64 },
     /// A message of ours went without sound.
     Silent { chat_id: i64, id: i64 },
+    /// The text of a message changed to `text`, seen at `at`.
+    Edit { chat_id: i64, id: i64, text: String, at: i64 },
     /// Keep a downloaded file of a message.
     Link { chat_id: i64, msg_id: i64, file_id: i32, path: String },
     /// Reply once everything before it is committed.
@@ -98,7 +107,14 @@ fn connect(path: &Path) -> rusqlite::Result<Connection> {
             chat_id INTEGER NOT NULL,
             id INTEGER NOT NULL,
             PRIMARY KEY (chat_id, id)
-        ) WITHOUT ROWID;",
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS edits (
+            chat_id INTEGER NOT NULL,
+            id INTEGER NOT NULL,
+            at INTEGER NOT NULL,
+            text TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS edits_message ON edits (chat_id, id);",
     )?;
     let has_data = conn
         .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'data'")?
@@ -152,6 +168,32 @@ impl Archive {
         rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
     }
 
+    /// The text of a message changed (edited): keep it, and the one before.
+    pub fn edited(&self, chat_id: i64, id: i64, text: String) {
+        let at = chrono::Utc::now().timestamp();
+        let _ = self.writer.send(Command::Edit { chat_id, id, text, at });
+    }
+
+    /// Every text the first of `ids` that has any had, oldest first (the
+    /// last is the current one); empty if it wasn't seen edited (blocking).
+    pub fn versions(&self, chat_id: i64, ids: &[i64]) -> Result<Vec<Version>, String> {
+        let conn = connect(&self.path).map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT at, text FROM edits WHERE chat_id = ?1 AND id = ?2 ORDER BY rowid")
+            .map_err(|e| e.to_string())?;
+        for &id in ids {
+            let versions: Vec<Version> = stmt
+                .query_map(params![chat_id, id], |row| Ok(Version { at: row.get(0)?, text: row.get(1)? }))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<_, _>>()
+                .map_err(|e| e.to_string())?;
+            if !versions.is_empty() {
+                return Ok(versions);
+            }
+        }
+        Ok(Vec::new())
+    }
+
     pub fn mark_deleted(&self, chat_id: i64, ids: Vec<i64>) {
         let at = chrono::Utc::now().timestamp();
         let _ = self.writer.send(Command::Delete { chat_id, ids, at });
@@ -185,6 +227,7 @@ impl Archive {
                     deleted_at: row.get(7)?,
                     data: row.get(8)?,
                     files: Vec::new(),
+                    edited_text: None,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -283,6 +326,11 @@ fn apply(tx: &rusqlite::Transaction<'_>, media: &Path, command: Command) -> rusq
                  SET text = excluded.text, data = coalesce(excluded.data, data)",
             )?;
             for r in records {
+                // Edited while the client wasn't looking (closed, or the
+                // chat not open): the archive still has the text before.
+                if let Some(text) = r.edited_text {
+                    keep_version(tx, r.chat_id, r.id, text, chrono::Utc::now().timestamp())?;
+                }
                 let (is_chat, sender_id) = match r.sender {
                     Sender::User(id) => (false, id),
                     Sender::Chat(id) => (true, id),
@@ -307,6 +355,7 @@ fn apply(tx: &rusqlite::Transaction<'_>, media: &Path, command: Command) -> rusq
             tx.prepare_cached("INSERT OR IGNORE INTO silent (chat_id, id) VALUES (?1, ?2)")?
                 .execute(params![chat_id, id])?;
         }
+        Command::Edit { chat_id, id, text, at } => keep_version(tx, chat_id, id, text, at)?,
         Command::Delete { chat_id, ids, at } => {
             let mut stmt = tx.prepare_cached(
                 "UPDATE messages SET deleted_at = ?3
@@ -317,6 +366,38 @@ fn apply(tx: &rusqlite::Transaction<'_>, media: &Path, command: Command) -> rusq
             }
         }
     }
+    Ok(())
+}
+
+/// Add `text` as the newest version of a message, unless it already is.
+/// Before the first one goes the text the archive had, from when the
+/// message was sent; a message never seen before has no history.
+fn keep_version(tx: &rusqlite::Transaction<'_>, chat_id: i64, id: i64, text: String, at: i64) -> rusqlite::Result<()> {
+    let last: Option<String> = tx
+        .prepare_cached("SELECT text FROM edits WHERE chat_id = ?1 AND id = ?2 ORDER BY rowid DESC LIMIT 1")?
+        .query_row(params![chat_id, id], |row| row.get(0))
+        .optional()?;
+    let mut insert = tx.prepare_cached("INSERT INTO edits (chat_id, id, at, text) VALUES (?1, ?2, ?3, ?4)")?;
+    match last {
+        Some(last) if last == text => return Ok(()),
+        Some(_) => {}
+        None => {
+            // `text` of the row is a summary with the media's label: the
+            // message's own text is in its JSON, absent in old records.
+            let before: Option<(String, i64)> = tx
+                .prepare_cached(
+                    "SELECT json_extract(data, '$.text'), date FROM messages
+                     WHERE chat_id = ?1 AND id = ?2 AND data IS NOT NULL",
+                )?
+                .query_row(params![chat_id, id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()?;
+            match before {
+                Some((before, date)) if before != text => insert.execute(params![chat_id, id, date, before])?,
+                _ => return Ok(()),
+            };
+        }
+    }
+    insert.execute(params![chat_id, id, at, text])?;
     Ok(())
 }
 
@@ -349,7 +430,39 @@ mod tests {
             preview: None,
             comments: None,
             thread: 0,
+            versions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn keeps_every_text_of_an_edited_message() {
+        let path = std::env::temp_dir().join(format!("vimgram-edits-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let archive = Archive::open(path.clone()).unwrap();
+        archive.save(&[msg(1, 10, "helo"), msg(1, 11, "same")]);
+        archive.edited(1, 10, "hello".into());
+        // The same change seen again (the message saved after it) is no new version.
+        let mut edited = msg(1, 10, "hello");
+        edited.edited = true;
+        archive.save(&[edited]);
+        archive.edited(1, 10, "hello!".into());
+        // Edited while the client was away: noticed once the message is seen again.
+        let mut away = msg(1, 11, "changed");
+        away.edited = true;
+        archive.save(&[away]);
+        // Its content update coming after that adds nothing.
+        archive.edited(1, 11, "changed".into());
+        // Nothing is known of a message never seen before.
+        archive.edited(1, 12, "new".into());
+        archive.flush();
+
+        let texts = |id| archive.versions(1, &[id]).unwrap().into_iter().map(|v| v.text).collect::<Vec<_>>();
+        assert_eq!(texts(10), ["helo", "hello", "hello!"]);
+        assert_eq!(texts(11), ["same", "changed"]);
+        assert!(texts(12).is_empty());
+        assert_eq!(archive.versions(1, &[12, 11]).unwrap().len(), 2, "the first of an album's parts with any");
+        assert_eq!(archive.versions(1, &[10]).unwrap()[0].at, 1_700_000_000, "the original from when it was sent");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

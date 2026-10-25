@@ -163,6 +163,8 @@ pub enum Action {
     Comments,
     /// A cursor in the message's text, to copy part of it (`gy`).
     ReadText,
+    /// Show or hide the texts the message had before its edits (`gh`).
+    Versions,
     /// Messages: start / end a Visual selection (`V`).
     Visual,
     /// Mark / unmark the message, or the Visual range, to act on several
@@ -222,6 +224,7 @@ impl Pending {
             (Some('g'), NKey::Char('f')) => Some(Action::GoToSource),
             (Some('g'), NKey::Char('c')) => Some(Action::Comments),
             (Some('g'), NKey::Char('y')) => Some(Action::ReadText),
+            (Some('g'), NKey::Char('h')) => Some(Action::Versions),
             (Some('g'), NKey::Char('x')) => Some(Action::OpenLink(explicit.unwrap_or(1))),
             (Some('g'), NKey::Char('e')) => Some(Action::Emoji),
             (Some('g'), NKey::Char('v')) => Some(Action::JumpPlaying),
@@ -1145,6 +1148,7 @@ mod tests {
         assert_eq!(feed("gugk"), vec![Action::FirstUnread { channel: false }, Action::FirstUnread { channel: true }]);
         assert_eq!(feed("rR"), vec![Action::Reply, Action::React]);
         assert_eq!(feed("gf"), vec![Action::GoToSource]);
+        assert_eq!(feed("gh"), vec![Action::Versions]);
         assert_eq!(feed("gccc"), vec![Action::Comments, Action::Edit]);
         assert_eq!(feed("Vjf"), vec![Action::Visual, Action::Down(1), Action::Forward]);
         assert_eq!(feed("vjvf"), vec![Action::Mark, Action::Down(1), Action::Mark, Action::Forward]);

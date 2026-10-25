@@ -67,7 +67,7 @@ pub const PINNED_TAG: &str = "📌";
 
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes  J/K gt/gT Alt-N folders  \
                     Enter open/play  gu/gk unread private chat/channel  i/I/a/A insert  Esc then vim keys in the text  q record  r reply  R react  cc/e edit  f forward  v mark  V visual  dd delete  \
-                    yy/Y copy  gy copy part  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  { } volume  H/L seek  m mute  U leave/join  gc comments  \
+                    yy/Y copy  gy copy part  gh edit history  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  { } volume  H/L seek  m mute  U leave/join  gc comments  \
                     / search chats, Telegram or messages  :posts public posts  n/N next/prev match or pinned  ga attach  gp pinned  gP all pinned  gf original/reply  gx link  ^o/^i back/forward between chats  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
                     :folder  :theme  :font 20  :autostart  :cleancache  :q";
@@ -156,6 +156,14 @@ pub enum Message {
         chat_id: i64,
         result: Result<Vec<Record>, String>,
     },
+    /// The texts message `id` had, from the archive (`gh`).
+    Versions {
+        chat_id: i64,
+        id: i64,
+        result: Result<Vec<tg::Version>, String>,
+    },
+    /// Click on "edited": show or hide how the message was edited.
+    ToggleVersions(i64),
     Pinned {
         chat_id: i64,
         result: Result<Vec<Msg>, String>,
@@ -1712,6 +1720,25 @@ impl App {
                 }
                 Task::none()
             }
+            Message::Versions { chat_id, id, result } => {
+                match result {
+                    Ok(versions) if versions.len() > 1 => {
+                        if let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id)
+                            && let Some(i) = open.position(id)
+                        {
+                            open.msgs[i].versions = versions;
+                            self.scroll_messages();
+                        }
+                    }
+                    Ok(_) => self.error("No earlier text: the client didn't see the message before it was edited"),
+                    Err(e) => self.error(format!("Archive: {e}")),
+                }
+                Task::none()
+            }
+            Message::ToggleVersions(id) => {
+                self.select_message(id);
+                self.toggle_versions()
+            }
             Message::Pinned { chat_id, result } => {
                 if let Some(open) = self.open.as_mut().filter(|o| o.id == chat_id) {
                     open.pins = result.unwrap_or_default();
@@ -2228,21 +2255,30 @@ impl App {
                 tg::sent_silently(u.message.chat_id, u.old_message_id);
             }
             Update::MessageContent(u) => {
+                // Kept for every chat, open or not: Telegram keeps only the last text.
+                if let Some(archive) = &self.archive
+                    && tg::editable(&u.new_content)
+                {
+                    // `outgoing` only matters for calls.
+                    archive.edited(u.chat_id, u.message_id, tg::message_text(&u.new_content, false));
+                }
                 if let Some(open) = self.open.as_mut().filter(|o| o.id == u.chat_id)
                     && let Some(i) = open.position(u.message_id)
                     && open.msgs[i].members.len() == 1
                 {
                     let msg = &mut open.msgs[i];
                     msg.media = tg::media(&u.new_content).into_iter().collect();
-                    if msg.media.is_empty() {
-                        msg.text = tg::content_text(&u.new_content, msg.outgoing);
-                    }
+                    msg.text = tg::message_text(&u.new_content, msg.outgoing);
                     msg.links = tg::content_links(&u.new_content, &msg.text);
                     msg.styles = tg::content_styles(&u.new_content, &msg.text);
                     msg.spoiler = tg::media_spoiler(&u.new_content);
                     msg.preview = tg::link_preview(&u.new_content);
                     let msg = msg.clone();
-                    self.archive_save(&[msg]);
+                    self.archive_save(std::slice::from_ref(&msg));
+                    // The history shown gets the new text too.
+                    if !msg.versions.is_empty() {
+                        return self.load_versions(&msg);
+                    }
                 }
             }
             // Listened on another device, or by the recipient.
@@ -4210,6 +4246,48 @@ impl App {
     }
 
     /// `gy`: a cursor in the text of the message under the cursor.
+    /// Show the texts the message under the cursor had, under it, or hide them.
+    fn toggle_versions(&mut self) -> Task<Message> {
+        let Some(m) = self.focused_message() else {
+            self.error("Go to a message first (l)");
+            return Task::none();
+        };
+        if !m.versions.is_empty() {
+            let id = m.id;
+            if let Some(open) = self.open.as_mut()
+                && let Some(i) = open.position(id)
+            {
+                open.msgs[i].versions.clear();
+            }
+            self.scroll_messages();
+            return Task::none();
+        }
+        if !m.edited {
+            self.error("The message wasn't edited");
+            return Task::none();
+        }
+        let m = m.clone();
+        self.load_versions(&m)
+    }
+
+    fn load_versions(&self, m: &Msg) -> Task<Message> {
+        let Some(archive) = self.archive.clone() else {
+            return Task::none();
+        };
+        let (chat_id, id, members) = (m.chat_id, m.id, m.members.clone());
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    archive.flush();
+                    archive.versions(chat_id, &members)
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            },
+            move |result| Message::Versions { chat_id, id, result },
+        )
+    }
+
     fn read_text(&mut self) {
         let Some(m) = self.focused_message() else {
             self.error("Go to a message first (l)");
@@ -4814,6 +4892,7 @@ impl App {
                 self.read_text();
                 Task::none()
             }
+            Action::Versions => self.toggle_versions(),
             Action::JumpBack => match self.jumps.pop() {
                 Some(to) => {
                     if let Some(here) = self.here() {
@@ -5677,6 +5756,7 @@ mod tests {
             preview: None,
             comments: None,
             thread: 0,
+            versions: Vec::new(),
         }
     }
 

@@ -18,7 +18,7 @@ use crate::emoji::{self, Picker};
 use crate::fonts::{self, EMOJI};
 use crate::media::Loaded;
 use crate::player::{self, SpeedKind};
-use crate::tg::{ChatKind, Media, Membership, Msg, Presence, Preview, Sender, Style, fmt_count, fmt_duration};
+use crate::tg::{ChatKind, Media, Membership, Msg, Presence, Preview, Sender, Style, Version, fmt_count, fmt_duration};
 use crate::vim::{Input, Mode};
 
 pub const FOLDER_W: f32 = 76.0;
@@ -98,6 +98,11 @@ const REACTION_W: f32 = 68.0;
 const BLOCK_H: f32 = 13.0;
 /// "💬 12 comments" under a channel post.
 const COMMENTS_H: f32 = 22.0;
+/// An earlier text of an edited message (`gh`): the line with its time,
+/// the space before the next one, how far in it is.
+const VERSION_HEAD_H: f32 = 18.0;
+const VERSION_GAP: f32 = 6.0;
+const VERSION_INDENT: f32 = 12.0;
 const BLOCK_GAP: i32 = 3600;
 
 pub fn chat_rows(size: Size) -> usize {
@@ -269,16 +274,26 @@ fn display_width(line: &str) -> usize {
 
 /// Deliberately pessimistic height estimate, so whatever we consider
 /// visible fits. Media sizes are exact.
-pub fn message_height(m: &Msg, width: f32) -> f32 {
+/// Screen lines a text of the message takes.
+fn text_lines(text: &str, width: f32) -> usize {
     let per_line = ((width - 20.0) / (TEXT * 0.6)).max(10.0) as usize;
-    let lines: usize = if m.text.is_empty() {
+    if text.is_empty() {
         0
     } else {
-        m.text
-            .split('\n')
-            .map(|l| display_width(l).max(1).div_ceil(per_line))
-            .sum()
-    };
+        text.split('\n').map(|l| display_width(l).max(1).div_ceil(per_line)).sum()
+    }
+}
+
+/// The texts a message had before the one it has, while shown (`gh`).
+fn earlier_versions(m: &Msg) -> &[Version] {
+    match m.versions.split_last() {
+        Some((last, earlier)) if last.text == m.text => earlier,
+        _ => &m.versions,
+    }
+}
+
+pub fn message_height(m: &Msg, width: f32) -> f32 {
+    let lines = text_lines(&m.text, width);
     let reply = if m.reply_to.is_some() { REPLY_H } else { 0.0 };
     let reply = reply + if m.forward.is_some() { FORWARD_H } else { 0.0 };
     let per_row = ((width - 20.0) / REACTION_W).max(1.0) as usize;
@@ -287,7 +302,12 @@ pub fn message_height(m: &Msg, width: f32) -> f32 {
     let reactions = if rows == 0 { 0.0 } else { rows as f32 * REACTIONS_H + 2.0 };
     let preview = m.preview.as_ref().map_or(0.0, |p| preview_height(p, width));
     let comments = if m.comments.is_some() { COMMENTS_H } else { 0.0 };
-    16.0 + 18.0 + reply + media_block_height(&m.media, width) + lines as f32 * LINE_H + preview + reactions + comments
+    let versions: f32 = earlier_versions(m)
+        .iter()
+        .map(|v| VERSION_HEAD_H + text_lines(&v.text, width - VERSION_INDENT) as f32 * LINE_H + VERSION_GAP)
+        .sum();
+    16.0 + 18.0 + reply + media_block_height(&m.media, width) + lines as f32 * LINE_H + versions + preview + reactions
+        + comments
         + MSG_SPACING
 }
 
@@ -1734,6 +1754,9 @@ fn message_keys<'a>(app: &App, m: &Msg) -> text::Rich<'a, (), Message> {
     if m.comments.is_some() {
         keys.push(("gc", "comments"));
     }
+    if m.edited {
+        keys.push(("gh", if m.versions.is_empty() { "how edited" } else { "hide edits" }));
+    }
     match m.media.first() {
         Some(Media::Voice { .. } | Media::Audio { .. } | Media::Video { round: true, .. }) => keys.push(("Enter", "play")),
         Some(media) if media.viewable() => keys.push(("Enter", "open")),
@@ -1770,7 +1793,16 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
     .spacing(8)
     .align_y(Alignment::Center);
     if m.edited {
-        header = header.push(text("edited").size(12).style(muted_text));
+        // Since when it says what it says, while its history is shown.
+        let label = match m.versions.last() {
+            Some(v) => format!("edited {}", fmt_time(v.at as i32, false)),
+            None => "edited".to_owned(),
+        };
+        header = header.push(
+            mouse_area(text(label).size(12).style(muted_text))
+                .on_press(Message::ToggleVersions(m.id))
+                .interaction(Interaction::Pointer),
+        );
     }
     if app.sent_silently(m) {
         header = header.push(text("silent").size(12).style(muted_text));
@@ -1825,6 +1857,10 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
     }
     if !m.text.is_empty() {
         body = body.push(message_text(app, m));
+    }
+    let earlier = earlier_versions(m);
+    if !earlier.is_empty() {
+        body = body.push(versions_view(earlier));
     }
     if let Some(preview) = &m.preview {
         body = body.push(preview_card(app, preview, width));
@@ -1881,6 +1917,23 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
         tooltip::Position::FollowCursor,
     )
     .into()
+}
+
+/// The texts an edited message had before, oldest first, each with when it
+/// was written (`gh`).
+fn versions_view<'a>(earlier: &[Version]) -> Element<'a, Message> {
+    let italic = Font { style: font::Style::Italic, ..Font::DEFAULT };
+    let mut list = column![].spacing(VERSION_GAP);
+    for (i, v) in earlier.iter().enumerate() {
+        let when = if i == 0 { "sent" } else { "edited" };
+        let shown: Element<_> = if v.text.is_empty() {
+            text("no text").size(TEXT).font(italic).style(muted_text).into()
+        } else {
+            emoji_text(&v.text).size(TEXT).style(muted_text).into()
+        };
+        list = list.push(column![text(format!("{when} {}", fmt_time(v.at as i32, false))).size(12).style(muted_text), shown]);
+    }
+    container(list).padding(iced::Padding { left: VERSION_INDENT, top: 2.0, ..Default::default() }).into()
 }
 
 /// Site, title, the start of the description and the picture of a link;
@@ -2723,6 +2776,7 @@ mod tests {
             preview: None,
             comments: None,
             thread: 0,
+            versions: Vec::new(),
         }
     }
 
