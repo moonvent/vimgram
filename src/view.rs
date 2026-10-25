@@ -955,25 +955,20 @@ fn list_row<'a>(
 }
 
 /// Selected row: a strong tint of the accent color with a solid accent
-/// outline when the pane has focus, so the active pane stands out; only a
-/// neutral lift otherwise. The text keeps the theme's own colors, so it
-/// stays readable either way.
+/// outline when the pane has focus, so the active pane stands out; a
+/// lighter tint and a thin, fainter outline otherwise, still plain to see
+/// (the open chat and folder while the messages have the keys). The text
+/// keeps the theme's own colors, so it stays readable either way.
 fn selection_style(t: &Theme, selected: bool, focused: bool) -> container::Style {
     if !selected {
         return container::Style::default();
     }
-    let p = t.extended_palette();
-    if focused {
-        container::Style {
-            background: Some(p.primary.base.color.scale_alpha(0.35).into()),
-            border: iced::border::width(2).color(p.primary.base.color).rounded(4),
-            ..Default::default()
-        }
-    } else {
-        container::Style {
-            background: Some(p.background.weak.color.scale_alpha(0.5).into()),
-            ..Default::default()
-        }
+    let accent = t.extended_palette().primary.base.color;
+    let (tint, width, outline) = if focused { (0.42, 2, 1.0) } else { (0.2, 1, 0.6) };
+    container::Style {
+        background: Some(accent.scale_alpha(tint).into()),
+        border: iced::border::width(width).color(accent.scale_alpha(outline)).rounded(4),
+        ..Default::default()
     }
 }
 
