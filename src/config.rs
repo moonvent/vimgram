@@ -91,6 +91,23 @@ pub fn dirs() -> ProjectDirs {
     ProjectDirs::from("", "", "vimgram").expect("could not determine home directory")
 }
 
+/// Where files downloaded from messages go: ~/Downloads.
+pub fn download_dir() -> std::path::PathBuf {
+    let dirs = directories::UserDirs::new();
+    dirs.as_ref()
+        .and_then(|d| d.download_dir().map(|p| p.to_path_buf()))
+        .or_else(|| dirs.as_ref().map(|d| d.home_dir().join("Downloads")))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// The path with the home directory as `~`, to show.
+pub fn tilde(path: &std::path::Path) -> String {
+    match directories::UserDirs::new().and_then(|d| path.strip_prefix(d.home_dir()).ok().map(|p| p.to_path_buf())) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
 impl Config {
     pub fn load() -> Result<Self, String> {
         let path = dirs().config_dir().join("config.toml");

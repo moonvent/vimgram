@@ -86,7 +86,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `h` / `l`, `Ctrl-h` / `Ctrl-l` | focus the pane to the left / right: folders ↔ chat list ↔ messages (`j`/`k`, `gg`/`G` move through folders there, `Enter` goes to the chats) |
 | `Tab` | switch between chat list and messages |
 | `J` / `K`, `gt` / `gT`, `3gt`, `Alt-1…9` | next / previous / n-th folder |
-| `Enter`, `o` | open chat (a channel opens beside the list, focus stays there; `Enter` again goes to the posts); view photo or video; play voice message or music; show a spoiler (text or media; clicking it does too) |
+| `Enter`, `o` | open chat (a channel opens beside the list, focus stays there; `Enter` again goes to the posts); view photo or video; play voice message or music; download a file into `~/Downloads` (files show their name and size and are never downloaded by themselves; a name taken gets ` (1)`); show a spoiler (text or media; clicking it does too) |
 | `i`, `I`, `a`, `A` | insert mode (write message / login field); `I` starts at the beginning of the message, `a`/`A` at its end |
 | `r` | reply to the message under the cursor |
 | `R` | react to the message: `h`/`j`/`k`/`l` + `Enter` or `1`–`9` picks, `/` searches, the same reaction again takes it back; clicking a reaction under a message toggles it too |
@@ -174,7 +174,7 @@ and every media file it downloads is hard-linked into `~/.local/share/vimgram/me
 their photos, voice messages, stickers and videos, marked as deleted. Every text an edited
 message had is kept there too (`gh` shows them). TDLib removes the
 files of deleted messages, so media of incoming messages in private chats and groups is
-downloaded right away (up to `prefetch_mb`). Links of messages still alive after 30 days
+downloaded right away (up to `prefetch_mb`), except files (documents), which wait for `Enter`. Links of messages still alive after 30 days
 are dropped.
 
 New messages raise desktop notifications with the chat photo (and the app icon in its
@@ -204,7 +204,7 @@ Hyprland also brought to the front, and exits; a second start with `--hidden` ju
 | `~/.local/share/vimgram/archive.sqlite`, `media/` | `%APPDATA%\vimgram\data\…` | archive of messages and their media (kept) |
 | `~/.cache/vimgram` | `%LOCALAPPDATA%\vimgram\cache` | pasted images, notification images |
 
-Nothing is saved to `~/Downloads`. The session in `db` is a logged-in Telegram
+Nothing is saved to `~/Downloads` but files you download with `Enter`. The session in `db` is a logged-in Telegram
 account: keep it private.
 
 ## Development

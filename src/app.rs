@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use iced::keyboard::key::{Named, Physical};
@@ -173,6 +173,11 @@ pub enum Message {
     ListPinned,
     Picked(Vec<PathBuf>),
     Exported(Result<(PathBuf, usize), String>),
+    /// A file of a message downloaded and copied to the downloads directory.
+    FileSaved {
+        file: i32,
+        result: Result<PathBuf, String>,
+    },
     WindowEvent(window::Event),
     WindowOpened,
     WindowClosed(window::Id),
@@ -689,6 +694,13 @@ fn merge_albums(msgs: &mut Vec<Msg>) {
     *msgs = merged;
 }
 
+/// A file of a message asked for with Enter (`Media::Document`).
+pub enum Download {
+    /// Being downloaded: how far, if its size is known.
+    Saving(Option<f32>),
+    Saved(PathBuf),
+}
+
 /// A file on its way to or from Telegram, from TDLib's file updates.
 #[derive(Debug, Clone, Copy)]
 struct Transfer {
@@ -854,6 +866,8 @@ pub struct App {
     tray_unread: i32,
     /// Media file id → (chat, message), to archive files once downloaded.
     file_owner: HashMap<i32, (i64, i64)>,
+    /// Files downloaded with Enter (or on their way) → where they were saved.
+    saved_files: HashMap<i32, Option<PathBuf>>,
     /// Files to send with the next message (pasted or picked).
     pub attachments: Vec<PathBuf>,
     /// A folder was picked (by the user or `folder` in the config).
@@ -1022,6 +1036,7 @@ impl App {
             tray: None,
             tray_unread: 0,
             file_owner: HashMap::new(),
+            saved_files: HashMap::new(),
             attachments: Vec::new(),
             folder_chosen: false,
             emoji: None,
@@ -1310,6 +1325,8 @@ impl App {
         Task::batch(
             msg.media
                 .iter()
+                // Files wait for Enter: they can be any size, and most are never opened.
+                .filter(|m| !matches!(m, Media::Document { .. }))
                 .flat_map(Media::files)
                 .filter(|&(_, size)| size <= limit)
                 .map(|(file, _)| Task::perform(tg::prefetch(file), |_| Message::Done(Ok(())))),
@@ -1765,6 +1782,19 @@ impl App {
             Message::ListPinned => self.list_pinned(),
             Message::Picked(paths) => {
                 self.attach(paths);
+                Task::none()
+            }
+            Message::FileSaved { file, result } => {
+                match result {
+                    Ok(path) => {
+                        self.info(format!("Saved to {}", config::tilde(&path)));
+                        self.saved_files.insert(file, Some(path));
+                    }
+                    Err(e) => {
+                        self.saved_files.remove(&file);
+                        self.error(format!("Download: {e}"));
+                    }
+                }
                 Task::none()
             }
             Message::Exported(result) => {
@@ -3477,7 +3507,55 @@ impl App {
                 self.toggle_voice(msg_id, file, kind)
             }
             None if media.viewable() => self.open_viewer(Viewer { msg_id, item }),
-            None => Task::none(),
+            None => match media {
+                Media::Document { file, name, .. } => {
+                    let (file, name) = (*file, name.clone());
+                    self.save_file(file, name)
+                }
+                _ => Task::none(),
+            },
+        }
+    }
+
+    /// Download a file of a message and copy it to the downloads directory.
+    fn save_file(&mut self, file: i32, name: String) -> Task<Message> {
+        match self.saved_files.get(&file) {
+            Some(Some(path)) => {
+                self.info(format!("Already saved to {}", config::tilde(path)));
+                return Task::none();
+            }
+            Some(None) => return Task::none(),
+            None => {}
+        }
+        self.saved_files.insert(file, None);
+        Task::perform(
+            async move {
+                let path = tg::download(file, media::PRIORITY_VIEWER).await?;
+                tokio::task::spawn_blocking(move || {
+                    save_copy(Path::new(&path), &config::download_dir(), &name).map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            },
+            move |result| Message::FileSaved { file, result },
+        )
+    }
+
+    /// How far the download of a file asked for with Enter is.
+    pub fn file_download(&self, file: i32) -> Option<Download> {
+        Some(match self.saved_files.get(&file)? {
+            Some(path) => Download::Saved(path.clone()),
+            None => Download::Saving(
+                self.transfers.get(&file).filter(|t| t.total > 0).map(|t| t.done as f32 / t.total as f32),
+            ),
+        })
+    }
+
+    /// A file not downloaded with Enter yet.
+    pub fn unsaved(&self, media: &Media) -> Option<i32> {
+        match media {
+            Media::Document { file, .. } if !self.saved_files.contains_key(file) => Some(*file),
+            _ => None,
         }
     }
 
@@ -4799,7 +4877,10 @@ impl App {
                             .media
                             .iter()
                             .position(|x| x.audible().is_some() && x.audible() == playing)
-                            .or_else(|| m.media.iter().position(|x| x.viewable() || x.audible().is_some()))?;
+                            .or_else(|| m.media.iter().position(|x| x.viewable() || x.audible().is_some()))
+                            // Files one after another, the next one not saved yet.
+                            .or_else(|| m.media.iter().position(|x| self.unsaved(x).is_some()))
+                            .or_else(|| m.media.iter().position(|x| matches!(x, Media::Document { .. })))?;
                         Some((m.id, item))
                     });
                     match target {
@@ -5692,10 +5773,47 @@ fn parse_when(arg: &str, now: chrono::DateTime<chrono::Local>) -> Option<i32> {
     (at > now).then(|| i32::try_from(at.timestamp()).ok()).flatten()
 }
 
+/// Copy a downloaded file into `dir` under the name it was sent with
+/// (only its last part, should it hold a path), never over another file:
+/// `report (1).pdf` then.
+fn save_copy(src: &Path, dir: &Path, name: &str) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let name = Path::new(name).file_name().map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem.to_owned(), format!(".{ext}")),
+        _ => (name.clone(), String::new()),
+    };
+    let mut dest = dir.join(&name);
+    let mut n = 1;
+    while dest.exists() {
+        dest = dir.join(format!("{stem} ({n}){ext}"));
+        n += 1;
+    }
+    std::fs::copy(src, &dest)?;
+    Ok(dest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::NaiveDate;
+
+    #[test]
+    fn saved_files_never_overwrite() {
+        let dir = std::env::temp_dir().join(format!("vimgram-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = std::env::temp_dir().join(format!("vimgram-save-src-{}", std::process::id()));
+        std::fs::write(&src, b"pdf").unwrap();
+        let first = save_copy(&src, &dir, "report.pdf").unwrap();
+        let second = save_copy(&src, &dir, "report.pdf").unwrap();
+        let sneaky = save_copy(&src, &dir, "../../etc/notes").unwrap();
+        assert_eq!(first, dir.join("report.pdf"));
+        assert_eq!(second, dir.join("report (1).pdf"));
+        assert_eq!(sneaky, dir.join("notes"));
+        assert_eq!(std::fs::read(&second).unwrap(), b"pdf");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&src);
+    }
 
     #[test]
     fn busy_files_sum_progress_and_skip_small_downloads() {

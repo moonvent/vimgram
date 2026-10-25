@@ -1193,6 +1193,13 @@ pub enum Media {
         title: String,
         performer: String,
     },
+    /// Any other file: its name and size shown, downloaded only on Enter.
+    Document {
+        file: i32,
+        /// Bytes, exact or expected; 0 when unknown.
+        size: i64,
+        name: String,
+    },
 }
 
 impl Media {
@@ -1202,7 +1209,7 @@ impl Media {
             Media::Photo { preview, .. } => Some(preview.id),
             Media::Sticker { file, .. } | Media::Animation { file } => Some(file.id),
             Media::Video { thumb, .. } => *thumb,
-            Media::Voice { .. } | Media::Audio { .. } => None,
+            Media::Voice { .. } | Media::Audio { .. } | Media::Document { .. } => None,
         }
     }
 
@@ -1228,7 +1235,7 @@ impl Media {
                 files
             }
             Media::Voice { file, .. } => vec![(*file, 0)],
-            Media::Audio { file, size, .. } => vec![(*file, *size)],
+            Media::Audio { file, size, .. } | Media::Document { file, size, .. } => vec![(*file, *size)],
         }
     }
 
@@ -1245,17 +1252,17 @@ impl Media {
                 video.id = f(video.id);
                 *thumb = thumb.map(&mut f);
             }
-            Media::Voice { file, .. } | Media::Audio { file, .. } => *file = f(*file),
+            Media::Voice { file, .. } | Media::Audio { file, .. } | Media::Document { file, .. } => *file = f(*file),
         }
     }
 
-    /// Natural pixel size, for layout. Voice messages and music have none.
+    /// Natural pixel size, for layout. Voice messages, music and files have none.
     pub fn dims(&self) -> Option<(u32, u32)> {
         let file = match self {
             Media::Photo { preview, .. } => preview,
             Media::Sticker { file, .. } | Media::Animation { file } => file,
             Media::Video { video, .. } => video,
-            Media::Voice { .. } | Media::Audio { .. } => return None,
+            Media::Voice { .. } | Media::Audio { .. } | Media::Document { .. } => return None,
         };
         Some((file.width, file.height))
     }
@@ -1295,7 +1302,27 @@ impl Media {
             Media::Video { round: true, .. } => "📹 Video message".into(),
             Media::Voice { duration, .. } => format!("🎤 Voice message {}", fmt_duration(*duration)),
             Media::Audio { .. } => format!("🎵 {}", self.track_name().unwrap_or_default()),
+            Media::Document { name, .. } => format!("📄 {name}"),
         }
+    }
+}
+
+/// "340 KB", "1.2 MB": bytes for people.
+pub fn fmt_size(bytes: i64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1000 {
+        return format!("{bytes} B");
+    }
+    let mut size = bytes as f64 / 1000.0;
+    let mut unit = 0;
+    while size >= 1000.0 && unit < UNITS.len() - 1 {
+        size /= 1000.0;
+        unit += 1;
+    }
+    if size < 10.0 && unit > 0 {
+        format!("{size:.1} {}", UNITS[unit])
+    } else {
+        format!("{size:.0} {}", UNITS[unit])
     }
 }
 
@@ -1972,6 +1999,14 @@ pub fn media(content: &MessageContent) -> Option<Media> {
                 performer: String::new(),
             })
         }
+        MessageContent::MessageDocument(d) => {
+            let doc = &d.document;
+            Some(Media::Document {
+                file: doc.document.id,
+                size: doc.document.size.max(doc.document.expected_size),
+                name: if doc.file_name.is_empty() { "file".into() } else { doc.file_name.clone() },
+            })
+        }
         _ => None,
     }
 }
@@ -2106,6 +2141,15 @@ fn yes() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sizes_for_people() {
+        assert_eq!(fmt_size(512), "512 B");
+        assert_eq!(fmt_size(340_000), "340 KB");
+        assert_eq!(fmt_size(1_234_567), "1.2 MB");
+        assert_eq!(fmt_size(25_000_000), "25 MB");
+        assert_eq!(fmt_size(2_100_000_000), "2.1 GB");
+    }
 
     #[test]
     fn drafts_from_telegram() {

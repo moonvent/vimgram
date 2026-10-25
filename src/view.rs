@@ -12,13 +12,13 @@ use iced::mouse::Interaction;
 use iced::{Alignment, Color, ContentFit, Element, Font, Length, Size, Theme, font};
 use iced_video_player::VideoPlayer;
 
-use crate::app::{App, Auth, Busy, Chat, Compose, Confirm, Focus, Message, Pane, COMPOSE_ID, SPOILER_LINK, TALL_ID, VideoPlayback, VoicePlayback};
+use crate::app::{App, Auth, Busy, Chat, Compose, Confirm, Download, Focus, Message, Pane, COMPOSE_ID, SPOILER_LINK, TALL_ID, VideoPlayback, VoicePlayback};
 use crate::config;
 use crate::emoji::{self, Picker};
 use crate::fonts::{self, EMOJI};
 use crate::media::Loaded;
 use crate::player::{self, SpeedKind};
-use crate::tg::{ChatKind, Media, Membership, Msg, Presence, Preview, Sender, Style, Version, fmt_count, fmt_duration};
+use crate::tg::{ChatKind, Media, Membership, Msg, Presence, Preview, Sender, Style, Version, fmt_count, fmt_duration, fmt_size};
 use crate::vim::{Input, Mode};
 
 pub const FOLDER_W: f32 = 76.0;
@@ -168,7 +168,8 @@ pub fn media_size(media: &Media, width: f32) -> Size {
         Media::Animation { .. } => GIF_MAX,
         Media::Sticker { .. } => STICKER_MAX,
         Media::Voice { .. } => return Size::new(VOICE.width.min(width - 20.0), VOICE.height),
-        Media::Audio { .. } => return Size::new(AUDIO.width.min(width - 20.0), AUDIO.height),
+        // A file takes a row like a track.
+        Media::Audio { .. } | Media::Document { .. } => return Size::new(AUDIO.width.min(width - 20.0), AUDIO.height),
     };
     let bounds = Size::new(max.width.min(width - 20.0).max(40.0), max.height);
     let (w, h) = media.dims().map_or((1.0, 1.0), |(w, h)| (w as f32, h as f32));
@@ -190,9 +191,9 @@ fn album_layout(count: usize, width: f32) -> (usize, Size) {
     (cols, Size::new(cell, cell))
 }
 
-/// An album of music files: one track under another, not a grid.
+/// An album of music or other files: one under another, not a grid.
 fn tracklist(media: &[Media]) -> bool {
-    media.len() > 1 && media.iter().all(|m| matches!(m, Media::Audio { .. }))
+    media.len() > 1 && media.iter().all(|m| matches!(m, Media::Audio { .. } | Media::Document { .. }))
 }
 
 /// Size of every media item of a message, in order.
@@ -1598,6 +1599,32 @@ fn audio_view<'a>(
         .into()
 }
 
+/// A file: its name and size; how far its download is, or where it was
+/// saved. Nothing is downloaded before Enter (or a click).
+fn document_view<'a>(app: &'a App, file: i32, size: i64, name: &str, width: f32) -> Element<'a, Message> {
+    let size = (size > 0).then(|| fmt_size(size));
+    let state = match app.file_download(file) {
+        Some(Download::Saving(Some(done))) => Some(format!("downloading {:.0}%", done * 100.0)),
+        Some(Download::Saving(None)) => Some("downloading…".to_owned()),
+        Some(Download::Saved(path)) => Some(format!("saved to {}", config::tilde(&path))),
+        None => None,
+    };
+    let status = size.into_iter().chain(state).collect::<Vec<_>>().join(" · ");
+    let icon = if matches!(app.file_download(file), Some(Download::Saved(_))) { "✓" } else { "⬇" };
+    let info = column![
+        text(format!("📄 {name}")).size(14).wrapping(Wrapping::None),
+        text(status).size(12).style(muted_text).wrapping(Wrapping::None),
+    ]
+    .spacing(2)
+    .width(Length::Fill)
+    .clip(true);
+    container(row![text(icon).size(18).style(primary_text), info].spacing(10).align_y(Alignment::Center))
+        .width(width)
+        .height(AUDIO.height)
+        .align_y(Alignment::Center)
+        .into()
+}
+
 fn media_cell<'a>(
     app: &'a App,
     msg_id: i64,
@@ -1631,6 +1658,7 @@ fn media_cell<'a>(
             voice_view(app, msg_id, item, *duration, waveform, *listened)
         }
         Media::Audio { file, duration, .. } => audio_view(app, (msg_id, item), *file, media, *duration, size.width),
+        Media::Document { file, size: bytes, name } => document_view(app, *file, *bytes, name, size.width),
         Media::Video { .. } => video_cell(app, media, size, radius),
         _ => match media.inline_file().and_then(|file| app.media.get(file)) {
             Some(Loaded::Image(handle)) => image(handle.clone())
@@ -1755,6 +1783,7 @@ fn message_keys<'a>(app: &App, m: &Msg) -> text::Rich<'a, (), Message> {
     match m.media.first() {
         Some(Media::Voice { .. } | Media::Audio { .. } | Media::Video { round: true, .. }) => keys.push(("Enter", "play")),
         Some(media) if media.viewable() => keys.push(("Enter", "open")),
+        Some(Media::Document { .. }) if m.media.iter().any(|x| app.unsaved(x).is_some()) => keys.push(("Enter", "download")),
         _ => {}
     }
     if !m.deleted {
