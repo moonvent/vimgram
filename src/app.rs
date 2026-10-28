@@ -66,7 +66,7 @@ pub const SPOILER_LINK: &str = "spoiler:";
 pub const PINNED_TAG: &str = "📌";
 
 const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes  J/K gt/gT Alt-N folders  \
-                    Enter open/play  gu/gk unread private chat/channel  i/I/a/A insert  Esc then vim keys in the text  q record  r reply  R react  cc/e edit  f forward  v mark  V visual  dd delete  \
+                    Enter open/play  gu/gk unread private chat/channel  u mark unread/read  i/I/a/A insert  Esc then vim keys in the text  q record  r reply  R react  cc/e edit  f forward  v mark  V visual  dd delete  \
                     yy/Y copy  gy copy part  gh edit history  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  { } volume  H/L seek  m mute  U leave/join  gc comments  \
                     / search chats, Telegram or messages  :posts public posts  n/N next/prev match or pinned  ga attach  gp pinned  gP all pinned  gf original/reply  gx link  ^o/^i back/forward between chats  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
@@ -426,6 +426,8 @@ pub struct Chat {
     pub kind: ChatKind,
     pub last: Option<Msg>,
     pub unread: i32,
+    /// Marked unread by hand (`u`, or on another device) until opened.
+    pub marked: bool,
     /// Outgoing messages up to this id were read by the other side.
     pub read_outbox: i64,
     /// Incoming messages up to this id you have read.
@@ -451,6 +453,11 @@ impl Chat {
         } else {
             self.positions.insert(key, position.order);
         }
+    }
+
+    /// Unread messages, or marked unread.
+    pub fn is_unread(&self) -> bool {
+        self.unread > 0 || self.marked
     }
 
     /// In one of your chat lists (not just found on the server).
@@ -1220,6 +1227,35 @@ impl App {
         Task::perform(tg::set_muted(id, settings, !muted), Message::Done)
     }
 
+    /// `u`: mark the chat unread; one that is unread (or marked) is read.
+    fn toggle_unread(&mut self) -> Task<Message> {
+        let Some(chat) = self.chat_in_focus() else {
+            self.error("Select a chat first");
+            return Task::none();
+        };
+        let (id, title) = (chat.id, chat.title.clone());
+        let task = if chat.marked {
+            Task::perform(tg::set_marked_unread(id, false), Message::Done)
+        } else if let Some(last) = chat.last.as_ref().filter(|_| chat.unread > 0) {
+            // Viewing the newest message reads everything before it.
+            Task::perform(tg::view_messages(id, vec![last.id]), Message::Done)
+        } else {
+            self.info(format!("Marked {title} unread"));
+            return Task::perform(tg::set_marked_unread(id, true), Message::Done);
+        };
+        self.info(format!("Marked {title} read"));
+        task
+    }
+
+    /// A marked unread chat opened (not just previewed) loses the mark.
+    fn unmark(&self, chat_id: i64) -> Task<Message> {
+        if self.chats.get(&chat_id).is_some_and(|c| c.marked) {
+            Task::perform(tg::set_marked_unread(chat_id, false), Message::Done)
+        } else {
+            Task::none()
+        }
+    }
+
     fn leave_or_join(&mut self) -> Task<Message> {
         let Some(chat) = self.chat_in_focus() else {
             self.error("Select a chat first");
@@ -1482,7 +1518,8 @@ impl App {
         match self.open.as_mut() {
             Some(open) if open.preview && self.focus == Focus::Messages => {
                 open.preview = false;
-                self.view_visible()
+                let id = open.id;
+                Task::batch([self.view_visible(), self.unmark(id)])
             }
             _ => Task::none(),
         }
@@ -1506,7 +1543,7 @@ impl App {
         let unread = self
             .chats
             .values()
-            .filter(|c| c.unread > 0 && c.order(ListKey::Main).is_some() && !self.muted(c))
+            .filter(|c| c.is_unread() && c.order(ListKey::Main).is_some() && !self.muted(c))
             .count() as i32;
         if unread == self.tray_unread {
             return Task::none();
@@ -1564,7 +1601,7 @@ impl App {
         let found = self
             .chats
             .values()
-            .filter(|c| c.unread > 0 && matches!(c.kind, ChatKind::Channel) == channel)
+            .filter(|c| c.is_unread() && matches!(c.kind, ChatKind::Channel) == channel)
             .filter(|c| channel || matches!(c.kind, ChatKind::Private(_)))
             .filter_map(|c| Some((c.order(ListKey::Main)?, c.id, c.read_inbox)))
             .max();
@@ -2061,11 +2098,8 @@ impl App {
                 if !still_here || self.forward.is_some() || self.auth != Auth::Ready || self.open.as_ref().is_some_and(|o| o.id == id) {
                     return Task::none();
                 }
-                let task = self.open_chat(id);
+                let task = self.open_chat_as(id, None, true);
                 self.focus = Focus::Chats;
-                if let Some(open) = self.open.as_mut() {
-                    open.preview = true;
-                }
                 task
             }
             Message::Tick(now) => {
@@ -2123,6 +2157,7 @@ impl App {
                     kind: ChatKind::of(&c.r#type),
                     last,
                     unread: c.unread_count,
+                    marked: c.is_marked_as_unread,
                     read_outbox: c.last_read_outbox_message_id,
                     read_inbox: c.last_read_inbox_message_id,
                     mute: Mute::of(&c.notification_settings),
@@ -2207,6 +2242,12 @@ impl App {
             Update::MessageIsPinned(u) => {
                 if self.open.as_ref().is_some_and(|o| o.id == u.chat_id) {
                     return Self::load_pinned(u.chat_id);
+                }
+            }
+            Update::ChatIsMarkedAsUnread(u) => {
+                if let Some(chat) = self.chats.get_mut(&u.chat_id) {
+                    chat.marked = u.is_marked_as_unread;
+                    self.list_dirty = true;
                 }
             }
             Update::ChatReadInbox(u) => {
@@ -2601,7 +2642,7 @@ impl App {
         self.list_dirty = false;
 
         self.folder_unread.clear();
-        for chat in self.chats.values().filter(|c| c.unread > 0) {
+        for chat in self.chats.values().filter(|c| c.is_unread()) {
             for key in chat.positions.keys() {
                 *self.folder_unread.entry(*key).or_default() += 1;
             }
@@ -3160,6 +3201,12 @@ impl App {
     /// Open a chat at its latest messages, or around message `at`, the
     /// cursor on it or (`true`) on the one after it.
     fn open_chat_near(&mut self, id: i64, at: Option<(i64, bool)>) -> Task<Message> {
+        self.open_chat_as(id, at, false)
+    }
+
+    /// `open_chat_near`, or (`preview`) just glanced at under the cursor:
+    /// left unread.
+    fn open_chat_as(&mut self, id: i64, at: Option<(i64, bool)>, preview: bool) -> Task<Message> {
         self.focus = Focus::Messages;
         let mut tasks = Vec::new();
         if let Some(prev) = self.open.take() {
@@ -3181,6 +3228,10 @@ impl App {
         }
         let mut open = OpenChat::new(id);
         open.list = self.current_list();
+        open.preview = preview;
+        if !preview {
+            tasks.push(self.unmark(id));
+        }
         tasks.push(self.switch_chat(open));
         tasks.push(Task::perform(tg::message_count(id), move |result| Message::Count {
             chat_id: id,
@@ -5039,6 +5090,7 @@ impl App {
             }
             Action::Mute => self.toggle_mute(),
             Action::Leave => self.leave_or_join(),
+            Action::ToggleUnread => self.toggle_unread(),
             Action::Louder => {
                 self.set_volume(player::louder(self.volume));
                 Task::none()

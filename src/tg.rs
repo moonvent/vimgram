@@ -426,6 +426,11 @@ pub async fn set_muted(chat_id: i64, mut settings: types::ChatNotificationSettin
     functions::set_chat_notification_settings(chat_id, settings, client()).await.map_err(err)
 }
 
+/// Mark a chat unread by hand (like Telegram's "Mark as unread"), or clear that.
+pub async fn set_marked_unread(chat_id: i64, marked: bool) -> Res<()> {
+    functions::toggle_chat_is_marked_as_unread(chat_id, marked, client()).await.map_err(err)
+}
+
 pub async fn leave(chat_id: i64) -> Res<()> {
     functions::leave_chat(chat_id, client()).await.map_err(err)
 }

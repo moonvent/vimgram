@@ -144,6 +144,8 @@ pub enum Action {
     Mute,
     /// Leave a channel or group (asks first), or join one you are not in.
     Leave,
+    /// Mark the chat unread, or read if it is (`u`).
+    ToggleUnread,
     SeekBack,
     SeekForward,
     Reply,
@@ -272,6 +274,7 @@ impl Pending {
             (None, NKey::Char('{')) => Some(Action::Quieter),
             (None, NKey::Char('m')) => Some(Action::Mute),
             (None, NKey::Char('U')) => Some(Action::Leave),
+            (None, NKey::Char('u')) => Some(Action::ToggleUnread),
             (None, NKey::Char('H')) => Some(Action::SeekBack),
             (None, NKey::Char('L')) => Some(Action::SeekForward),
             (None, NKey::Char('r')) => Some(Action::Reply),
@@ -1160,7 +1163,7 @@ mod tests {
         assert_eq!(p.feed(NKey::Ctrl('i')), Some(Action::JumpForward));
         assert_eq!(feed("][="), vec![Action::Faster, Action::Slower, Action::NormalSpeed]);
         assert_eq!(feed("}{"), vec![Action::Louder, Action::Quieter]);
-        assert_eq!(feed("mU"), vec![Action::Mute, Action::Leave]);
+        assert_eq!(feed("mUu"), vec![Action::Mute, Action::Leave, Action::ToggleUnread]);
         assert_eq!(feed("iIaA"), vec![Action::Insert, Action::InsertStart, Action::Append, Action::Append]);
     }
 

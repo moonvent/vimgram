@@ -680,7 +680,11 @@ fn fmt_secs(secs: f64) -> String {
 fn badge<'a>(count: impl ToString) -> Element<'a, Message> {
     // Digits have no descenders and sit high in a normal line box: a tight
     // line and a pixel more room on top center them visually.
-    container(text(count.to_string()).size(11).line_height(1.0))
+    let count = count.to_string();
+    // Empty (a chat marked unread): a round dot.
+    let width = if count.is_empty() { Length::Fixed(18.0) } else { Length::Shrink };
+    container(text(count).size(11).line_height(1.0))
+        .width(width)
         .height(18)
         .padding(iced::Padding { top: 1.0, right: 7.0, bottom: 0.0, left: 7.0 })
         .align_y(Alignment::Center)
@@ -893,7 +897,13 @@ fn chat_row<'a>(app: &'a App, chat: &'a Chat, selected: bool, focused: bool) -> 
     }
     let title_line = title_line.push(text(time).size(12).style(muted_text));
     let preview = emoji_text(&preview).style(muted_text);
-    list_row(avatar(app, chat), title_line, preview, chat.unread, selected, focused, Message::ClickChat(chat.id))
+    // Marked unread by hand: an empty badge, like Telegram.
+    let badge = match chat.unread {
+        0 if chat.marked => Some(badge("")),
+        0 => None,
+        n => Some(badge(fmt_count(n))),
+    };
+    list_row(avatar(app, chat), title_line, preview, badge, selected, focused, Message::ClickChat(chat.id))
 }
 
 /// A message found by the chat filter: its chat, when, and the message
@@ -913,7 +923,7 @@ fn hit_row<'a>(app: &'a App, m: &'a Msg, i: usize, selected: bool, focused: bool
     let sender = chat.is_some_and(|c| c.kind == ChatKind::Group).then(|| app.sender_name(m.sender));
     let preview = emoji_text(&preview_of(m, sender));
     let avatar = avatar_image(app, chat.and_then(|c| c.avatar), m.chat_id, title, AVATAR);
-    list_row(avatar, title_line, preview, 0, selected, focused, Message::ClickHit(i))
+    list_row(avatar, title_line, preview, None, selected, focused, Message::ClickHit(i))
 }
 
 /// A row of the chat list: avatar, title line, two preview lines.
@@ -922,7 +932,7 @@ fn list_row<'a>(
     avatar: Element<'a, Message>,
     title_line: Row<'a, Message>,
     preview: text::Rich<'a, (), Message>,
-    unread: i32,
+    badge: Option<Element<'a, Message>>,
     selected: bool,
     focused: bool,
     on_press: Message,
@@ -934,8 +944,8 @@ fn list_row<'a>(
             .clip(true)
     ]
     .spacing(8);
-    if unread > 0 {
-        preview_line = preview_line.push(badge(fmt_count(unread)));
+    if let Some(badge) = badge {
+        preview_line = preview_line.push(badge);
     }
 
     mouse_area(
