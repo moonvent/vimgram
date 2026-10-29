@@ -128,7 +128,7 @@ Normal mode works in any keyboard layout (`о` = `j`, `Shift+п` = `G`, `х` = `
 | `:posts [query]` | also find posts of public channels for the chat filter (or `query`), below the other results; Telegram allows a few free searches a day, none paid |
 | `:search word`, `:folder name`, `:theme name`, `:speed 1.5`, `:42` | commands |
 | `:autostart [on\|off]` | start with the session, in the tray (off by default) |
-| `gb`, `:bionic [on\|off]` | bionic reading: the first letters of every word in messages bold, for the eye to skim on; remembered |
+| `gb`, `:bionic [on\|off]` | bionic reading: the first letters of every word in messages bold and the rest a bit faded, for the eye to skim on; remembered |
 | `:cleancache [days]` | delete cached media unused for that many days (default 7; also done weekly) |
 | `:help` | key summary |
 

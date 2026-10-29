@@ -36,6 +36,8 @@ const SELECTION_ALPHA: f32 = 0.3;
 /// Between keys in a hint.
 const KEY_GAP: &str = "   ";
 const READ_CURSOR_ALPHA: f32 = 0.55;
+/// Bionic reading: the rest of a word after its bold head.
+const BIONIC_TAIL_ALPHA: f32 = 0.7;
 const LINE_H: f32 = TEXT * 1.35;
 const MSG_PAD_X: f32 = 16.0;
 const MSG_SPACING: f32 = 2.0;
@@ -468,10 +470,11 @@ fn emoji_spans<'a, L>(s: &str) -> impl Iterator<Item = text::Span<'a, L>> {
         .map(|(run, emoji)| span(run.to_owned()).font_maybe(emoji.then_some(EMOJI)))
 }
 
-/// Bionic reading (`:bionic`): the first letters of each word, about two
-/// fifths of it, as byte ranges of `text` to show bold.
-fn word_heads(text: &str) -> Vec<(usize, usize)> {
-    let mut heads = Vec::new();
+/// Bionic reading (`:bionic`): the words of `text` as byte offsets of their
+/// start, the end of their head (the first letters, about two fifths of the
+/// word, shown bold; the rest faded) and their end.
+fn bionic_words(text: &str) -> Vec<(usize, usize, usize)> {
+    let mut words = Vec::new();
     let mut chars = text.char_indices().peekable();
     while let Some((start, c)) = chars.next() {
         if !c.is_alphanumeric() {
@@ -488,9 +491,10 @@ fn word_heads(text: &str) -> Vec<(usize, usize)> {
             n => (n * 2 + 2) / 5,
         };
         let (last, c) = word[word.len() - 1];
-        heads.push((start, word.get(bold).map_or(last + c.len_utf8(), |&(i, _)| i)));
+        let end = last + c.len_utf8();
+        words.push((start, word.get(bold).map_or(end, |&(i, _)| i), end));
     }
-    heads
+    words
 }
 
 /// A message's text with its formatting: links underlined in the theme's
@@ -505,13 +509,13 @@ fn message_text<'a>(app: &App, m: &Msg) -> Element<'a, Message> {
         (at, at + m.text[at..].chars().next().map_or(0, char::len_utf8))
     });
     let selection = reading.and_then(|(_, input)| app.text_pending.selection(input)).map(|(start, end, _)| (start, end));
-    let heads = if app.bionic { word_heads(&m.text) } else { Vec::new() };
+    let words = if app.bionic { bionic_words(&m.text) } else { Vec::new() };
     // Every place a link or a style starts or ends cuts the text into parts
     // shown alike.
     let mut cuts = vec![0, m.text.len()];
     cuts.extend(m.links.iter().flat_map(|l| [l.start, l.end]));
     cuts.extend(m.styles.iter().flat_map(|s| [s.start, s.end]));
-    cuts.extend(heads.iter().flat_map(|&(start, end)| [start, end]));
+    cuts.extend(words.iter().flat_map(|&(start, head, end)| [start, head, end]));
     cuts.extend(cursor.into_iter().chain(selection).flat_map(|(start, end)| [start, end]));
     cuts.retain(|&c| m.text.is_char_boundary(c));
     cuts.sort_unstable();
@@ -536,10 +540,15 @@ fn message_text<'a>(app: &App, m: &Msg) -> Element<'a, Message> {
             );
             continue;
         }
-        // Sorted and apart: the head that could hold this part is the first
-        // one ending after its start.
-        let head = heads.get(heads.partition_point(|&(_, e)| e <= start)).is_some_and(|&(s, _)| s <= start);
-        let bold = has(Style::Bold) || (head && !has(Style::Code));
+        // Sorted and apart: the word that could hold this part is the first
+        // one ending after its start. Code and links stay as they are, and
+        // deleted messages wholly faded.
+        let word = words
+            .get(words.partition_point(|&(_, _, e)| e <= start))
+            .filter(|&&(s, _, _)| s <= start && !has(Style::Code));
+        let head = word.is_some_and(|&(_, h, _)| start < h);
+        let tail = (word.is_some() && !head && link.is_none() && !m.deleted).then(|| palette.text.scale_alpha(BIONIC_TAIL_ALPHA));
+        let bold = has(Style::Bold) || head;
         let font = Font {
             weight: if bold { font::Weight::Bold } else { font::Weight::Normal },
             style: if has(Style::Italic) { font::Style::Italic } else { font::Style::Normal },
@@ -561,7 +570,8 @@ fn message_text<'a>(app: &App, m: &Msg) -> Element<'a, Message> {
             piece = piece
                 .underline(link.is_some() || has(Style::Underline))
                 .strikethrough(has(Style::Strike))
-                .background_maybe(code);
+                .background_maybe(code)
+                .color_maybe(tail);
             if let Some(link) = link {
                 piece = piece.link(link.url.clone()).color(palette.primary);
             }
@@ -2741,13 +2751,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn word_heads_bold_about_two_fifths() {
-        fn heads(text: &str) -> Vec<&str> {
-            word_heads(text).into_iter().map(|(s, e)| &text[s..e]).collect()
+    fn bionic_heads_about_two_fifths() {
+        fn split(text: &str) -> Vec<(&str, &str)> {
+            bionic_words(text).into_iter().map(|(s, h, e)| (&text[s..h], &text[h..e])).collect()
         }
-        assert_eq!(heads("a to the word reading"), ["a", "t", "t", "wo", "rea"]);
-        assert_eq!(heads("Привет, мир! 2026"), ["Пр", "м", "20"]);
-        assert_eq!(heads("—  ...  🙂"), Vec::<&str>::new());
+        assert_eq!(split("a to word reading"), [("a", ""), ("t", "o"), ("wo", "rd"), ("rea", "ding")]);
+        assert_eq!(split("Привет, мир! 2026"), [("Пр", "ивет"), ("м", "ир"), ("20", "26")]);
+        assert_eq!(split("—  ...  🙂"), []);
     }
 
     #[test]
