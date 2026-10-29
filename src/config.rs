@@ -91,6 +91,25 @@ pub fn dirs() -> ProjectDirs {
     ProjectDirs::from("", "", "vimgram").expect("could not determine home directory")
 }
 
+/// Bionic reading (`:bionic`) as last switched; off when never.
+pub fn load_bionic() -> bool {
+    bionic_path().exists()
+}
+
+pub fn save_bionic(on: bool) {
+    let path = bionic_path();
+    let _ = if on {
+        path.parent().map(std::fs::create_dir_all);
+        std::fs::write(path, "")
+    } else {
+        std::fs::remove_file(path)
+    };
+}
+
+fn bionic_path() -> std::path::PathBuf {
+    dirs().data_dir().join("bionic")
+}
+
 /// Where files downloaded from messages go: ~/Downloads.
 pub fn download_dir() -> std::path::PathBuf {
     let dirs = directories::UserDirs::new();

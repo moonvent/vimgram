@@ -468,6 +468,31 @@ fn emoji_spans<'a, L>(s: &str) -> impl Iterator<Item = text::Span<'a, L>> {
         .map(|(run, emoji)| span(run.to_owned()).font_maybe(emoji.then_some(EMOJI)))
 }
 
+/// Bionic reading (`:bionic`): the first letters of each word, about two
+/// fifths of it, as byte ranges of `text` to show bold.
+fn word_heads(text: &str) -> Vec<(usize, usize)> {
+    let mut heads = Vec::new();
+    let mut chars = text.char_indices().peekable();
+    while let Some((start, c)) = chars.next() {
+        if !c.is_alphanumeric() {
+            continue;
+        }
+        let mut word = vec![(start, c)];
+        while let Some(&(i, c)) = chars.peek().filter(|(_, c)| c.is_alphanumeric()) {
+            word.push((i, c));
+            chars.next();
+        }
+        let bold = match word.len() {
+            1..=3 => 1,
+            4 => 2,
+            n => (n * 2 + 2) / 5,
+        };
+        let (last, c) = word[word.len() - 1];
+        heads.push((start, word.get(bold).map_or(last + c.len_utf8(), |&(i, _)| i)));
+    }
+    heads
+}
+
 /// A message's text with its formatting: links underlined in the theme's
 /// color (clicking one opens it), bold, italic, code, and spoilers as solid
 /// blocks until shown. In Read mode, the cursor and the Visual selection.
@@ -480,11 +505,13 @@ fn message_text<'a>(app: &App, m: &Msg) -> Element<'a, Message> {
         (at, at + m.text[at..].chars().next().map_or(0, char::len_utf8))
     });
     let selection = reading.and_then(|(_, input)| app.text_pending.selection(input)).map(|(start, end, _)| (start, end));
+    let heads = if app.bionic { word_heads(&m.text) } else { Vec::new() };
     // Every place a link or a style starts or ends cuts the text into parts
     // shown alike.
     let mut cuts = vec![0, m.text.len()];
     cuts.extend(m.links.iter().flat_map(|l| [l.start, l.end]));
     cuts.extend(m.styles.iter().flat_map(|s| [s.start, s.end]));
+    cuts.extend(heads.iter().flat_map(|&(start, end)| [start, end]));
     cuts.extend(cursor.into_iter().chain(selection).flat_map(|(start, end)| [start, end]));
     cuts.retain(|&c| m.text.is_char_boundary(c));
     cuts.sort_unstable();
@@ -509,8 +536,12 @@ fn message_text<'a>(app: &App, m: &Msg) -> Element<'a, Message> {
             );
             continue;
         }
+        // Sorted and apart: the head that could hold this part is the first
+        // one ending after its start.
+        let head = heads.get(heads.partition_point(|&(_, e)| e <= start)).is_some_and(|&(s, _)| s <= start);
+        let bold = has(Style::Bold) || (head && !has(Style::Code));
         let font = Font {
-            weight: if has(Style::Bold) { font::Weight::Bold } else { font::Weight::Normal },
+            weight: if bold { font::Weight::Bold } else { font::Weight::Normal },
             style: if has(Style::Italic) { font::Style::Italic } else { font::Style::Normal },
             ..if has(Style::Code) { Font::MONOSPACE } else { Font::DEFAULT }
         };
@@ -2708,6 +2739,16 @@ fn status_line(app: &App) -> Element<'_, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_heads_bold_about_two_fifths() {
+        fn heads(text: &str) -> Vec<&str> {
+            word_heads(text).into_iter().map(|(s, e)| &text[s..e]).collect()
+        }
+        assert_eq!(heads("a to the word reading"), ["a", "t", "t", "wo", "rea"]);
+        assert_eq!(heads("Привет, мир! 2026"), ["Пр", "м", "20"]);
+        assert_eq!(heads("—  ...  🙂"), Vec::<&str>::new());
+    }
 
     #[test]
     fn preview_description_fits_three_lines() {

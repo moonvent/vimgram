@@ -167,6 +167,8 @@ pub enum Action {
     ReadText,
     /// Show or hide the texts the message had before its edits (`gh`).
     Versions,
+    /// Bionic reading on / off (`gb`).
+    Bionic,
     /// Messages: start / end a Visual selection (`V`).
     Visual,
     /// Mark / unmark the message, or the Visual range, to act on several
@@ -227,6 +229,7 @@ impl Pending {
             (Some('g'), NKey::Char('c')) => Some(Action::Comments),
             (Some('g'), NKey::Char('y')) => Some(Action::ReadText),
             (Some('g'), NKey::Char('h')) => Some(Action::Versions),
+            (Some('g'), NKey::Char('b')) => Some(Action::Bionic),
             (Some('g'), NKey::Char('x')) => Some(Action::OpenLink(explicit.unwrap_or(1))),
             (Some('g'), NKey::Char('e')) => Some(Action::Emoji),
             (Some('g'), NKey::Char('v')) => Some(Action::JumpPlaying),

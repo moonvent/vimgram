@@ -70,7 +70,7 @@ const HELP: &str = "j/k move  gg/G top/bottom  ^d/^u half page  h/l ^h/^l panes 
                     yy/Y copy  gy copy part  gh edit history  p/P paste  ge emoji  gv back to playing voice  Space play/pause  [ ] speed  = 1x  { } volume  H/L seek  m mute  U leave/join  gc comments  \
                     / search chats, Telegram or messages  :posts public posts  n/N next/prev match or pinned  ga attach  gp pinned  gP all pinned  gf original/reply  gx link  ^o/^i back/forward between chats  \
                     Alt-Enter silent  :later 21:00  :silent  :attach  :export  :date 01.05.2024  \
-                    :folder  :theme  :font 20  :autostart  :cleancache  :q";
+                    gb/:bionic bold word starts  :folder  :theme  :font 20  :autostart  :cleancache  :q";
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -860,6 +860,8 @@ pub struct App {
     pub text_pending: TextPending,
     /// Read mode: the message whose text has the cursor, and that text.
     pub reading: Option<(i64, Input)>,
+    /// Bionic reading: the start of each word in messages bold (`:bionic`, `gb`).
+    pub bionic: bool,
     pub status: Option<Status>,
     pub theme: Theme,
     /// Of the whole window, from the font size (`:font`).
@@ -1035,6 +1037,7 @@ impl App {
             pending: Pending::default(),
             text_pending: TextPending::default(),
             reading: None,
+            bionic: config::load_bionic(),
             status: None,
             theme: theme.clone().unwrap_or(Theme::TokyoNight),
             scale,
@@ -3926,6 +3929,12 @@ impl App {
 
     /// One volume for videos and voice messages, kept across restarts;
     /// changing it turns the sound back on.
+    fn set_bionic(&mut self, on: bool) {
+        self.bionic = on;
+        config::save_bionic(on);
+        self.info(if on { "Bionic reading on" } else { "Bionic reading off" });
+    }
+
     fn set_volume(&mut self, volume: f64) {
         self.volume = volume;
         self.silent = false;
@@ -4703,6 +4712,10 @@ impl App {
                 return Task::none();
             }
             ("autostart", arg) => return self.autostart(arg),
+            ("bionic", None) => self.set_bionic(!self.bionic),
+            ("bionic", Some("on" | "1" | "true" | "yes")) => self.set_bionic(true),
+            ("bionic", Some("off" | "0" | "false" | "no")) => self.set_bionic(false),
+            ("bionic", Some(other)) => self.error(format!("Usage: :bionic [on|off], not {other}")),
             ("cleancache", days) => {
                 let days = match days.map(str::parse::<i32>) {
                     None => CACHE_DAYS,
@@ -5025,6 +5038,10 @@ impl App {
                 Task::none()
             }
             Action::Versions => self.toggle_versions(),
+            Action::Bionic => {
+                self.set_bionic(!self.bionic);
+                Task::none()
+            }
             Action::JumpBack => match self.jumps.pop() {
                 Some(to) => {
                     if let Some(here) = self.here() {
