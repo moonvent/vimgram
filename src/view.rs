@@ -12,9 +12,10 @@ use iced::mouse::Interaction;
 use iced::{Alignment, Color, ContentFit, Element, Font, Length, Size, Theme, font};
 use iced_video_player::VideoPlayer;
 
-use crate::app::{App, Auth, Busy, Chat, Compose, Confirm, Download, Focus, Message, Pane, COMPOSE_ID, SPOILER_LINK, TALL_ID, VideoPlayback, VoicePlayback};
+use crate::app::{App, Auth, Busy, Chat, Compose, Confirm, Download, Focus, Message, Pane, COMPOSE_ID, OpenChat, SPOILER_LINK, VideoPlayback, VoicePlayback};
 use crate::config;
 use crate::emoji::{self, Picker};
+use crate::feed::Feed;
 use crate::fonts::{self, EMOJI};
 use crate::media::Loaded;
 use crate::player::{self, SpeedKind};
@@ -70,9 +71,6 @@ const PINNED_TEXT_H: f32 = 13.0 * 1.3 * 2.0;
 const PINNED_H: f32 = 11.0 * 1.3 + PINNED_TEXT_H + 13.0;
 /// Bar of a voice message playing in another chat.
 const PLAYER_H: f32 = 44.0;
-/// Space above the visible messages worth filling with the end of the
-/// previous (too tall) message.
-const MIN_PARTIAL: f32 = 40.0;
 const ALBUM_GAP: f32 = 4.0;
 /// Emoji panel: grid cell, the tab bar and search line above the grid,
 /// the name line below it.
@@ -408,30 +406,6 @@ fn list_item<'a>(app: &'a App, msgs: &'a [Msg], i: usize, selected: bool, width:
     } else {
         message
     }
-}
-
-/// First message that still fits entirely when `bottom` is the last one shown.
-pub fn top_for_bottom(msgs: &[Msg], bottom: usize, width: f32, height: f32) -> usize {
-    let mut used = 0.0;
-    for i in (0..=bottom).rev() {
-        used += item_height(msgs, i, width);
-        if used > height {
-            return (i + 1).min(bottom);
-        }
-    }
-    0
-}
-
-/// Last message that still fits entirely when `top` is the first one shown.
-pub fn bottom_for_top(msgs: &[Msg], top: usize, width: f32, height: f32) -> usize {
-    let mut used = 0.0;
-    for i in top..msgs.len() {
-        used += item_height(msgs, i, width);
-        if used > height {
-            return i.saturating_sub(1).max(top);
-        }
-    }
-    msgs.len().saturating_sub(1)
 }
 
 pub fn view(app: &App, _window: iced::window::Id) -> Element<'_, Message> {
@@ -1194,57 +1168,8 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
     let selected = (app.focus == Focus::Messages).then_some(open.cursor);
     let messages: Element<_> = if open.msgs.is_empty() {
         center(text(if open.loading { "Loading…" } else { "No messages" }).size(14)).into()
-    } else if app.is_tall() {
-        // Taller than the screen: the message gets its own scrollable,
-        // moved by j/k (and the wheel) before the cursor moves on.
-        let (width, _) = app.viewport();
-        let i = open.cursor;
-        let item = message_view(app, &open.msgs[i], selected == Some(i), width, starts_run(&open.msgs, i));
-        let tall = scrollable(container(item).padding([0.0, MSG_PAD_X]))
-            .id(TALL_ID)
-            .on_scroll(Message::TallScroll)
-            .direction(Direction::Vertical(Scrollbar::new().width(4).scroller_width(4)))
-            .height(Length::Fill);
-        container(tall)
-            .padding(iced::Padding { bottom: LIST_BOTTOM, ..Default::default() })
-            .into()
     } else {
-        let (width, height) = app.viewport();
-        let top = top_for_bottom(&open.msgs, open.bottom, width, height);
-        let used: f32 = (top..=open.bottom).map(|i| item_height(&open.msgs, i, width)).sum();
-        let leftover = height - used;
-        let items = (top..=open.bottom).map(|i| list_item(app, &open.msgs, i, selected == Some(i), width));
-        // The spacer pushes messages to the bottom; heights are estimated
-        // pessimistically, so the rendered range always fits.
-        let mut children: Vec<Element<_>> = vec![space::vertical().height(Length::Fill).into()];
-        // A message too tall to fit above the visible ones still shows its
-        // end instead of leaving the space empty.
-        if top > 0 && leftover >= MIN_PARTIAL {
-            let i = top - 1;
-            let partial = list_item(app, &open.msgs, i, false, width);
-            children.push(
-                scrollable(partial)
-                    .direction(Direction::Vertical(Scrollbar::hidden()))
-                    .anchor_bottom()
-                    .height(leftover - MSG_SPACING)
-                    .into(),
-            );
-        }
-        children.extend(items);
-        container(
-            Column::with_children(children)
-                .spacing(MSG_SPACING)
-                .padding(iced::Padding {
-                    top: 0.0,
-                    right: MSG_PAD_X,
-                    bottom: LIST_BOTTOM,
-                    left: MSG_PAD_X,
-                })
-                .height(Length::Fill),
-        )
-        .height(Length::Fill)
-        .clip(true)
-        .into()
+        message_list(app, open, selected)
     };
 
     let mut pane = column![];
@@ -1259,7 +1184,7 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
         .on_scroll(|delta| Message::Scroll(Pane::Messages, delta))
         .into();
     // Scrolled up (or in old history): a way back down besides `G`.
-    let scrolled_up = !open.at_latest || open.bottom + 1 < open.msgs.len();
+    let scrolled_up = !open.at_latest || open.bottom + 1 < open.msgs.len() || open.shift >= 1.0;
     let messages: Element<_> = if scrolled_up {
         stack![messages, to_latest_button()].into()
     } else {
@@ -1276,6 +1201,28 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
         .push(compose(app))
         .width(Length::Fill)
         .height(Length::Fill)
+        .into()
+}
+
+/// The messages on screen and a few beyond, placed to the pixel where the
+/// list is scrolled to (or gliding through on the way there).
+fn message_list<'a>(app: &'a App, open: &'a OpenChat, selected: Option<usize>) -> Element<'a, Message> {
+    let (width, height) = app.viewport();
+    let stack = open.stack(width, height);
+    let y = stack.clamp(open.scrolled(&stack) - app.glide);
+    let (bottom, shift) = stack.anchor(y);
+    // Heights not laid out yet are estimates, too large as a rule: lay out
+    // more above than they say fits, to be measured.
+    let mut first = stack.visible(y).start.saturating_sub(3);
+    while first > 0 && stack.top(first) > y - height * 1.5 {
+        first -= 1;
+    }
+    let items = (first..=bottom)
+        .map(|i| (open.msgs[i].id, open.known_height(i, width), list_item(app, &open.msgs, i, selected == Some(i), width)))
+        .collect();
+    Feed::new(items, bottom - first, shift, Message::Measured)
+        .spacing(MSG_SPACING)
+        .padding(iced::Padding { top: 0.0, right: MSG_PAD_X, bottom: LIST_BOTTOM, left: MSG_PAD_X })
         .into()
 }
 

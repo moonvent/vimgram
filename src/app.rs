@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use iced::keyboard::key::{Named, Physical};
 use iced::keyboard::{self, Key, Modifiers};
 use iced::mouse::ScrollDelta;
-use iced::widget::scrollable::{AbsoluteOffset, RelativeOffset, Viewport};
+use iced::widget::scrollable::RelativeOffset;
 use iced::{Size, Subscription, Task, Theme, window};
 use tdlib_rs::enums::{AuthorizationState, Update};
 use tdlib_rs::types::{ChatNotificationSettings, ChatPhotoInfo, ChatPosition};
@@ -13,6 +13,7 @@ use tdlib_rs::types::{ChatNotificationSettings, ChatPhotoInfo, ChatPosition};
 use crate::archive::{Archive, Record};
 use crate::config::{self, Config};
 use crate::clipboard::{self, Clip};
+use crate::feed::{self, Stack};
 use crate::emoji::{self, Picker, React};
 use crate::{autostart, export, icon, instance, notify, nvim, tray};
 use crate::media::{self, Kind, Loaded, Shared, Store};
@@ -50,15 +51,20 @@ const SCROLL_PIXELS: f32 = 40.0;
 const DRAFT_DELAY: Duration = Duration::from_secs(1);
 /// Messages kept visible above and below the cursor, like Vim's `scrolloff`.
 const SCROLLOFF: usize = 2;
-/// Pixels `j`/`k` scroll inside a message taller than the screen.
+/// Pixels `j`/`k` scroll inside a message taller than the screen, at least.
 const TALL_STEP: f32 = 90.0;
+/// Pixels a notch of the mouse wheel scrolls the message list.
+const WHEEL_PIXELS: f32 = 60.0;
+/// The message list glides to where it was scrolled, this fast (seconds
+/// for the distance left to shrink by e), unless it is moved further than
+/// this many screens.
+const GLIDE_TIME: f32 = 0.06;
+const GLIDE_SCREENS: f32 = 2.0;
 /// Older messages arriving (e.g. after being offline) don't notify.
 const NOTIFY_MAX_AGE: i64 = 120;
 /// Cached media unused this long is deleted, checked once this often.
 const CACHE_DAYS: i32 = 7;
 
-/// Scrollable showing a message taller than the screen.
-pub const TALL_ID: &str = "tall-message";
 pub const COMPOSE_ID: &str = "compose";
 /// Link of a spoiler in a message's text: this prefix and the message id.
 pub const SPOILER_LINK: &str = "spoiler:";
@@ -189,7 +195,10 @@ pub enum Message {
     NotificationClicked(i64),
     Autostart(Result<String, String>),
     CacheCleaned(Result<i64, String>),
-    TallScroll(Viewport),
+    /// Heights of messages as laid out, by id.
+    Measured(feed::Measured),
+    /// A frame while the message list glides.
+    Glide(Instant),
     Paste(Option<String>),
     Clip(Result<Clip, String>),
     /// The message after one that finished playing, for autoplay.
@@ -481,8 +490,14 @@ pub struct OpenChat {
     /// Sorted by id, oldest first; album parts are merged.
     pub msgs: Vec<Msg>,
     pub cursor: usize,
-    /// Last message shown at the bottom of the viewport.
+    /// Last message shown at the bottom of the viewport...
     pub bottom: usize,
+    /// ...with this many pixels of it below the viewport.
+    pub shift: f32,
+    /// Heights of messages as laid out (with what separates them from the
+    /// one above), by id, at the list width `heights_width`.
+    heights: HashMap<i64, f32>,
+    heights_width: f32,
     pub loading: bool,
     /// No older history left.
     pub exhausted: bool,
@@ -538,6 +553,9 @@ impl OpenChat {
             msgs: Vec::new(),
             cursor: 0,
             bottom: 0,
+            shift: 0.0,
+            heights: HashMap::new(),
+            heights_width: 0.0,
             loading: false,
             exhausted: false,
             at_latest: true,
@@ -569,7 +587,40 @@ impl OpenChat {
         self.exhausted = true;
         self.total = Some(self.pins.len() as i32);
         self.cursor = at.and_then(|id| self.position(id)).unwrap_or(self.msgs.len().saturating_sub(1));
-        self.bottom = self.msgs.len().saturating_sub(1);
+        self.show_at_bottom(self.msgs.len().saturating_sub(1));
+    }
+
+    /// Message `i` just in full view at the bottom of the list.
+    pub fn show_at_bottom(&mut self, i: usize) {
+        self.bottom = i;
+        self.shift = 0.0;
+    }
+
+    /// Height of message `i` in the list: as laid out, else estimated.
+    pub fn item_height(&self, i: usize, width: f32) -> f32 {
+        self.known_height(i, width).unwrap_or_else(|| view::item_height(&self.msgs, i, width))
+    }
+
+    pub fn known_height(&self, i: usize, width: f32) -> Option<f32> {
+        if self.heights_width != width {
+            return None;
+        }
+        self.heights.get(&self.msgs.get(i)?.id).copied()
+    }
+
+    /// The messages placed to the pixel, under a screen `height` tall.
+    pub fn stack(&self, width: f32, height: f32) -> Stack {
+        Stack::new((0..self.msgs.len()).map(|i| self.item_height(i, width)), height)
+    }
+
+    /// Where the bottom of the screen is in `stack`.
+    pub fn scrolled(&self, stack: &Stack) -> f32 {
+        stack.position(self.bottom, self.shift)
+    }
+
+    /// Scroll so the bottom of the screen is at `y`.
+    fn scroll_to(&mut self, stack: &Stack, y: f32) {
+        (self.bottom, self.shift) = stack.anchor(y);
     }
 
     pub fn thread_root(&self) -> i64 {
@@ -581,7 +632,7 @@ impl OpenChat {
         self.tag = tag;
         self.msgs.clear();
         self.cursor = 0;
-        self.bottom = 0;
+        self.show_at_bottom(0);
         self.loading = false;
         self.exhausted = false;
         self.at_latest = true;
@@ -778,10 +829,10 @@ pub struct App {
     focused: bool,
     search_history: History,
     command_history: History,
-    /// Scroll position inside a message taller than the screen.
-    pub tall_offset: f32,
-    /// How far that message can scroll, once the scrollable reported it.
-    tall_max: Option<f32>,
+    /// Pixels the message list is drawn off from where it is scrolled to,
+    /// shrinking to nothing as it glides there, and the last frame of that.
+    pub glide: f32,
+    glide_frame: Option<Instant>,
     pub folders: Vec<Folder>,
     pub folder: usize,
     /// Number of chats with unread messages, per folder.
@@ -985,8 +1036,8 @@ impl App {
             focused: true,
             search_history: load_history('/'),
             command_history: load_history(':'),
-            tall_offset: 0.0,
-            tall_max: None,
+            glide: 0.0,
+            glide_frame: None,
             folders: tg::folders(tdlib_rs::types::UpdateChatFolders::default()),
             folder: 0,
             folder_unread: HashMap::new(),
@@ -1139,6 +1190,11 @@ impl App {
                 Subscription::none()
             },
             tick,
+            if self.glide != 0.0 {
+                window::frames().map(Message::Glide)
+            } else {
+                Subscription::none()
+            },
         ])
     }
 
@@ -1181,13 +1237,20 @@ impl App {
         }
     }
 
-    /// The message under the cursor is taller than the message pane.
-    pub fn is_tall(&self) -> bool {
+    /// The open chat's messages placed to the pixel, and where the bottom of
+    /// the screen is over them.
+    pub fn feed(&self) -> Option<(Stack, f32)> {
+        let open = self.open.as_ref().filter(|o| !o.msgs.is_empty())?;
         let (width, height) = self.viewport();
-        self.open
-            .as_ref()
-            .and_then(OpenChat::current)
-            .is_some_and(|m| view::message_height(m, width) > height)
+        let stack = open.stack(width, height);
+        let y = open.scrolled(&stack);
+        Some((stack, y))
+    }
+
+    /// Messages of the open chat at least partly on screen.
+    fn on_screen(&self) -> Option<std::ops::Range<usize>> {
+        let (stack, y) = self.feed()?;
+        Some(stack.visible(y))
     }
 
     pub fn membership(&self, chat: &Chat) -> Option<Membership> {
@@ -2010,9 +2073,18 @@ impl App {
                     }
                 }
             },
-            Message::TallScroll(viewport) => {
-                self.tall_offset = viewport.absolute_offset().y;
-                self.tall_max = Some((viewport.content_bounds().height - viewport.bounds().height).max(0.0));
+            Message::Measured(heights) => {
+                self.on_measured(heights);
+                Task::none()
+            }
+            Message::Glide(now) => {
+                let dt = self.glide_frame.map_or(0.0, |last| now.saturating_duration_since(last).as_secs_f32());
+                self.glide_frame = Some(now);
+                self.glide *= (-dt / GLIDE_TIME).exp();
+                if self.glide.abs() < 0.5 {
+                    self.stop_glide();
+                    self.keep_cursor_whole();
+                }
                 Task::none()
             }
             Message::Paste(text) => self.on_paste(text),
@@ -2321,7 +2393,7 @@ impl App {
                     });
                     if follow {
                         open.cursor = open.msgs.len() - 1;
-                        open.bottom = open.cursor;
+                        open.show_at_bottom(open.cursor);
                     }
                 }
             }
@@ -2504,18 +2576,19 @@ impl App {
             *total += 1;
         }
         let cursor_at_end = open.msgs.is_empty() || open.at_end();
-        let bottom_shown = open.bottom + 1 >= open.msgs.len();
+        let bottom_shown = open.bottom + 1 >= open.msgs.len() && open.shift < 1.0;
         open.edit(|msgs| msgs.push(msg));
         let last = open.msgs.len() - 1;
         if cursor_at_end || sent_here {
             open.cursor = last;
-            open.bottom = last;
-            self.reset_tall();
+            open.show_at_bottom(last);
+            self.stop_glide();
         } else if bottom_shown {
             // The newest message was on screen: keep it there, and the cursor
             // with it if it would scroll away.
-            open.bottom = last;
-            open.cursor = open.cursor.max(view::top_for_bottom(&open.msgs, last, width, height));
+            open.show_at_bottom(last);
+            let stack = open.stack(width, height);
+            open.cursor = stack.follow(open.scrolled(&stack), open.cursor);
         }
         if incoming { self.view_messages(chat_id, vec![id]) } else { Task::none() }
     }
@@ -2558,10 +2631,10 @@ impl App {
         let Some(open) = self.open.as_ref().filter(|o| !o.msgs.is_empty()) else {
             return Task::none();
         };
-        let (width, height) = self.viewport();
-        let bottom = open.bottom.min(open.msgs.len() - 1);
-        let top = view::top_for_bottom(&open.msgs, bottom, width, height);
-        let ids: Vec<i64> = open.msgs[top..=bottom]
+        let Some(shown) = self.on_screen() else {
+            return Task::none();
+        };
+        let ids: Vec<i64> = open.msgs[shown]
             .iter()
             .filter(|m| !m.outgoing && !m.deleted)
             .flat_map(|m| m.members.iter().copied())
@@ -2623,7 +2696,7 @@ impl App {
         open.edit(|msgs| msgs.extend(batch));
         if first_load {
             open.cursor = open.msgs.len() - 1;
-            open.bottom = open.cursor;
+            open.show_at_bottom(open.cursor);
         }
         let want_more = open.msgs.len() < MIN_HISTORY || open.cursor < PREFETCH;
         self.scroll_messages();
@@ -2952,7 +3025,7 @@ impl App {
         self.focus = Focus::Messages;
         self.end_selection();
         self.found = None;
-        self.reset_tall();
+        self.stop_glide();
         self.info(format!("Only messages with {tag} (Esc shows all)"));
         let count = Task::perform(tg::search(chat_id, tag.clone()), move |result| Message::Count {
             chat_id,
@@ -2982,10 +3055,10 @@ impl App {
         self.focus = Focus::Messages;
         self.end_selection();
         self.found = None;
-        self.reset_tall();
+        self.stop_glide();
         self.scroll_messages();
         self.info("Pinned messages: Enter or Esc goes to the one under the cursor in the chat");
-        self.scroll_tall()
+        Task::none()
     }
 
     /// Back to all messages; returns the task counting them.
@@ -2995,7 +3068,7 @@ impl App {
         };
         let chat_id = open.id;
         open.retag(None);
-        self.reset_tall();
+        self.stop_glide();
         Task::perform(tg::message_count(chat_id), move |result| Message::Count {
             chat_id,
             tag: None,
@@ -3061,14 +3134,10 @@ impl App {
         let found = if after { open.first_after(target) } else { open.position(target) };
         // Nothing after the last one read: the newest there is.
         open.cursor = found.unwrap_or(if after { open.msgs.len().saturating_sub(1) } else { 0 });
-        open.bottom = open.cursor;
-        self.reset_tall();
+        open.show_at_bottom(open.cursor);
+        self.stop_glide();
         self.scroll_messages();
-        Task::batch([
-            self.view_messages(chat_id, ids),
-            self.load_archived(chat_id, lo, hi),
-            self.scroll_tall(),
-        ])
+        Task::batch([self.view_messages(chat_id, ids), self.load_archived(chat_id, lo, hi)])
     }
 
     fn show_match(&mut self) {
@@ -3154,15 +3223,15 @@ impl App {
             .collect();
 
         if let Some(open) = &self.open
-            && !open.msgs.is_empty()
+            && let Some(shown) = self.on_screen()
         {
-            let (width, height) = self.viewport();
-            let top = view::top_for_bottom(&open.msgs, open.bottom, width, height);
+            let (width, _) = self.viewport();
             if let Some(file) = self.chats.get(&open.id).and_then(|c| c.avatar) {
                 wanted.push((file, Kind::Image, Size::ZERO, media::PRIORITY_AVATAR));
             }
-            let first = top.saturating_sub(1);
-            for msg in &open.msgs[first..=open.bottom] {
+            // And the ones next to the screen, about to scroll onto it.
+            let around = shown.start.saturating_sub(1)..(shown.end + 1).min(open.msgs.len());
+            for msg in &open.msgs[around] {
                 if let Some(file) = self.sender_avatar(msg.sender) {
                     wanted.push((file, Kind::Image, Size::ZERO, media::PRIORITY_AVATAR));
                 }
@@ -3242,7 +3311,7 @@ impl App {
             result,
         }));
         tasks.push(Self::load_pinned(id));
-        self.reset_tall();
+        self.stop_glide();
         tasks.push(match at {
             Some((msg, after)) => self.jump_to(msg, after),
             None => self.load_history(false),
@@ -3305,7 +3374,7 @@ impl App {
         });
         self.focus = Focus::Messages;
         tasks.push(self.switch_chat(open));
-        self.reset_tall();
+        self.stop_glide();
         tasks.push(self.load_history(false));
         self.info("Comments: i writes one, r replies, Esc back to the post");
         Task::batch(tasks)
@@ -5430,6 +5499,9 @@ impl App {
     }
 
     fn on_scroll(&mut self, pane: Pane, delta: ScrollDelta) -> Task<Message> {
+        if pane == Pane::Messages {
+            return if self.open.is_some() { self.scroll_feed(delta) } else { Task::none() };
+        }
         let lines = match delta {
             ScrollDelta::Lines { y, .. } => y,
             ScrollDelta::Pixels { y, .. } => {
@@ -5449,10 +5521,6 @@ impl App {
             Pane::Chats => {
                 self.focus = Focus::Chats;
                 self.step(steps * 3)
-            }
-            Pane::Messages if self.open.is_some() => {
-                self.focus = Focus::Messages;
-                self.step(steps)
             }
             Pane::Messages => Task::none(),
             Pane::Emoji => {
@@ -5486,54 +5554,130 @@ impl App {
 
     fn step(&mut self, delta: isize) -> Task<Message> {
         // j/k scroll through a message taller than the screen first.
-        if self.focus == Focus::Messages && delta.abs() == 1 && self.is_tall() {
-            let max = self.tall_limit();
-            if delta > 0 && self.tall_offset < max - 1.0 {
-                self.tall_offset = (self.tall_offset + TALL_STEP).min(max);
-                return self.scroll_tall();
-            }
-            if delta < 0 && self.tall_offset > 1.0 {
-                self.tall_offset = (self.tall_offset - TALL_STEP).max(0.0);
-                return self.scroll_tall();
-            }
+        if self.focus == Focus::Messages && delta.abs() == 1 && self.scroll_within(delta > 0) {
+            return self.near_edges();
         }
         let target = self.current().saturating_add_signed(delta);
-        let task = self.jump(target);
-        // Coming from below, a tall message starts at its end.
-        if self.focus == Focus::Messages && delta < 0 && self.is_tall() {
-            self.tall_offset = self.tall_limit();
-            return Task::batch([task, self.scroll_tall()]);
+        self.jump(target)
+    }
+
+    /// Scroll on through the message under the cursor where it is taller
+    /// than the screen and goes on that way; false at its end.
+    fn scroll_within(&mut self, down: bool) -> bool {
+        let Some((stack, y)) = self.feed() else {
+            return false;
+        };
+        let Some(open) = self.open.as_mut() else {
+            return false;
+        };
+        let cursor = open.cursor;
+        if !stack.tall(cursor) {
+            return false;
         }
-        task
+        let step = (stack.view / 3.0).max(TALL_STEP);
+        let to = if down {
+            (y + step).min(stack.end(cursor))
+        } else {
+            (y - step).max(stack.top(cursor) + stack.view)
+        };
+        if (to - y).abs() < 1.0 {
+            return false;
+        }
+        open.scroll_to(&stack, to);
+        self.glide_by(to - y, stack.view);
+        true
     }
 
-    /// How far the tall message under the cursor can scroll.
-    fn tall_limit(&self) -> f32 {
-        let (width, height) = self.viewport();
-        self.tall_max.unwrap_or_else(|| {
-            self.open
-                .as_ref()
-                .and_then(OpenChat::current)
-                .map_or(0.0, |m| (view::message_height(m, width) - height).max(0.0))
-        })
+    /// Draw the message list `distance` pixels back from where it now is,
+    /// to glide there.
+    fn glide_by(&mut self, distance: f32, view: f32) {
+        self.glide += distance;
+        if self.glide.abs() > view * GLIDE_SCREENS {
+            self.stop_glide();
+        } else if self.glide_frame.is_none() {
+            self.glide_frame = Some(Instant::now());
+        }
     }
 
-    fn reset_tall(&mut self) {
-        self.tall_offset = 0.0;
-        self.tall_max = None;
+    fn stop_glide(&mut self) {
+        self.glide = 0.0;
+        self.glide_frame = None;
     }
 
-    fn scroll_tall(&self) -> Task<Message> {
-        if !self.is_tall() {
+    /// Heights the message list was laid out with; the cursor stays in full
+    /// view should they be other than estimated.
+    fn on_measured(&mut self, heights: feed::Measured) {
+        let (width, _) = self.viewport();
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        if open.heights_width != width {
+            open.heights.clear();
+            open.heights_width = width;
+        }
+        open.heights.extend(heights);
+        if self.glide == 0.0 {
+            self.keep_cursor_whole();
+        }
+    }
+
+    /// A message under the cursor that fits on screen but is partly off it
+    /// (its height was misjudged) comes in full view.
+    fn keep_cursor_whole(&mut self) {
+        let Some((stack, y)) = self.feed() else {
+            return;
+        };
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        let cursor = open.cursor;
+        if !stack.tall(cursor) && !stack.fully_visible(cursor, y) && stack.visible(y).contains(&cursor) {
+            let to = stack.reveal(y, cursor, 0, false);
+            open.scroll_to(&stack, to);
+        }
+    }
+
+    /// Load more history when the cursor or the screen nears what is loaded.
+    fn near_edges(&mut self) -> Task<Message> {
+        let Some(open) = self.open.as_ref().filter(|o| !o.msgs.is_empty()) else {
             return Task::none();
+        };
+        let len = open.msgs.len();
+        let shown = self.on_screen().unwrap_or(open.cursor..open.cursor + 1);
+        if open.cursor.min(shown.start) < PREFETCH {
+            return self.load_history(true);
         }
-        iced::widget::operation::scroll_to(
-            TALL_ID,
-            AbsoluteOffset {
-                x: 0.0,
-                y: self.tall_offset,
-            },
-        )
+        if open.cursor.max(shown.end) + PREFETCH >= len {
+            return self.load_newer();
+        }
+        Task::none()
+    }
+
+    /// The wheel or touchpad over the message list: it scrolls by pixels,
+    /// the cursor following to stay on screen.
+    fn scroll_feed(&mut self, delta: ScrollDelta) -> Task<Message> {
+        // Wheel up (positive) moves towards the top of the list.
+        let (pixels, notched) = match delta {
+            ScrollDelta::Lines { y, .. } => (y * WHEEL_PIXELS, true),
+            ScrollDelta::Pixels { y, .. } => (y, false),
+        };
+        self.focus = Focus::Messages;
+        let Some((stack, y)) = self.feed() else {
+            return Task::none();
+        };
+        let Some(open) = self.open.as_mut() else {
+            return Task::none();
+        };
+        // From where it is gliding to, so quick notches add up.
+        let to = stack.clamp(y - pixels);
+        open.scroll_to(&stack, to);
+        open.cursor = stack.follow(to, open.cursor);
+        if notched {
+            self.glide_by(to - y, stack.view);
+        } else {
+            self.stop_glide();
+        }
+        self.near_edges()
     }
 
     /// Move the cursor of the focused pane to `index` (clamped).
@@ -5548,21 +5692,12 @@ impl App {
                 }
                 let before = open.cursor;
                 open.cursor = index.min(open.msgs.len() - 1);
-                let moved = open.cursor != before;
-                let near_top = open.cursor < PREFETCH;
-                let near_bottom = open.cursor + PREFETCH >= open.msgs.len();
-                if moved {
-                    self.reset_tall();
-                }
-                self.scroll_messages();
-                let scroll = if moved { self.scroll_tall() } else { Task::none() };
-                if near_top {
-                    return Task::batch([scroll, self.load_history(true)]);
-                }
-                if near_bottom {
-                    return Task::batch([scroll, self.load_newer()]);
-                }
-                return scroll;
+                let (cursor, up) = (open.cursor, open.cursor < before);
+                let next = cursor.abs_diff(before) == 1;
+                let moved = self.reveal_cursor(up, next);
+                let (_, view) = self.viewport();
+                self.glide_by(moved, view);
+                self.near_edges()
             }
             _ => {
                 if self.rows() == 0 {
@@ -5602,40 +5737,30 @@ impl App {
         self.chat_top = self.chat_top.min(self.rows().saturating_sub(rows));
     }
 
+    /// Scroll as little as needed to show the message under the cursor, with
+    /// a few around it.
     fn scroll_messages(&mut self) {
-        let tall = self.is_tall();
-        let (width, height) = self.viewport();
-        let Some(open) = self.open.as_mut() else {
-            return;
+        self.reveal_cursor(false, false);
+    }
+
+    /// `up`: the cursor came from below, `next`: from the message right next
+    /// to it, so of a message taller than the screen the end that side shows.
+    fn reveal_cursor(&mut self, up: bool, next: bool) -> f32 {
+        let Some((stack, y)) = self.feed() else {
+            return 0.0;
         };
-        if open.msgs.is_empty() {
-            return;
-        }
+        let Some(open) = self.open.as_mut() else {
+            return 0.0;
+        };
         let last = open.msgs.len() - 1;
         open.cursor = open.cursor.min(last);
-        open.bottom = open.bottom.min(last);
-        let (cursor, msgs) = (open.cursor, &open.msgs);
-        let top_of = |bottom: usize| view::top_for_bottom(msgs, bottom, width, height);
-        let bottom_of = |top: usize| view::bottom_for_top(msgs, top, width, height);
-        if tall {
-            open.bottom = cursor;
-            return;
-        }
-        let mut bottom = open.bottom;
-        // Keep a few messages below the cursor in view...
-        bottom = bottom.max((cursor + SCROLLOFF).min(last));
-        while bottom > cursor && cursor < top_of(bottom) {
-            bottom -= 1;
-        }
-        // ...and a few above it.
-        let want_top = cursor.saturating_sub(SCROLLOFF);
-        if want_top < top_of(bottom) {
-            bottom = bottom_of(want_top).max(cursor);
-            while bottom > cursor && cursor < top_of(bottom) {
-                bottom -= 1;
-            }
-        }
-        open.bottom = bottom;
+        let to = if stack.tall(open.cursor) {
+            stack.reveal(y, open.cursor, 0, up && next)
+        } else {
+            stack.reveal(y, open.cursor, SCROLLOFF, up)
+        };
+        open.scroll_to(&stack, to);
+        to - y
     }
 }
 

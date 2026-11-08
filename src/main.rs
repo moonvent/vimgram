@@ -8,6 +8,7 @@ mod clipboard;
 mod config;
 mod emoji;
 mod export;
+mod feed;
 mod fonts;
 mod icon;
 mod instance;
