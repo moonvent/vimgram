@@ -652,7 +652,7 @@ impl OpenChat {
     /// or older ones are: otherwise what comes after it is not known yet.
     fn first_after(&self, id: i64) -> Option<usize> {
         let newest = |m: &Msg| m.members.iter().copied().fold(m.id, i64::max);
-        if self.msgs.first().is_none_or(|m| m.id > id) {
+        if id != 0 && self.msgs.first().is_none_or(|m| m.id > id) {
             return None;
         }
         self.msgs.iter().position(|m| newest(m) > id)
@@ -1691,8 +1691,7 @@ impl App {
         self.hit = None;
         self.selected = Some(chat_id);
         self.scroll_chats();
-        // Never read: from the latest messages.
-        let open = self.open_chat_near(chat_id, (read != 0).then_some((read, true)));
+        let open = self.open_chat_near(chat_id, Some((read, true)));
         Task::batch([load, open])
     }
 
@@ -3007,7 +3006,10 @@ impl App {
         let chat_id = open.id;
         open.loading = true;
         let half = HISTORY_PAGE / 2;
-        let window = Task::perform(tg::history(chat_id, id, -half, HISTORY_PAGE), move |result| {
+        // Zero means nothing has been read: request from the start of history,
+        // since TDLib interprets a zero history anchor as the latest messages.
+        let from = if after && id == 0 { 1 } else { id };
+        let window = Task::perform(tg::history(chat_id, from, -half, HISTORY_PAGE), move |result| {
             Message::Window { chat_id, target: id, after, result }
         });
         Task::batch([count, window])
@@ -3137,7 +3139,7 @@ impl App {
         open.show_at_bottom(open.cursor);
         self.stop_glide();
         self.scroll_messages();
-        Task::batch([self.view_messages(chat_id, ids), self.load_archived(chat_id, lo, hi)])
+        Task::batch([self.view_visible(), self.load_archived(chat_id, lo, hi)])
     }
 
     fn show_match(&mut self) {
@@ -3265,7 +3267,7 @@ impl App {
         self.open_chat_at(id, None)
     }
 
-    /// Open a chat at its latest messages, or around message `at`.
+    /// Open at the first unread message (otherwise the latest), or at `at`.
     fn open_chat_at(&mut self, id: i64, at: Option<i64>) -> Task<Message> {
         self.open_chat_near(id, at.map(|msg| (msg, false)))
     }
@@ -3280,6 +3282,9 @@ impl App {
     /// left unread.
     fn open_chat_as(&mut self, id: i64, at: Option<(i64, bool)>, preview: bool) -> Task<Message> {
         self.focus = Focus::Messages;
+        let at = at.or_else(|| {
+            self.chats.get(&id).filter(|chat| chat.unread > 0).map(|chat| (chat.read_inbox, true))
+        });
         let mut tasks = Vec::new();
         if let Some(prev) = self.open.take() {
             if prev.id == id && prev.thread.is_none() {
@@ -6080,6 +6085,7 @@ mod tests {
     fn first_message_after_the_last_read() {
         let mut open = OpenChat::new(1);
         open.msgs = vec![msg(10, 0), msg(12, 0), Msg { members: vec![13, 14], ..msg(13, 5) }, msg(20, 0)];
+        assert_eq!(open.first_after(0), Some(0));
         assert_eq!(open.first_after(10), Some(1));
         assert_eq!(open.first_after(11), Some(1));
         assert_eq!(open.first_after(13), Some(2));
@@ -6087,6 +6093,8 @@ mod tests {
         assert_eq!(open.first_after(20), None);
         // Older than what is loaded: what follows it may not be loaded.
         assert_eq!(open.first_after(5), None);
+        open.msgs.clear();
+        assert_eq!(open.first_after(0), None);
     }
 
     #[test]
