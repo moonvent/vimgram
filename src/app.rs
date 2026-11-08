@@ -4416,6 +4416,10 @@ impl App {
         }
         match self.text_pending.feed(key, &mut self.input) {
             TextAction::None => Task::none(),
+            TextAction::Emoji => {
+                self.open_emoji();
+                Task::none()
+            }
             TextAction::Insert => {
                 self.mode = Mode::Insert;
                 Task::none()

@@ -413,6 +413,8 @@ const UNDO_MAX: usize = 100;
 pub enum TextAction {
     None,
     Insert,
+    /// Open the emoji picker (`ge`) while composing.
+    Emoji,
     /// Back to the message list (`Esc`).
     Leave,
     Submit,
@@ -526,6 +528,9 @@ impl TextPending {
             };
             input.settle();
             return TextAction::None;
+        }
+        if g && key == NKey::Char('e') && !self.read_only && self.visual.is_none() {
+            return TextAction::Emoji;
         }
         if g || count.is_some() && matches!(key, NKey::Esc) {
             return TextAction::None;
@@ -1221,6 +1226,14 @@ mod tests {
         assert_eq!(text("abcd\nx|y", "gg").0, "|abcd\nxy");
         assert_eq!(text("a|bcd\nxy", "G").0, "abcd\n|xy");
         assert_eq!(text("привет мир|", "b").0, "привет |мир");
+    }
+
+    #[test]
+    fn text_mode_emoji() {
+        assert_eq!(text("hello worl|d", "ge"), ("hello worl|d".into(), vec![TextAction::Emoji]));
+        assert!(read("hello worl|d", "ge").1.is_empty());
+        assert!(text("hello worl|d", "dge").1.is_empty());
+        assert!(text("hello worl|d", "vge").1.is_empty());
     }
 
     #[test]
