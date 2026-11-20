@@ -185,7 +185,7 @@ pub async fn decode(job: Job) -> Result<Shared<Loaded>, String> {
             Kind::Image => Loaded::Image(Handle::from_path(&job.path)),
             Kind::Tgs => Loaded::Frames(decode_tgs(&job.path, job.size)?),
             Kind::Webm => Loaded::Frames(decode_webm(&job.path, job.size)?),
-            Kind::Video => Loaded::Video(open_video(&job.path)?),
+            Kind::Video => Loaded::Video(crate::player::looping_video(&job.path)?),
         };
         Ok(Shared::new(loaded))
     })
@@ -401,14 +401,6 @@ fn decode_webm_ffmpeg(path: &str, w: u32, h: u32) -> Result<(Vec<Handle>, f64), 
         return Err(format!("ffmpeg: no frames decoded from {path}"));
     }
     Ok((frames, fps))
-}
-
-fn open_video(path: &str) -> Result<Video, String> {
-    let uri = url::Url::from_file_path(path).map_err(|()| format!("bad path: {path}"))?;
-    let mut video = Video::new(&uri).map_err(|e| e.to_string())?;
-    video.set_muted(true);
-    video.set_looping(true);
-    Ok(video)
 }
 
 #[cfg(test)]

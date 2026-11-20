@@ -231,8 +231,9 @@ pub fn open_stream(source: Arc<dyn stream::Source>, size: u64, speed: f64, volum
     build(stream::URI, Some((source, size)), speed, volume)
 }
 
-/// Same pipeline as `Video::new`, plus a pitch-preserving audio filter.
-fn build(uri: &str, source: Option<(Arc<dyn stream::Source>, u64)>, speed: f64, volume: f64) -> Result<Movie, String> {
+/// `Video::new`'s pipeline for `uri`, and its appsink with the frame
+/// fixes below.
+fn video_pipeline(uri: &str) -> Result<(gst::Pipeline, gstreamer_app::AppSink), String> {
     gst::init().map_err(|e| e.to_string())?;
     let description = format!(
         "playbin uri=\"{uri}\" video-sink=\"videoscale ! videoconvert ! appsink name=iced_video \
@@ -242,11 +243,6 @@ fn build(uri: &str, source: Option<(Arc<dyn stream::Source>, u64)>, speed: f64, 
         .map_err(|e| e.to_string())?
         .downcast::<gst::Pipeline>()
         .map_err(|_| "video: not a pipeline".to_string())?;
-    pipeline.set_property("audio-filter", scaletempo()?);
-    // Before it starts playing, so it never starts loud.
-    pipeline.set_property("volume", volume);
-    let stream = source.map(|(source, size)| stream::attach(pipeline.upcast_ref(), source, size));
-
     let sink_bin: gst::Element = pipeline.property("video-sink");
     let video_sink = sink_bin
         .downcast::<gst::Bin>()
@@ -254,10 +250,10 @@ fn build(uri: &str, source: Option<(Arc<dyn stream::Source>, u64)>, speed: f64, 
         .and_then(|bin| bin.by_name("iced_video"))
         .and_then(|sink| sink.downcast::<gstreamer_app::AppSink>().ok())
         .ok_or_else(|| "video: no appsink".to_string())?;
-    // Variable frame rate videos (phones, screen recordings) say 0/1, which
-    // iced_video_player refuses; it only keeps the number, frames follow
-    // their timestamps anyway.
     if let Some(pad) = video_sink.static_pad("sink") {
+        // Variable frame rate videos (phones, screen recordings) say 0/1,
+        // which iced_video_player refuses; it only keeps the number, frames
+        // follow their timestamps anyway.
         pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, |_, info| {
             if let Some(gst::PadProbeData::Event(event)) = &mut info.data
                 && let gst::EventView::Caps(c) = event.view()
@@ -267,7 +263,48 @@ fn build(uri: &str, source: Option<(Arc<dyn stream::Source>, u64)>, speed: f64, 
             }
             gst::PadProbeReturn::Ok
         });
+        // GStreamer pads NV12 rows to 4 bytes; without a VideoMeta saying so
+        // iced_video_player takes rows as long as the width, and a video
+        // 1170 px wide comes out sheared, each row 2 px further along.
+        pad.add_probe(gst::PadProbeType::BUFFER, |pad, info| {
+            if let Some(gst::PadProbeData::Buffer(buffer)) = &mut info.data
+                && buffer.meta::<gstreamer_video::VideoMeta>().is_none()
+                && let Some(caps) = pad.current_caps()
+                && let Ok(video) = gstreamer_video::VideoInfo::from_caps(&caps)
+                && video.stride()[0] as u32 != video.width()
+            {
+                let _ = gstreamer_video::VideoMeta::add_full(
+                    buffer.make_mut(),
+                    gstreamer_video::VideoFrameFlags::empty(),
+                    video.format(),
+                    video.width(),
+                    video.height(),
+                    video.offset(),
+                    video.stride(),
+                );
+            }
+            gst::PadProbeReturn::Ok
+        });
     }
+    Ok((pipeline, video_sink))
+}
+
+/// A video without sound that plays over and over (in the message list).
+pub fn looping_video(path: &str) -> Result<Video, String> {
+    let (pipeline, sink) = video_pipeline(uri(path)?.as_str())?;
+    let mut video = Video::from_gst_pipeline(pipeline, sink, None).map_err(|e| e.to_string())?;
+    video.set_muted(true);
+    video.set_looping(true);
+    Ok(video)
+}
+
+/// The video pipeline plus a pitch-preserving audio filter.
+fn build(uri: &str, source: Option<(Arc<dyn stream::Source>, u64)>, speed: f64, volume: f64) -> Result<Movie, String> {
+    let (pipeline, video_sink) = video_pipeline(uri)?;
+    pipeline.set_property("audio-filter", scaletempo()?);
+    // Before it starts playing, so it never starts loud.
+    pipeline.set_property("volume", volume);
+    let stream = source.map(|(source, size)| stream::attach(pipeline.upcast_ref(), source, size));
 
     let video = Video::from_gst_pipeline(pipeline, video_sink, None).map_err(|e| e.to_string())?;
     let mut movie = Movie {
@@ -569,6 +606,38 @@ mod tests {
         let thumb = video_thumbnail(&sample, big).expect("thumbnail");
         assert_eq!((thumb.width, thumb.height), (320, 180));
         let _ = std::fs::remove_file(&thumb.path);
+    }
+
+    /// A video 330 px wide has NV12 rows of 332 bytes: the frames must say
+    /// so, or the player shears the picture.
+    #[test]
+    fn padded_rows_are_described() {
+        gst::init().unwrap();
+        let path = std::env::temp_dir().join(format!("vimgram-test-330-{}.mp4", std::process::id()));
+        let encode = gst::parse::launch(&format!(
+            "videotestsrc num-buffers=5 ! video/x-raw,width=330,height=240,framerate=30/1 ! \
+             x264enc ! h264parse ! mp4mux ! filesink location={}",
+            path.display()
+        ));
+        let Ok(encode) = encode else {
+            eprintln!("skipped: cannot encode a sample video");
+            return;
+        };
+        encode.set_state(gst::State::Playing).unwrap();
+        let done = encode
+            .bus()
+            .unwrap()
+            .timed_pop_filtered(gst::ClockTime::from_seconds(30), &[gst::MessageType::Eos, gst::MessageType::Error]);
+        let _ = encode.set_state(gst::State::Null);
+        assert_eq!(done.map(|m| m.type_()), Some(gst::MessageType::Eos));
+
+        let (pipeline, sink) = video_pipeline(uri(&path.to_string_lossy()).unwrap().as_str()).unwrap();
+        pipeline.set_state(gst::State::Paused).unwrap();
+        let sample = sink.try_pull_preroll(gst::ClockTime::from_seconds(10)).expect("a frame");
+        let _ = pipeline.set_state(gst::State::Null);
+        let _ = std::fs::remove_file(&path);
+        let meta = sample.buffer().unwrap().meta::<gstreamer_video::VideoMeta>().expect("a VideoMeta");
+        assert_eq!((meta.width(), meta.stride()[0]), (330, 332));
     }
 
     #[test]
