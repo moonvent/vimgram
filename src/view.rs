@@ -907,6 +907,10 @@ fn chat_row<'a>(app: &'a App, chat: &'a Chat, selected: bool, focused: bool) -> 
     ]
     .spacing(6)
     .align_y(Alignment::Center);
+    // Outside the clipped title, so a long name never hides it.
+    if app.muted(chat) {
+        title_line = title_line.push(text("🔕").size(12).font(EMOJI));
+    }
     if let Some(mark) = mark_text(chat.last.as_ref().and_then(|m| delivery_mark(app, m))) {
         title_line = title_line.push(mark);
     }
