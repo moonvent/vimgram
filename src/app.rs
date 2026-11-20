@@ -244,6 +244,8 @@ pub enum Message {
     },
     /// A reaction under a message was clicked.
     ToggleReaction { msg_id: i64, kind: ReactionKind },
+    /// Stickers of custom emoji reactions, by emoji id.
+    CustomEmoji(Result<Vec<(i64, Media)>, String>),
     ClickFolder(usize),
     ClickChat(i64),
     /// Click on the photo or video beside the chat: the keys go to it.
@@ -867,6 +869,10 @@ pub struct App {
     /// Sound off (`m` in the viewer); `volume` stays for when it is back on.
     silent: bool,
     pub media: Store,
+    /// Stickers of custom emoji reactions, by emoji id.
+    pub custom_emoji: HashMap<i64, Media>,
+    /// Custom emoji already asked for (in flight, found or not).
+    custom_emoji_asked: HashSet<i64>,
     /// Time base for animations: frame = (now - clock) / frame time.
     pub clock: Instant,
     pub now: Instant,
@@ -1059,6 +1065,8 @@ impl App {
             volume: player::load_volume(),
             silent: false,
             media: Store::default(),
+            custom_emoji: HashMap::new(),
+            custom_emoji_asked: HashSet::new(),
             clock: Instant::now(),
             now: Instant::now(),
             animating: false,
@@ -2033,6 +2041,16 @@ impl App {
                 Task::none()
             }
             Message::EmojiPick(e) => self.pick_emoji(e),
+            Message::CustomEmoji(result) => match result {
+                Ok(found) => {
+                    self.custom_emoji.extend(found);
+                    self.fetch_visible()
+                }
+                Err(e) => {
+                    self.error(format!("Custom emoji: {e}"));
+                    Task::none()
+                }
+            },
             Message::Reactions { chat_id, msg_id, result } => {
                 match result {
                     _ if self.open.as_ref().is_none_or(|o| o.id != chat_id) => {}
@@ -3224,6 +3242,7 @@ impl App {
             .map(|file| (file, Kind::Image, Size::ZERO, media::PRIORITY_AVATAR))
             .collect();
 
+        let mut unknown_emoji = Vec::new();
         if let Some(open) = &self.open
             && let Some(shown) = self.on_screen()
         {
@@ -3246,8 +3265,23 @@ impl App {
                 if let Some(photo) = msg.preview.as_ref().and_then(|p| p.photo) {
                     wanted.push((photo.id, Kind::Image, Size::ZERO, media::PRIORITY_INLINE));
                 }
+                for r in &msg.reactions {
+                    let ReactionKind::Custom(id) = r.kind else { continue };
+                    match self.custom_emoji.get(&id) {
+                        Some(sticker) => {
+                            if let Some(file) = sticker.inline_file() {
+                                let side = view::REACTION_EMOJI_PX;
+                                wanted.push((file, Kind::of(sticker), Size::new(side, side), media::PRIORITY_INLINE));
+                            }
+                        }
+                        None if !self.custom_emoji_asked.contains(&id) => unknown_emoji.push(id),
+                        None => {}
+                    }
+                }
             }
         }
+        unknown_emoji.sort_unstable();
+        unknown_emoji.dedup();
         if let Some(Media::Photo { full, .. }) = self.viewer_media() {
             wanted.push((full.id, Kind::Image, Size::ZERO, media::PRIORITY_VIEWER));
         }
@@ -3256,10 +3290,15 @@ impl App {
         self.media.retain_visible(&visible);
         self.animating = wanted.iter().any(|w| matches!(w.1, Kind::Tgs | Kind::Webm));
 
+        let lookup = (!unknown_emoji.is_empty()).then(|| {
+            self.custom_emoji_asked.extend(&unknown_emoji);
+            Task::perform(tg::custom_emoji(unknown_emoji), Message::CustomEmoji)
+        });
         Task::batch(
             wanted
                 .into_iter()
-                .filter_map(|(file, kind, size, priority)| self.download(file, kind, size, priority)),
+                .filter_map(|(file, kind, size, priority)| self.download(file, kind, size, priority))
+                .chain(lookup),
         )
     }
 

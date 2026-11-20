@@ -1622,7 +1622,7 @@ fn forward_origin(info: Option<&types::MessageForwardInfo>) -> Option<Forward> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReactionKind {
     Emoji(String),
-    /// Custom emoji: shown as a generic sparkle, the sticker isn't loaded.
+    /// Custom emoji: its sticker once loaded, a generic sparkle until then.
     Custom(i64),
     /// Telegram Stars.
     Paid,
@@ -1654,6 +1654,32 @@ impl ReactionKind {
             ReactionKind::Paid => "⭐",
         }
     }
+}
+
+fn sticker_media(s: &types::Sticker) -> Media {
+    let kind = match s.format {
+        StickerFormat::Webp => StickerKind::Webp,
+        StickerFormat::Tgs => StickerKind::Tgs,
+        StickerFormat::Webm => StickerKind::Webm,
+    };
+    Media::Sticker {
+        file: FileRef::new(&s.sticker, s.width, s.height),
+        kind,
+        emoji: s.emoji.clone(),
+    }
+}
+
+/// The stickers behind custom emoji, by emoji id (a `Media::Sticker` each).
+pub async fn custom_emoji(ids: Vec<i64>) -> Res<Vec<(i64, Media)>> {
+    let enums::Stickers::Stickers(found) = functions::get_custom_emoji_stickers(ids, client()).await.map_err(err)?;
+    Ok(found
+        .stickers
+        .iter()
+        .filter_map(|s| match &s.full_type {
+            enums::StickerFullType::CustomEmoji(c) => Some((c.custom_emoji_id, sticker_media(s))),
+            _ => None,
+        })
+        .collect())
 }
 
 /// One reaction under a message.
@@ -1933,19 +1959,7 @@ pub fn media(content: &MessageContent) -> Option<Media> {
                 full: FileRef::new(&full.photo, full.width, full.height),
             })
         }
-        MessageContent::MessageSticker(s) => {
-            let s = &s.sticker;
-            let kind = match s.format {
-                StickerFormat::Webp => StickerKind::Webp,
-                StickerFormat::Tgs => StickerKind::Tgs,
-                StickerFormat::Webm => StickerKind::Webm,
-            };
-            Some(Media::Sticker {
-                file: FileRef::new(&s.sticker, s.width, s.height),
-                kind,
-                emoji: s.emoji.clone(),
-            })
-        }
+        MessageContent::MessageSticker(s) => Some(sticker_media(&s.sticker)),
         MessageContent::MessageAnimation(a) => {
             let a = &a.animation;
             Some(Media::Animation {

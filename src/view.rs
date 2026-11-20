@@ -19,7 +19,7 @@ use crate::feed::Feed;
 use crate::fonts::{self, EMOJI};
 use crate::media::Loaded;
 use crate::player::{self, SpeedKind};
-use crate::tg::{ChatKind, Media, Membership, Msg, Presence, Preview, Sender, Style, Version, fmt_count, fmt_duration, fmt_size};
+use crate::tg::{ChatKind, Media, Membership, Msg, Presence, Preview, ReactionKind, Sender, Style, Version, fmt_count, fmt_duration, fmt_size};
 use crate::vim::{Input, Mode};
 
 pub const FOLDER_W: f32 = 76.0;
@@ -94,6 +94,10 @@ const FORWARD_H: f32 = 27.0;
 const REACTION_CHIP_H: f32 = 24.0;
 const REACTIONS_H: f32 = REACTION_CHIP_H + 4.0;
 const REACTION_W: f32 = 68.0;
+/// Custom emoji in a reaction chip, and the pixels it is decoded at (sharp
+/// up to 2× scaling).
+const REACTION_EMOJI: f32 = 18.0;
+pub const REACTION_EMOJI_PX: f32 = 2.0 * REACTION_EMOJI;
 /// Line between posts or between messages far apart in time.
 const BLOCK_H: f32 = 13.0;
 /// "💬 12 comments" under a channel post.
@@ -1889,7 +1893,7 @@ fn message_view<'a>(app: &'a App, m: &'a Msg, selected: bool, width: f32, show_a
     }
 
     if !m.reactions.is_empty() {
-        body = body.push(reactions_row(m));
+        body = body.push(reactions_row(app, m));
     }
     if let Some(count) = m.comments {
         let label = match count {
@@ -2007,12 +2011,12 @@ fn preview_card<'a>(app: &'a App, preview: &'a Preview, width: f32) -> Element<'
 }
 
 /// Reaction chips; yours are highlighted, a click puts or takes back one.
-fn reactions_row(m: &Msg) -> Element<'_, Message> {
+fn reactions_row<'a>(app: &'a App, m: &'a Msg) -> Element<'a, Message> {
     let chips = m.reactions.iter().map(|r| {
         let chosen = r.chosen;
         mouse_area(
             container(
-                row![text(r.kind.label()).size(14).font(EMOJI), text(fmt_count(r.count)).size(12)]
+                row![reaction_emoji(app, &r.kind), text(fmt_count(r.count)).size(12)]
                     .spacing(4)
                     .align_y(Alignment::Center),
             )
@@ -2040,6 +2044,29 @@ fn reactions_row(m: &Msg) -> Element<'_, Message> {
     container(Row::with_children(chips).spacing(6).wrap().vertical_spacing(4.0))
         .padding(iced::Padding { top: 4.0, ..Default::default() })
         .into()
+}
+
+/// A reaction's emoji; a custom one is its sticker once loaded, until then
+/// the plain emoji it stands for.
+fn reaction_emoji<'a>(app: &'a App, kind: &'a ReactionKind) -> Element<'a, Message> {
+    let sticker = match kind {
+        ReactionKind::Custom(id) => app.custom_emoji.get(id),
+        _ => None,
+    };
+    let loaded = sticker.and_then(|s| app.media.get(s.inline_file()?));
+    let handle = match loaded {
+        Some(Loaded::Image(handle)) => Some(handle),
+        Some(Loaded::Frames(frames)) => Some(frames.at(app.now.saturating_duration_since(app.clock))),
+        _ => None,
+    };
+    if let Some(handle) = handle {
+        return image(handle.clone()).width(REACTION_EMOJI).height(REACTION_EMOJI).into();
+    }
+    let label = match sticker {
+        Some(Media::Sticker { emoji, .. }) if !emoji.is_empty() => emoji,
+        _ => kind.label(),
+    };
+    text(label).size(14).font(EMOJI).into()
 }
 
 /// Full-screen photo or video, shown instead of the panes.
