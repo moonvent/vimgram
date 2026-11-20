@@ -1325,6 +1325,10 @@ mod tests {
         assert_eq!(text("|hello big world", "dwdwuu").0, "|hello big world");
         assert_eq!(text("|hello big world", "dwdwuu\u{12}").0, "|big world");
         assert_eq!(text("|hello big world", "dwu2\u{12}").0, "|big world");
+        assert_eq!(text("hello big wor|ld", "dd").0, "|");
+        assert_eq!(text("hello big wor|ld", "ddu").0, "hello big wor|ld");
+        assert_eq!(text("one\nt|wo\nthree", "ggdG").0, "|");
+        assert_eq!(text("one\nt|wo\nthree", "ggdGu").0, "|one\ntwo\nthree");
     }
 
     #[test]
