@@ -220,6 +220,40 @@ pub async fn clean_cache(days: i32) -> Res<i64> {
     Ok(deleted.size)
 }
 
+/// Delete cached media of channels not opened for `days` days; private
+/// chats and groups are left alone. Returns the channels that had files
+/// and the bytes freed.
+pub async fn clean_channel_media(days: u32) -> Res<(Vec<i64>, i64)> {
+    let enums::StorageStatistics::StorageStatistics(stats) =
+        functions::get_storage_statistics(100_000, client()).await.map_err(err)?;
+    let mut channels = Vec::new();
+    for chat_id in stats.by_chat.iter().map(|c| c.chat_id).filter(|&id| id != 0) {
+        if let Ok(enums::Chat::Chat(chat)) = functions::get_chat(chat_id, client()).await
+            && ChatKind::of(&chat.r#type) == ChatKind::Channel
+        {
+            channels.push(chat_id);
+        }
+    }
+    if channels.is_empty() {
+        return Ok((channels, 0));
+    }
+    let enums::StorageStatistics::StorageStatistics(deleted) = functions::optimize_storage(
+        1 << 50, // no size limit, only age
+        (days as i32).saturating_mul(86_400),
+        i32::MAX,
+        0,
+        Vec::new(),
+        channels.clone(),
+        Vec::new(),
+        true,
+        0,
+        client(),
+    )
+    .await
+    .map_err(err)?;
+    Ok((channels, deleted.size))
+}
+
 /// Download in the background at low priority, so the message's media
 /// survives if it gets deleted.
 pub async fn prefetch(file_id: i32) -> Res<()> {

@@ -64,6 +64,9 @@ const GLIDE_SCREENS: f32 = 2.0;
 const NOTIFY_MAX_AGE: i64 = 120;
 /// Cached media unused this long is deleted, checked once this often.
 const CACHE_DAYS: i32 = 7;
+/// How often media of channels is checked for deletion
+/// (`channel_media_days`).
+const CHANNEL_CLEAN_EVERY: Duration = Duration::from_secs(6 * 3600);
 
 pub const COMPOSE_ID: &str = "compose";
 /// Link of a spoiler in a message's text: this prefix and the message id.
@@ -195,6 +198,10 @@ pub enum Message {
     NotificationClicked(i64),
     Autostart(Result<String, String>),
     CacheCleaned(Result<i64, String>),
+    /// Time to delete old media of channels.
+    CleanChannelMedia,
+    /// The channels that had media files, and the bytes freed.
+    ChannelMediaCleaned(Result<(Vec<i64>, i64), String>),
     /// Heights of messages as laid out, by id.
     Measured(feed::Measured),
     /// A frame while the message list glides.
@@ -1198,6 +1205,11 @@ impl App {
                 Subscription::none()
             },
             tick,
+            if self.cfg.channel_media_days > 0 && self.auth == Auth::Ready {
+                iced::time::every(CHANNEL_CLEAN_EVERY).map(|_| Message::CleanChannelMedia)
+            } else {
+                Subscription::none()
+            },
             if self.glide != 0.0 {
                 window::frames().map(Message::Glide)
             } else {
@@ -1431,6 +1443,16 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Delete media of channels not opened for `channel_media_days` (when
+    /// that is not 0).
+    fn clean_channel_media(&self) -> Task<Message> {
+        let days = self.cfg.channel_media_days;
+        if days == 0 {
+            return Task::none();
+        }
+        Task::perform(tg::clean_channel_media(days), Message::ChannelMediaCleaned)
     }
 
     /// Download the media of an incoming message right away (in private
@@ -1998,6 +2020,26 @@ impl App {
                 }
                 Task::none()
             }
+            Message::CleanChannelMedia => self.clean_channel_media(),
+            Message::ChannelMediaCleaned(result) => {
+                match result {
+                    Ok((mut channels, freed)) => {
+                        // Channels whose files TDLib no longer has may still
+                        // have links in the archive.
+                        channels.extend(self.chats.values().filter(|c| c.kind == ChatKind::Channel).map(|c| c.id));
+                        channels.sort_unstable();
+                        channels.dedup();
+                        if let Some(archive) = &self.archive {
+                            archive.prune(channels, i64::from(self.cfg.channel_media_days));
+                        }
+                        if freed > 0 {
+                            self.info(format!("Channel media: freed {:.1} MB", freed as f64 / 1e6));
+                        }
+                    }
+                    Err(e) => self.error(format!("Channel media cleanup: {e}")),
+                }
+                Task::none()
+            }
             Message::Autostart(result) => {
                 match result {
                     Ok(text) => self.info(text),
@@ -2562,7 +2604,7 @@ impl App {
                 self.mode = Mode::Normal;
                 self.input.clear();
                 self.status = None;
-                return Task::batch([self.load_more_chats(), weekly_cache_clean()]);
+                return Task::batch([self.load_more_chats(), weekly_cache_clean(), self.clean_channel_media()]);
             }
             S::LoggingOut | S::Closing => self.auth = Auth::Info("Closing…".into()),
             S::Closed => self.auth = Auth::Info("Session closed".into()),

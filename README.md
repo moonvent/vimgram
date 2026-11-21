@@ -28,6 +28,8 @@ folder = "Личка"        # optional: folder to start in (by name, any case)
 tray = true             # optional: tray icon (waybar `tray` module)
 close_to_tray = true    # optional: closing the window keeps vimgram in the tray
 prefetch_mb = 50        # optional: auto-download media up to this size (see below)
+channel_media_days = 1  # optional: delete media of channels not opened for this many
+                        # days (1 by default; private chats and groups keep theirs); 0 = off
 open_on_select = true   # optional: moving through the chat list opens the chat beside it
                         # (read only once you move into its messages)
 viewer = "side"         # optional: photos and videos open beside the chat, not full screen
@@ -176,7 +178,7 @@ their photos, voice messages, stickers and videos, marked as deleted. Every text
 message had is kept there too (`gh` shows them). TDLib removes the
 files of deleted messages, so media of incoming messages in private chats and groups is
 downloaded right away (up to `prefetch_mb`), except files (documents), which wait for `Enter`. Links of messages still alive after 30 days
-are dropped.
+are dropped; in channels, after `channel_media_days`.
 
 New messages raise desktop notifications with the chat photo (and the app icon in its
 corner) unless the chat is muted or open and focused; clicking one opens the chat. Once
@@ -201,7 +203,7 @@ Hyprland also brought to the front, and exits; a second start with `--hidden` ju
 |---|---|---|
 | `~/.config/vimgram/config.toml` | `%APPDATA%\vimgram\config\config.toml` | settings |
 | `~/.local/share/vimgram/db` | `%APPDATA%\vimgram\data\db` | TDLib database (session, chats, sticker files) |
-| `~/.local/share/vimgram/files` | `%APPDATA%\vimgram\data\files` | media cache: photos, videos, voice messages, documents. Files unused for a week are deleted weekly (`:cleancache`) |
+| `~/.local/share/vimgram/files` | `%APPDATA%\vimgram\data\files` | media cache: photos, videos, voice messages, documents. Files unused for a week are deleted weekly (`:cleancache`); those of channels after `channel_media_days` (checked at start and every 6 hours) |
 | `~/.local/share/vimgram/archive.sqlite`, `media/` | `%APPDATA%\vimgram\data\…` | archive of messages and their media (kept) |
 | `~/.cache/vimgram` | `%LOCALAPPDATA%\vimgram\cache` | pasted images, notification images |
 

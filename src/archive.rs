@@ -68,6 +68,8 @@ enum Command {
     Edit { chat_id: i64, id: i64, text: String, at: i64 },
     /// Keep a downloaded file of a message.
     Link { chat_id: i64, msg_id: i64, file_id: i32, path: String },
+    /// Drop links of these chats' messages still alive after `days`.
+    Prune { chats: Vec<i64>, days: i64 },
     /// Reply once everything before it is committed.
     Flush(mpsc::Sender<()>),
 }
@@ -137,7 +139,7 @@ impl Archive {
         std::thread::Builder::new()
             .name("archive".into())
             .spawn(move || {
-                let _ = prune_media(&conn, MEDIA_DAYS);
+                let _ = prune_media(&conn, MEDIA_DAYS, None);
                 write_loop(&mut conn, &dir, &commands);
             })
             .map_err(|e| e.to_string())?;
@@ -149,6 +151,14 @@ impl Archive {
         let _ = self.writer.send(Command::Link { chat_id, msg_id, file_id, path });
     }
 
+
+    /// Drop links to media of these chats' messages still alive after
+    /// `days`, sooner than for the rest.
+    pub fn prune(&self, chats: Vec<i64>, days: i64) {
+        if !chats.is_empty() {
+            let _ = self.writer.send(Command::Prune { chats, days });
+        }
+    }
 
     pub fn save(&self, msgs: &[Msg]) {
         if !msgs.is_empty() {
@@ -258,16 +268,17 @@ impl Archive {
 /// Linked files of messages that were not deleted are dropped after this.
 const MEDIA_DAYS: i64 = 30;
 
-/// Remove links to media of messages still alive after `days`.
-fn prune_media(conn: &Connection, days: i64) -> rusqlite::Result<usize> {
+/// Remove links to media of messages still alive after `days`, of one
+/// chat or of all.
+fn prune_media(conn: &Connection, days: i64, chat: Option<i64>) -> rusqlite::Result<usize> {
     let cutoff = chrono::Utc::now().timestamp() - days * 86_400;
     let mut stmt = conn.prepare(
         "SELECT f.chat_id, f.msg_id, f.file_id, f.path FROM files f
          LEFT JOIN messages m ON m.chat_id = f.chat_id AND m.id = f.msg_id
-         WHERE f.linked_at < ?1 AND m.deleted_at IS NULL",
+         WHERE f.linked_at < ?1 AND m.deleted_at IS NULL AND (?2 IS NULL OR f.chat_id = ?2)",
     )?;
     let stale: Vec<(i64, i64, i32, String)> = stmt
-        .query_map([cutoff], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .query_map(params![cutoff, chat], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .filter_map(Result::ok)
         .collect();
     for (chat_id, msg_id, file_id, path) in &stale {
@@ -339,6 +350,11 @@ fn apply(tx: &rusqlite::Transaction<'_>, media: &Path, command: Command) -> rusq
             }
         }
         Command::Flush(_) => {}
+        Command::Prune { chats, days } => {
+            for chat in chats {
+                prune_media(tx, days, Some(chat))?;
+            }
+        }
         Command::Link { chat_id, msg_id, file_id, path } => {
             let exists: bool = tx
                 .prepare_cached("SELECT 1 FROM files WHERE chat_id = ?1 AND msg_id = ?2 AND file_id = ?3")?
@@ -538,8 +554,39 @@ mod tests {
         archive.link(1, 21, 78, other.to_string_lossy().into_owned());
         archive.flush();
         let conn = connect(&dir.join("archive.sqlite")).unwrap();
-        assert_eq!(prune_media(&conn, -1).unwrap(), 1, "only the live message's file");
+        assert_eq!(prune_media(&conn, -1, None).unwrap(), 1, "only the live message's file");
         assert_eq!(archive.deleted_between(1, 0, 100).unwrap()[0].files.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prunes_media_of_given_chats_only() {
+        let dir = std::env::temp_dir().join(format!("vimgram-archive-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = Archive::open(dir.join("archive.sqlite")).unwrap();
+        // A private chat (1) and a channel (2), a photo in each.
+        for chat in [1, 2] {
+            let file = dir.join(format!("{chat}.jpg"));
+            std::fs::write(&file, b"jpeg").unwrap();
+            archive.save(&[msg(chat, 30, "photo")]);
+            archive.link(chat, 30, 90 + chat as i32, file.to_string_lossy().into_owned());
+        }
+        archive.flush();
+
+        archive.prune(vec![2], -1);
+        archive.flush();
+        let conn = connect(&dir.join("archive.sqlite")).unwrap();
+        let kept: Vec<i64> = conn
+            .prepare("SELECT chat_id FROM files ORDER BY chat_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(kept, [1], "the channel's link is gone, the private chat's stays");
+        assert!(dir.join("media/1/30-91.jpg").exists());
+        assert!(!dir.join("media/2/30-92.jpg").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

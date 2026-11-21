@@ -21,6 +21,10 @@ pub struct Config {
     /// size (MB) is downloaded right away, so it is kept if deleted.
     #[serde(default = "default_prefetch_mb")]
     pub prefetch_mb: u32,
+    /// Media of channel posts not opened for this many days is deleted
+    /// (private chats and groups keep theirs); 0 turns this off.
+    #[serde(default = "default_channel_media_days")]
+    pub channel_media_days: u32,
     /// Moving through the chat list opens the selected chat beside it.
     #[serde(default)]
     pub open_on_select: bool,
@@ -87,6 +91,10 @@ fn default_prefetch_mb() -> u32 {
     50
 }
 
+fn default_channel_media_days() -> u32 {
+    1
+}
+
 pub fn dirs() -> ProjectDirs {
     ProjectDirs::from("", "", "vimgram").expect("could not determine home directory")
 }
@@ -145,5 +153,13 @@ mod tests {
         assert_eq!(parse(""), Clock::H24);
         assert_eq!(parse("clock = \"12h\""), Clock::H12);
         assert_eq!(parse("clock = \"24h\""), Clock::H24);
+    }
+
+    #[test]
+    fn channel_media_days_from_config() {
+        let parse = |extra: &str| toml::from_str::<Config>(&format!("api_id = 1\napi_hash = \"x\"\n{extra}")).unwrap().channel_media_days;
+        assert_eq!(parse(""), 1);
+        assert_eq!(parse("channel_media_days = 0"), 0);
+        assert_eq!(parse("channel_media_days = 3"), 3);
     }
 }
