@@ -1379,7 +1379,15 @@ impl App {
         };
         let body = notify::preview(&msg.summary());
         let (chat_id, avatar, msg_id) = (chat.id, chat.avatar, msg.id);
-        Task::perform(
+        // Mark the window urgent too, so the compositor highlights its
+        // workspace (waybar paints it red) until the window is focused.
+        let attention = match self.window {
+            Some(id) if !self.focused => {
+                window::request_user_attention(id, Some(window::UserAttention::Informational))
+            }
+            _ => Task::none(),
+        };
+        let shown = Task::perform(
             async move {
                 // The chat photo with the app icon in its corner.
                 let image = match avatar {
@@ -1405,7 +1413,8 @@ impl App {
                     Message::Done(Ok(()))
                 }
             },
-        )
+        );
+        Task::batch([attention, shown])
     }
 
     /// Archive messages, and their media files as they get downloaded.
