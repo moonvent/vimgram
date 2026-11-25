@@ -2104,10 +2104,10 @@ fn media_viewer(app: &App) -> Option<Element<'_, Message>> {
             ]
             .spacing(10)
             .into(),
-            None => center(text("Loading video…").size(14).style(|_: &Theme| text::Style {
-                color: Some(Color::WHITE),
-            }))
-            .into(),
+            None => {
+                let label = app.video.as_ref().and_then(|v| v.error.as_deref()).unwrap_or("Loading video…");
+                center(text(label).size(14).style(|_: &Theme| text::Style { color: Some(Color::WHITE) })).into()
+            }
         },
         _ => return None,
     };

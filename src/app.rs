@@ -345,6 +345,8 @@ pub struct VideoPlayback {
     kind: SpeedKind,
     /// `None` until the stream has started.
     pub movie: Option<Movie>,
+    /// Why it could not start, shown in place of the video.
+    pub error: Option<String>,
     /// A speed change failed (e.g. mid-seek) and is retried on the next tick.
     speed_pending: bool,
 }
@@ -1859,7 +1861,11 @@ impl App {
                 if let Some(playback) = self.video.as_mut().filter(|p| p.file_id == file_id) {
                     match result {
                         Ok(shared) => playback.movie = shared.take(),
-                        Err(e) => self.error(format!("Cannot play video: {e}")),
+                        Err(e) => {
+                            let e = format!("Cannot play video: {e}");
+                            playback.error = Some(e.clone());
+                            self.error(e);
+                        }
                     }
                 }
                 Task::none()
@@ -3887,6 +3893,7 @@ impl App {
                     round_msg,
                     kind,
                     movie: None,
+                    error: None,
                     speed_pending: false,
                 });
                 let (speed, volume) = (self.speeds.get(kind), self.sound());
