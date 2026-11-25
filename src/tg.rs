@@ -52,10 +52,20 @@ fn err(e: types::Error) -> String {
     format!("{} ({})", e.message, e.code)
 }
 
-/// Any request starts update delivery for the client; this one also silences
-/// TDLib's very chatty default logging.
+/// Any request starts update delivery for the client. TDLib's log goes to
+/// `tdlib.log` in the data directory: warnings and errors (verbosity 2), or
+/// as much as `VIMGRAM_TDLIB_LOG` says (3 shows why a download stalls).
 pub async fn start() -> Res<()> {
-    functions::set_log_verbosity_level(1, client()).await.map_err(err)
+    let path = config::dirs().data_dir().join("tdlib.log");
+    let stream = types::LogStreamFile {
+        path: path.to_string_lossy().into_owned(),
+        // Rotated to tdlib.log.old when full.
+        max_file_size: 10 << 20,
+        redirect_stderr: false,
+    };
+    let _ = functions::set_log_stream(enums::LogStream::File(stream), client()).await;
+    let level = std::env::var("VIMGRAM_TDLIB_LOG").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    functions::set_log_verbosity_level(level, client()).await.map_err(err)
 }
 
 pub async fn set_parameters(cfg: Config) -> Res<()> {
